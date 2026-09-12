@@ -1,0 +1,41 @@
+{
+  "name": "hivemind",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local hive for Human, brains, and workers",
+  "bin": {
+    "hivemind": "./bin/hivemind.mjs"
+  },
+  "scripts": {
+    "dev": "concurrently -k -n hive,ui -c yellow,cyan \"tsx watch src/cli.ts serve\" \"vite\"",
+    "start": "tsx src/cli.ts serve",
+    "build": "vite build",
+    "mcp": "tsx src/mcp/index.ts",
+    "hivemind": "tsx src/cli.ts",
+    "test": "tsx --test src/server/hive.test.ts src/server/http.test.ts src/shared/join-args.test.ts src/mcp/mcp.test.ts"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.19.6",
+    "@modelcontextprotocol/sdk": "^1.20.2",
+    "hono": "^4.10.3",
+    "tsx": "^4.20.5",
+    "ws": "^8.18.3",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^24.5.2",
+    "@types/react": "^19.1.13",
+    "@types/react-dom": "^19.1.9",
+    "@types/ws": "^8.18.1",
+    "@vitejs/plugin-react": "^5.0.4",
+    "concurrently": "^9.2.1",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.7"
+  }
+}

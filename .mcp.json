@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "hivemind": {
+      "command": "npx",
+      "args": ["tsx", "src/cli.ts", "mcp"],
+      "env": {
+        "HIVEMIND_URL": "http://127.0.0.1:7420"
+      }
+    }
+  }
+}
