@@ -7,11 +7,12 @@ import { getRequestListener } from "@hono/node-server";
 import { DEFAULT_PORT } from "../shared/types.ts";
 import { Hive } from "./hive.ts";
 import { createApp } from "./app.ts";
+import { startTelegram } from "./telegram.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const packageRoot = path.resolve(here, "../..");
 
-export function startServer(opts: { port?: number; hive?: Hive } = {}) {
+export function startServer(opts: { port?: number; hive?: Hive; telegram?: boolean } = {}) {
   const port = opts.port ?? Number(process.env.HIVEMIND_PORT ?? DEFAULT_PORT);
   const hive = opts.hive ?? new Hive();
   const app = createApp(hive);
@@ -45,13 +46,18 @@ export function startServer(opts: { port?: number; hive?: Hive } = {}) {
   const onAgent = (payload: unknown) => emit("agent", payload);
   const onChannel = (payload: unknown) => emit("channel", payload);
   const onThread = (payload: unknown) => emit("thread", payload);
+  const onReaction = (payload: unknown) => emit("reaction", payload);
+  const onQueued = (payload: unknown) => emit("queued", payload);
   hive.bus.on("message", onMessage);
   hive.bus.on("agent", onAgent);
   hive.bus.on("channel", onChannel);
   hive.bus.on("thread", onThread);
+  hive.bus.on("reaction", onReaction);
+  hive.bus.on("queued", onQueued);
 
   const sweep = setInterval(() => hive.sweepPresence(), 15_000);
   sweep.unref();
+  const telegram = opts.telegram === false ? null : startTelegram(hive);
 
   const ready = new Promise<number>((resolve, reject) => {
     server.once("error", reject);
@@ -65,10 +71,13 @@ export function startServer(opts: { port?: number; hive?: Hive } = {}) {
 
   const shutdown = () => {
     clearInterval(sweep);
+    telegram?.stop();
     hive.bus.off("message", onMessage);
     hive.bus.off("agent", onAgent);
     hive.bus.off("channel", onChannel);
     hive.bus.off("thread", onThread);
+    hive.bus.off("reaction", onReaction);
+    hive.bus.off("queued", onQueued);
     wss.close();
     server.close();
   };

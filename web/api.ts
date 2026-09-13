@@ -1,4 +1,5 @@
-import type { Agent, Channel, Message, Thread, ThreadStatus } from "../src/shared/types.ts";
+import type { Agent, AttachmentMeta, Channel, Message, Thread, ThreadStatus } from "../src/shared/types.ts";
+import { resolveUploadMime } from "../src/shared/mime.ts";
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
@@ -16,6 +17,8 @@ export type Snapshot = {
   channels: Channel[];
   unread: Record<string, number>;
   mentions: Message[];
+  mentionsHasMore?: boolean;
+  queued: Record<string, number>;
 };
 
 export type ChannelPayload = {
@@ -28,6 +31,14 @@ export type ChannelPayload = {
 
 export const api = {
   snapshot: () => req<Snapshot>("/api/ui/snapshot"),
+  mentions: (beforeSeq?: number) => {
+    const q = beforeSeq ? `?beforeSeq=${beforeSeq}` : "";
+    return req<{ messages: Message[]; hasMore: boolean }>(`/api/ui/mentions${q}`);
+  },
+  markMentionsSeen: () =>
+    req<{ messages: Message[]; hasMore: boolean; unread: Record<string, number> }>("/api/ui/mentions/seen", {
+      method: "POST",
+    }),
   messages: (id: string, threadId?: string | null, beforeSeq?: number) => {
     const q = new URLSearchParams();
     if (threadId) q.set("threadId", threadId);
@@ -35,11 +46,30 @@ export const api = {
     const suffix = q.toString() ? `?${q}` : "";
     return req<ChannelPayload>(`/api/ui/channels/${encodeURIComponent(id)}/messages${suffix}`);
   },
-  send: (id: string, body: string, threadId?: string | null) =>
+  send: (id: string, body: string, threadId?: string | null, attachmentIds?: string[]) =>
     req<{ message: Message }>(`/api/ui/channels/${encodeURIComponent(id)}/messages`, {
       method: "POST",
-      body: JSON.stringify({ body, threadId: threadId ?? null }),
+      body: JSON.stringify({ body, threadId: threadId ?? null, attachmentIds }),
     }),
+  upload: async (file: File): Promise<AttachmentMeta> => {
+    const res = await fetch("/api/ui/files", {
+      method: "POST",
+      headers: {
+        "x-file-name": file.name || "paste.png",
+        "x-file-mime": resolveUploadMime(file.type, file.name || "paste.png"),
+      },
+      body: file,
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    return data.file as AttachmentMeta;
+  },
+  react: (seq: number, emoji: string) =>
+    req<{ message: Message; added: boolean }>(`/api/ui/messages/${seq}/reactions`, {
+      method: "POST",
+      body: JSON.stringify({ emoji }),
+    }),
+  fileUrl: (id: string) => `/api/ui/files/${encodeURIComponent(id)}`,
   createChannel: (name: string, type: "public" | "private", topic?: string, memberNames?: string[]) =>
     req<{ channel: Channel }>("/api/ui/channels", {
       method: "POST",

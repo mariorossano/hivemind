@@ -28,7 +28,7 @@ async function json(
 test("HTTP protocol: join, isolate, wait, Human admin", async () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), "hive-http-"));
   const hive = new Hive(path.join(dir, "hive.db"));
-  const started = startServer({ port: 0, hive });
+  const started = startServer({ port: 0, hive, telegram: false });
   const port = await started.ready;
   const base = `http://127.0.0.1:${port}`;
   try {
@@ -95,6 +95,8 @@ test("HTTP protocol: join, isolate, wait, Human admin", async () => {
     assert.ok(after.data.channels.some((c: { type: string }) => c.type === "dm"));
     assert.ok(after.data.agents.some((a: { name: string }) => a.name === workerName));
     assert.ok(after.data.agents.some((a: { name: string }) => a.name === brainName));
+    assert.equal(typeof after.data.queued, "object");
+    assert.equal(after.data.queued[worker.data.agent.id] ?? 0, 0);
 
     const room = await json(
       base,
@@ -112,6 +114,24 @@ test("HTTP protocol: join, isolate, wait, Human admin", async () => {
       workerTok,
     );
     assert.equal(invited.status, 200);
+    assert.equal(invited.data.threads, undefined);
+    assert.equal(invited.data.replyCounts, undefined);
+    const fatLimit = await json(
+      base,
+      "GET",
+      `/api/agent/channels/${room.data.channel.id}/messages?limit=50`,
+      undefined,
+      workerTok,
+    );
+    assert.equal(fatLimit.data.threads, undefined);
+    const withMeta = await json(
+      base,
+      "GET",
+      `/api/agent/channels/${room.data.channel.id}/messages?meta=1`,
+      undefined,
+      workerTok,
+    );
+    assert.ok(withMeta.data.threads);
 
     const humanDm = await json(base, "POST", "/api/ui/dms", { name: workerName });
     await json(base, "POST", `/api/ui/channels/${humanDm.data.channel.id}/messages`, {
@@ -129,6 +149,15 @@ test("HTTP protocol: join, isolate, wait, Human admin", async () => {
     const clear = await json(base, "POST", "/api/ui/clear-context", { name: workerName });
     assert.equal(clear.status, 200);
     assert.equal(clear.data.message.control, "clear_context");
+
+    await json(base, "POST", "/api/agent/channels/general/messages", { body: "goal please @Human" }, brainTok);
+    const beforeSeen = await json(base, "GET", "/api/ui/snapshot");
+    assert.ok((beforeSeen.data.unread.general ?? 0) > 0);
+    assert.ok(beforeSeen.data.mentions.length > 0);
+    const seen = await json(base, "POST", "/api/ui/mentions/seen");
+    assert.equal(seen.status, 200);
+    assert.equal(seen.data.messages.length, 0);
+    assert.equal(seen.data.unread.general ?? 0, 0);
   } finally {
     started.shutdown();
     rmSync(dir, { recursive: true, force: true });

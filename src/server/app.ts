@@ -1,8 +1,22 @@
+import { Readable } from "node:stream";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { DEFAULT_WAIT_MS, HiveError, type Seniority } from "../shared/types.ts";
+import { DEFAULT_WAIT_MS, HiveError, type Agent, type Seniority } from "../shared/types.ts";
+import { resolveUploadMime } from "../shared/mime.ts";
 import { standingOrders } from "../shared/standing-orders.ts";
 import { Hive, describeAgent } from "./hive.ts";
+import { safeFileName } from "./files.ts";
+
+function fileDownload(hive: Hive, actor: Agent, id: string) {
+  const opened = hive.openAttachment(actor, id);
+  return new Response(Readable.toWeb(opened.stream) as ReadableStream, {
+    headers: {
+      "content-type": opened.meta.mime,
+      "content-length": String(opened.meta.bytes),
+      "content-disposition": `inline; filename="${safeFileName(opened.meta.name)}"`,
+    },
+  });
+}
 
 export function createApp(hive: Hive) {
   const app = new Hono();
@@ -19,13 +33,28 @@ export function createApp(hive: Hive) {
   const ui = new Hono();
   ui.get("/snapshot", (c) => {
     const human = hive.getAgent("human");
+    const inbox = hive.mentionInbox(human, 30);
     return c.json({
       you: human,
       agents: hive.listAgents(),
       channels: hive.listChannels(human),
       unread: hive.unreadCounts(human),
-      mentions: hive.mentionInbox(human, 30),
+      mentions: inbox.messages,
+      mentionsHasMore: inbox.hasMore,
+      queued: hive.queuedCounts(),
     });
+  });
+  ui.get("/mentions", (c) => {
+    const human = hive.getAgent("human");
+    const beforeSeq = c.req.query("beforeSeq") ? Number(c.req.query("beforeSeq")) : undefined;
+    const inbox = hive.mentionInbox(human, 30, beforeSeq);
+    return c.json(inbox);
+  });
+  ui.post("/mentions/seen", (c) => {
+    const human = hive.getAgent("human");
+    hive.markMentionsSeen(human);
+    const inbox = hive.mentionInbox(human, 30);
+    return c.json({ ...inbox, unread: hive.unreadCounts(human) });
   });
   ui.get("/channels/:id/messages", (c) => {
     const human = hive.getAgent("human");
@@ -68,9 +97,27 @@ export function createApp(hive: Hive) {
       channel: c.req.param("id"),
       body: String(body.body ?? ""),
       threadId: body.threadId ?? null,
+      attachmentIds: Array.isArray(body.attachmentIds) ? body.attachmentIds.map(String) : undefined,
     });
     hive.markRead(human, message.channelId, message.seq);
     return c.json({ message });
+  });
+  ui.post("/files", async (c) => {
+    const human = hive.getAgent("human");
+    const name = c.req.header("x-file-name") || "paste.png";
+    const file = await hive.createFile(human, {
+      name,
+      mime: resolveUploadMime(c.req.header("x-file-mime"), name),
+      body: c.req.raw.body,
+    });
+    return c.json({ file });
+  });
+  ui.get("/files/:id", (c) => fileDownload(hive, hive.getAgent("human"), c.req.param("id")));
+  ui.post("/messages/:seq/reactions", async (c) => {
+    const human = hive.getAgent("human");
+    const body = await c.req.json();
+    const result = hive.toggleReaction(human, Number(c.req.param("seq")), String(body.emoji ?? ""));
+    return c.json(result);
   });
   ui.post("/dms", async (c) => {
     const human = hive.getAgent("human");
@@ -131,35 +178,49 @@ export function createApp(hive: Hive) {
     });
     return c.json({
       ...result,
-      standingOrders: standingOrders(result.agent),
       describe: describeAgent(result.agent),
+      standingOrders: result.created ? standingOrders(result.agent) : undefined,
+      ordersRef: result.created ? undefined : "unchanged",
     });
   });
 
   agent.get("/me", (c) => {
     const me = c.get("me");
-    return c.json({ you: me, standingOrders: standingOrders(me) });
+    if (c.req.query("orders") === "1") {
+      return c.json({ you: me, standingOrders: standingOrders(me) });
+    }
+    return c.json({
+      you: { name: me.name, role: me.role, seniority: me.seniority, focus: me.focus, online: me.online },
+      ordersRef: "unchanged",
+    });
   });
-  agent.get("/agents", (c) => c.json({ agents: hive.listAgents() }));
+  agent.get("/agents", (c) =>
+    c.json({
+      agents: hive.listAgents().map(({ createdAt: _c, ...a }) => a),
+    }),
+  );
   agent.get("/channels", (c) => {
     const me = c.get("me");
-    return c.json({ channels: hive.listChannels(me), unread: hive.unreadCounts(me) });
+    const unread = c.req.query("unread") === "1" ? hive.unreadCounts(me) : undefined;
+    return c.json({ channels: hive.listChannels(me), unread });
   });
   agent.get("/channels/:id/messages", (c) => {
     const me = c.get("me");
+    const limit = Number(c.req.query("limit") ?? 20);
     const listed = hive.listMessages(me, c.req.param("id"), {
       threadId: c.req.query("threadId") || null,
       afterSeq: c.req.query("afterSeq") ? Number(c.req.query("afterSeq")) : 0,
       beforeSeq: c.req.query("beforeSeq") ? Number(c.req.query("beforeSeq")) : undefined,
-      limit: Number(c.req.query("limit") ?? 80),
+      limit,
     });
     const ch = hive.getChannel(c.req.param("id"));
+    const meta = c.req.query("meta") === "1";
     return c.json({
-      channel: ch,
+      channel: { id: ch.id, name: ch.name, type: ch.type },
       messages: listed.messages,
       hasOlder: listed.hasOlder,
-      threads: hive.threadsInChannel(ch.id),
-      replyCounts: hive.replyCounts(ch.id),
+      threads: meta ? hive.threadsInChannel(ch.id) : undefined,
+      replyCounts: meta ? hive.replyCounts(ch.id) : undefined,
     });
   });
   agent.post("/channels", async (c) => {
@@ -180,8 +241,30 @@ export function createApp(hive: Hive) {
       channel: c.req.param("id"),
       body: String(body.body ?? ""),
       threadId: body.threadId ?? null,
+      attachmentIds: Array.isArray(body.attachmentIds) ? body.attachmentIds.map(String) : undefined,
     });
-    return c.json({ message });
+    return c.json({ ok: true, seq: message.seq, id: message.id });
+  });
+  agent.get("/messages/:seq", (c) => {
+    const me = c.get("me");
+    return c.json({ message: hive.getVisibleMessage(me, Number(c.req.param("seq"))) });
+  });
+  agent.post("/files", async (c) => {
+    const me = c.get("me");
+    const name = c.req.header("x-file-name") || "file";
+    const file = await hive.createFile(me, {
+      name,
+      mime: resolveUploadMime(c.req.header("x-file-mime"), name),
+      body: c.req.raw.body,
+    });
+    return c.json({ file });
+  });
+  agent.get("/files/:id", (c) => fileDownload(hive, c.get("me"), c.req.param("id")));
+  agent.post("/messages/:seq/reactions", async (c) => {
+    const me = c.get("me");
+    const body = await c.req.json();
+    const result = hive.toggleReaction(me, Number(c.req.param("seq")), String(body.emoji ?? ""));
+    return c.json({ ok: true, added: result.added, seq: result.message.seq });
   });
   agent.post("/dms", async (c) => {
     const me = c.get("me");
@@ -212,8 +295,12 @@ export function createApp(hive: Hive) {
     const me = c.get("me");
     const body = await c.req.json().catch(() => ({}));
     const timeoutMs = Number(body.timeoutMs ?? DEFAULT_WAIT_MS);
-    const result = await hive.wait(me, timeoutMs, c.req.raw.signal);
+    const result = await hive.wait(me, timeoutMs, c.req.raw.signal, { compact: Boolean(body.compact) });
     return c.json(result);
+  });
+  agent.post("/ping", (c) => {
+    const me = c.get("me");
+    return c.json({ ok: true, name: me.name, online: true });
   });
   agent.post("/leave", (c) => {
     const me = c.get("me");

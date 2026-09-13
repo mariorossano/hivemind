@@ -383,6 +383,50 @@ html.dark .avatar { color: #11150e; }
 }
 html.dark .send { background: var(--wax); color: #1b2017; }
 .send:disabled { opacity: 0.35; cursor: default; }
+.clip {
+  flex: none;
+  height: 2rem;
+  width: 2rem;
+  border-radius: 10px;
+}
+.pending-files {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin: 0 0 0.4rem;
+  padding: 0;
+}
+.pending-files li {
+  display: flex;
+  gap: 0.35rem;
+  align-items: center;
+  padding: 0.2rem 0.45rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 0.75rem;
+}
+.atts { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.35rem 0; }
+.att-img { max-width: 220px; max-height: 160px; border-radius: 10px; display: block; }
+.att-chip {
+  display: inline-flex;
+  gap: 0.35rem;
+  align-items: baseline;
+  padding: 0.25rem 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 0.78rem;
+}
+.reacts { display: flex; flex-wrap: wrap; gap: 0.2rem; margin: 0.3rem 0 0.15rem; }
+.react {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0.05rem 0.4rem;
+  font-size: 0.85rem;
+  background: transparent;
+}
+.react.mine { border-color: var(--moss); background: color-mix(in srgb, var(--moss) 16%, transparent); }
+.react em { font-style: normal; margin-left: 0.2rem; font-size: 0.7rem; }
 .hints {
   list-style: none;
   margin: 0 0 0.4rem;
@@ -438,6 +482,19 @@ html.dark .person-main:hover { background: rgba(255, 255, 255, 0.08); }
 .person.on .dot { background: var(--moss); }
 .person.away { opacity: 0.45; }
 .pn { font-weight: 600; }
+.queue-badge {
+  margin-left: auto;
+  min-width: 1.15rem;
+  padding: 0 0.28rem;
+  border-radius: 999px;
+  background: var(--wax);
+  color: #1b2017;
+  font-size: 0.68rem;
+  font-weight: 700;
+  font-style: normal;
+  text-align: center;
+}
+html.dark .queue-badge { color: #1b2017; }
 .focus {
   color: var(--rail-mute);
   font-size: 0.72rem;

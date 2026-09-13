@@ -1,16 +1,29 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { agentRequest, currentToken, saveIdentity } from "../client/http.ts";
+import { mkdirSync, readFileSync, existsSync } from "node:fs";
+import path from "node:path";
+import { agentDownloadToFile, agentRequest, agentUploadFile, loadIdentityByName, saveIdentity } from "../client/http.ts";
+import { imagePreview } from "../server/files.ts";
+import { guessMime } from "../shared/mime.ts";
 import { waitUntilMail } from "./wait-loop.ts";
-import { DEFAULT_WAIT_MS, type Agent, type Channel, type Identity, type Message, type WaitResult } from "../shared/types.ts";
+import { DEFAULT_WAIT_MS, IMAGE_PREVIEW_MAX_BYTES, MCP_HEARTBEAT_MS, type Agent, type Channel, type Identity, type WaitResult } from "../shared/types.ts";
 
 let sessionToken = process.env.HIVEMIND_TOKEN;
+let heartbeat: ReturnType<typeof setInterval> | undefined;
 
 function token(): string {
-  const t = sessionToken ?? currentToken();
-  if (!t) throw new Error("Join first with the join tool.");
-  return t;
+  if (!sessionToken) throw new Error("Join first with the join tool.");
+  return sessionToken;
+}
+
+function ensureHeartbeat() {
+  if (heartbeat) return;
+  heartbeat = setInterval(() => {
+    if (!sessionToken) return;
+    agentRequest("POST", "/api/agent/ping", {}, sessionToken).catch(() => undefined);
+  }, MCP_HEARTBEAT_MS);
+  heartbeat.unref();
 }
 
 function text(data: unknown) {
@@ -31,13 +44,14 @@ export async function startMcp() {
     },
     async ({ role, seniority, focus, resume }) => {
       const auth = resume
-        ? (sessionToken ?? currentToken())
+        ? (loadIdentityByName(resume)?.token ?? sessionToken)
         : process.env.HIVEMIND_TOKEN;
       const result = await agentRequest<{
         agent: Agent;
         token: string;
         created: boolean;
-        standingOrders: string;
+        standingOrders?: string;
+        ordersRef?: string;
         describe: string;
       }>(
         "POST",
@@ -46,6 +60,7 @@ export async function startMcp() {
         auth ?? null,
       );
       sessionToken = result.token;
+      ensureHeartbeat();
       saveIdentity({
         id: result.agent.id,
         name: result.agent.name,
@@ -60,35 +75,50 @@ export async function startMcp() {
         created: result.created,
         token: result.token,
         standingOrders: result.standingOrders,
-        next: "Call wait once with no arguments when idle. It returns only when you have mail. Do not pass a timeout.",
+        ordersRef: result.ordersRef,
+        next: result.created
+          ? "Call wait once with no arguments. After send, wait is the last call. Never end a turn without wait in flight."
+          : "Orders unchanged. Call standing_orders if you need them. Then wait once with no arguments. After send, wait is the last call.",
       });
     },
   );
 
-  server.tool("whoami", "Your Hivemind identity and standing orders.", async () => {
+  server.tool("whoami", "Your name, role, and online flag. Use standing_orders for the full rule block.", async () => {
     return text(await agentRequest("GET", "/api/agent/me", undefined, token()));
   });
 
-  server.tool("agents", "List Human, brains, and workers with online/offline and seniority.", async () => {
+  server.tool("standing_orders", "Full standing orders for this identity.", async () => {
+    return text(await agentRequest("GET", "/api/agent/me?orders=1", undefined, token()));
+  });
+
+  server.tool("agents", "Roster with online/offline.", async () => {
     return text(await agentRequest("GET", "/api/agent/agents", undefined, token()));
   });
 
-  server.tool("channels", "List channels and DMs you can see.", async () => {
-    return text(await agentRequest("GET", "/api/agent/channels", undefined, token()));
+  server.tool("channels", "Channels and DMs you can see. Pass unread=true for unread counts.", {
+    unread: z.boolean().optional(),
+  }, async ({ unread }) => {
+    const q = unread ? "?unread=1" : "";
+    return text(await agentRequest("GET", `/api/agent/channels${q}`, undefined, token()));
   });
 
   server.tool(
     "history",
-    "Read recent messages in a channel or DM. Workers may read public channel history when they need context.",
+    "Read a channel or DM. Default 20 messages. Use since to page forward.",
     {
-      channel: z.string().describe("Channel name, #slug, or id"),
+      channel: z.string(),
       threadId: z.string().optional(),
       limit: z.number().optional(),
+      since: z.number().optional(),
+      meta: z.boolean().optional(),
     },
-    async ({ channel, threadId, limit }) => {
+    async ({ channel, threadId, limit, since, meta }) => {
       const q = new URLSearchParams();
       if (threadId) q.set("threadId", threadId);
       if (limit) q.set("limit", String(limit));
+      if (since) q.set("afterSeq", String(since));
+      if (meta === true) q.set("meta", "1");
+      if (meta === false) q.set("meta", "0");
       const suffix = q.toString() ? `?${q}` : "";
       return text(
         await agentRequest(
@@ -103,14 +133,15 @@ export async function startMcp() {
 
   server.tool(
     "send",
-    "Post a message. Use channel for #general etc, or to for a DM by agent name. Workers cannot mention @Human or DM Human (unless Human already opened that DM).",
+    "Post to channel or to (DM by name). Workers cannot @Human or open a Human DM.",
     {
       body: z.string(),
       channel: z.string().optional(),
-      to: z.string().optional().describe("Agent name for a DM"),
+      to: z.string().optional(),
       threadId: z.string().optional(),
+      attachmentIds: z.array(z.string()).optional(),
     },
-    async ({ body, channel, to, threadId }) => {
+    async ({ body, channel, to, threadId, attachmentIds }) => {
       let channelId = channel;
       if (to) {
         const dm = await agentRequest<{ channel: Channel }>("POST", "/api/agent/dms", { name: to }, token());
@@ -118,10 +149,10 @@ export async function startMcp() {
       }
       if (!channelId) throw new Error("Provide channel or to");
       return text(
-        await agentRequest<{ message: Message }>(
+        await agentRequest<{ ok: boolean; seq: number; id: string }>(
           "POST",
           `/api/agent/channels/${encodeURIComponent(channelId)}/messages`,
-          { body, threadId: threadId ?? null },
+          { body, threadId: threadId ?? null, attachmentIds },
           token(),
         ),
       );
@@ -130,14 +161,14 @@ export async function startMcp() {
 
   server.tool(
     "wait",
-    "Sleep at your desk. Call once with no arguments. This tool does not return until you have mail — idle and transient network errors are retried inside the tool, not by you. Codex may show Working; that is sleep, not a model turn. Do not pass a timeout. Do not call wait in a loop. Do not call other Hivemind tools while waiting. Handle control clear_context first when it returns.",
+    "Sleep until mail. Call once, no args. When it returns, handle mail, then call wait again before you stop. Never end a turn without wait in flight.",
     {},
     async () => {
       const result = await waitUntilMail(() =>
         agentRequest<WaitResult>(
           "POST",
           "/api/agent/wait",
-          { timeoutMs: DEFAULT_WAIT_MS },
+          { timeoutMs: DEFAULT_WAIT_MS, compact: true },
           token(),
           DEFAULT_WAIT_MS + 10_000,
         ),
@@ -148,7 +179,7 @@ export async function startMcp() {
 
   server.tool(
     "create_channel",
-    "Brains and Human only. Create a public or private channel.",
+    "Brain only. Create a public or private channel.",
     {
       name: z.string(),
       type: z.enum(["public", "private"]).optional(),
@@ -181,7 +212,7 @@ export async function startMcp() {
 
   server.tool(
     "invite",
-    "Brain or Human only. Invite agents into a private channel.",
+    "Brain only. Invite into a private channel.",
     {
       channel: z.string(),
       members: z.array(z.string()),
@@ -200,13 +231,102 @@ export async function startMcp() {
 
   server.tool(
     "clear_context",
-    "Brain or Human only. Tell a worker to discard task memory and wait.",
+    "Brain only. Tell a worker to discard task memory and wait.",
     { agent: z.string() },
     async ({ agent }) => {
       return text(await agentRequest("POST", "/api/agent/clear-context", { name: agent }, token()));
     },
   );
 
+  server.tool(
+    "attach",
+    "Upload a local file and post it. Same channel/to/thread as send.",
+    {
+      path: z.string(),
+      body: z.string().optional(),
+      channel: z.string().optional(),
+      to: z.string().optional(),
+      threadId: z.string().optional(),
+      mime: z.string().optional(),
+    },
+    async ({ path: filePath, body, channel, to, threadId, mime }) => {
+      const resolved = path.resolve(filePath);
+      if (!existsSync(resolved)) throw new Error(`File not found: ${filePath}`);
+      const name = path.basename(resolved);
+      const guessed = mime ?? guessMime(name);
+      const uploaded = await agentUploadFile<{ file: { id: string; name: string; mime: string; bytes: number } }>(
+        "/api/agent/files",
+        resolved,
+        token(),
+        name,
+        guessed,
+      );
+      let channelId = channel;
+      if (to) {
+        const dm = await agentRequest<{ channel: Channel }>("POST", "/api/agent/dms", { name: to }, token());
+        channelId = dm.channel.id;
+      }
+      if (!channelId) throw new Error("Provide channel or to");
+      return text(
+        await agentRequest(
+          "POST",
+          `/api/agent/channels/${encodeURIComponent(channelId)}/messages`,
+          { body: body ?? "", threadId: threadId ?? null, attachmentIds: [uploaded.file.id] },
+          token(),
+        ),
+      );
+    },
+  );
+
+  server.tool(
+    "fetch_file",
+    "Download an attachment into .hivemind-inbox in this workspace. Images also return a small preview.",
+    { id: z.string().optional(), seq: z.number().optional(), index: z.number().optional() },
+    async ({ id, seq, index }) => {
+      let fileId = id;
+      if (!fileId) {
+        if (seq == null) throw new Error("Provide id or seq");
+        const listed = await agentRequest<{ message: { attachments?: Array<{ id: string }> } }>(
+          "GET",
+          `/api/agent/messages/${seq}`,
+          undefined,
+          token(),
+        );
+        const att = listed.message.attachments?.[index ?? 0];
+        if (!att) throw new Error("No attachment at that seq/index");
+        fileId = att.id;
+      }
+      const dir = path.join(process.cwd(), ".hivemind-inbox");
+      mkdirSync(dir, { recursive: true });
+      const file = await agentDownloadToFile(
+        `/api/agent/files/${encodeURIComponent(fileId)}`,
+        token(),
+        dir,
+        fileId.slice(0, 8),
+      );
+      const content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> = [
+        { type: "text", text: JSON.stringify({ ok: true, path: file.path, mime: file.mime, bytes: file.bytes }) },
+      ];
+      if (file.mime.startsWith("image/")) {
+        const hint =
+          file.bytes <= IMAGE_PREVIEW_MAX_BYTES ? readFileSync(file.path) : Buffer.alloc(IMAGE_PREVIEW_MAX_BYTES + 1);
+        const preview = imagePreview(file.path, file.mime, hint);
+        if (preview) content.push({ type: "image", data: preview.data.toString("base64"), mimeType: preview.mime });
+      }
+      return { content };
+    },
+  );
+
+  server.tool(
+    "react",
+    "Toggle a reaction on a message seq: 👍 👎 👀 🚩 ✅ ❓",
+    { seq: z.number(), emoji: z.string() },
+    async ({ seq, emoji }) => {
+      return text(await agentRequest("POST", `/api/agent/messages/${seq}/reactions`, { emoji }, token()));
+    },
+  );
+
+  if (sessionToken) ensureHeartbeat();
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }

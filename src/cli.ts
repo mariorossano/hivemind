@@ -1,16 +1,19 @@
 #!/usr/bin/env node
-import { resolve, dirname } from "node:path";
+import { resolve, dirname, basename, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DEFAULT_PORT } from "./shared/types.ts";
+import { DEFAULT_PORT, DEFAULT_WAIT_MS, MCP_HEARTBEAT_MS } from "./shared/types.ts";
+import { guessMime } from "./shared/mime.ts";
 import {
+  agentDownloadToFile,
   agentRequest,
+  agentUploadFile,
   currentToken,
   hiveUrl,
   identitiesDir,
   loadIdentityByName,
   saveIdentity,
 } from "./client/http.ts";
-import { readdirSync, existsSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync } from "node:fs";
 import type { Agent, Channel, Message, WaitResult } from "./shared/types.ts";
 import { parseJoinArgs } from "./shared/join-args.ts";
 
@@ -21,13 +24,17 @@ function help() {
   hivemind join --as worker junior|mid|senior [--focus …] [--resume Name]
   hivemind join --as worker --seniority junior|mid|senior
   hivemind join --as brain [--focus …] [--resume Name]
-  hivemind wait [--timeout 120]
-  hivemind send --channel NAME --body TEXT [--thread ID]
-  hivemind send --to NAME --body TEXT
+  hivemind wait [--timeout ${Math.round(DEFAULT_WAIT_MS / 1000)}]
+  hivemind send --channel NAME --body TEXT [--thread ID] [--file PATH]
+  hivemind send --to NAME --body TEXT [--file PATH]
+  hivemind fetch --id ATT_ID [--out DIR]
+  hivemind react --seq N --emoji 👍
+  hivemind gc
   hivemind history --channel NAME [--thread ID]
   hivemind agents
   hivemind channels
   hivemind whoami
+  hivemind standing-orders
   hivemind clear-context --agent NAME
   hivemind invite --channel NAME --member NAME
   hivemind identities
@@ -113,7 +120,7 @@ async function main() {
       agent: Agent;
       token: string;
       created: boolean;
-      standingOrders: string;
+      standingOrders?: string;
       describe: string;
     }>("POST", "/api/agent/join", {
       role: as,
@@ -131,8 +138,12 @@ async function main() {
     });
     console.log(`${result.created ? "Joined" : "Back"} as ${result.agent.name} · ${result.describe}`);
     console.log(`export HIVEMIND_TOKEN=${result.token}`);
-    console.log("");
-    console.log(result.standingOrders);
+    if (result.standingOrders) {
+      console.log("");
+      console.log(result.standingOrders);
+    } else {
+      console.log("orders unchanged — hivemind standing-orders");
+    }
     return;
   }
 
@@ -161,21 +172,30 @@ async function main() {
   }
 
   if (cmd === "wait") {
-    const timeout = Number(arg(argv, "--timeout") ?? 120) * 1000;
-    const result = await agentRequest<WaitResult>(
-      "POST",
-      "/api/agent/wait",
-      { timeoutMs: timeout },
-      token,
-      timeout + 10_000,
-    );
-    console.log(JSON.stringify(result, null, 2));
+    const timeout = Number(arg(argv, "--timeout") ?? Math.round(DEFAULT_WAIT_MS / 1000)) * 1000;
+    const beat = setInterval(() => {
+      agentRequest("POST", "/api/agent/ping", {}, token).catch(() => undefined);
+    }, MCP_HEARTBEAT_MS);
+    beat.unref();
+    try {
+      const result = await agentRequest<WaitResult>(
+        "POST",
+        "/api/agent/wait",
+        { timeoutMs: timeout, compact: true },
+        token,
+        timeout + 10_000,
+      );
+      console.log(JSON.stringify(result, null, 2));
+    } finally {
+      clearInterval(beat);
+    }
     return;
   }
 
   if (cmd === "send") {
-    const body = argRest(argv, "--body");
-    if (!body) throw new Error("send --body TEXT");
+    const body = argRest(argv, "--body") ?? "";
+    const file = arg(argv, "--file");
+    if (!body && !file) throw new Error("send --body TEXT  and/or  --file PATH");
     const thread = arg(argv, "--thread");
     const to = arg(argv, "--to");
     let channel = arg(argv, "--channel");
@@ -184,13 +204,54 @@ async function main() {
       channel = dm.channel.id;
     }
     if (!channel) throw new Error("send --channel NAME  or  --to NAME");
-    const result = await agentRequest<{ message: Message }>(
+    const attachmentIds: string[] = [];
+    if (file) {
+      const mime = guessMime(file);
+      if (mime === "application/octet-stream") throw new Error("unsupported file type");
+      const uploaded = await agentUploadFile<{ file: { id: string } }>(
+        "/api/agent/files",
+        resolvePath(file),
+        token,
+        basename(file),
+        mime,
+      );
+      attachmentIds.push(uploaded.file.id);
+    }
+    const result = await agentRequest<{ ok: boolean; seq: number; id: string }>(
       "POST",
       `/api/agent/channels/${encodeURIComponent(channel)}/messages`,
-      { body, threadId: thread ?? null },
+      { body, threadId: thread ?? null, attachmentIds },
       token,
     );
-    console.log(`sent ${result.message.id} as ${result.message.authorName}`);
+    console.log(`sent ${result.id} seq ${result.seq}`);
+    return;
+  }
+
+  if (cmd === "fetch") {
+    const id = arg(argv, "--id");
+    if (!id) throw new Error("fetch --id ATT_ID");
+    const out = arg(argv, "--out") ?? ".hivemind-inbox";
+    mkdirSync(out, { recursive: true });
+    const saved = await agentDownloadToFile(`/api/agent/files/${encodeURIComponent(id)}`, token, resolvePath(out), id.slice(0, 8));
+    console.log(saved.path);
+    return;
+  }
+
+  if (cmd === "react") {
+    const seq = Number(arg(argv, "--seq"));
+    const emoji = arg(argv, "--emoji");
+    if (!seq || !emoji) throw new Error("react --seq N --emoji 👍");
+    await agentRequest("POST", `/api/agent/messages/${seq}/reactions`, { emoji }, token);
+    console.log(`reacted ${emoji} on ${seq}`);
+    return;
+  }
+
+  if (cmd === "gc") {
+    const { Hive } = await import("./server/hive.ts");
+    const hive = new Hive();
+    const result = hive.gcFiles();
+    hive.db.close();
+    console.log(`gc attachments=${result.attachments} blobs=${result.blobs}`);
     return;
   }
 
@@ -198,9 +259,10 @@ async function main() {
     const channel = arg(argv, "--channel");
     if (!channel) throw new Error("history --channel NAME");
     const thread = arg(argv, "--thread");
+    const since = arg(argv, "--since");
     const result = await agentRequest<{ messages: Message[] }>(
       "GET",
-      `/api/agent/channels/${encodeURIComponent(channel)}/messages?limit=80${thread ? `&threadId=${thread}` : ""}`,
+      `/api/agent/channels/${encodeURIComponent(channel)}/messages?limit=${arg(argv, "--limit") ?? 20}&meta=${arg(argv, "--meta") ?? "0"}${thread ? `&threadId=${thread}` : ""}${since ? `&afterSeq=${since}` : ""}`,
       undefined,
       token,
     );
@@ -230,14 +292,13 @@ async function main() {
   }
 
   if (cmd === "whoami") {
-    const result = await agentRequest<{ you: Agent; standingOrders: string }>(
-      "GET",
-      "/api/agent/me",
-      undefined,
-      token,
-    );
-    console.log(JSON.stringify(result.you, null, 2));
-    console.log("");
+    const result = await agentRequest<{ you: Agent; ordersRef?: string }>("GET", "/api/agent/me", undefined, token);
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  if (cmd === "standing-orders") {
+    const result = await agentRequest<{ standingOrders: string }>("GET", "/api/agent/me?orders=1", undefined, token);
     console.log(result.standingOrders);
     return;
   }

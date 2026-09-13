@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent } from "react";
-import type { Agent, Channel, Message, ThreadStatus } from "../src/shared/types.ts";
+import type { Agent, Channel, Message, Thread, ThreadStatus } from "../src/shared/types.ts";
+import { REACTION_EMOJIS } from "../src/shared/types.ts";
 import { api, connectWs, type ChannelPayload, type Snapshot } from "./api.ts";
 import { renderBody } from "./markdown.tsx";
 
@@ -13,6 +14,47 @@ function parseHash(): Sel {
   if (parts[0] === "inbox") return { kind: "inbox" };
   if (parts[1]) return { kind: "channel", id: decodeURIComponent(parts[1]) };
   return { kind: "channel", id: "general" };
+}
+
+function patchPane(pane: ChannelPayload | null, msg: Message, viewingThread: string | null = null): ChannelPayload | null {
+  if (!pane || pane.channel.id !== msg.channelId) return pane;
+  if (pane.messages.some((m) => m.id === msg.id)) return pane;
+  if (viewingThread) {
+    if (msg.threadId === viewingThread || msg.id === viewingThread) {
+      return { ...pane, messages: [...pane.messages, msg] };
+    }
+    return pane;
+  }
+  if (msg.threadId) {
+    return {
+      ...pane,
+      replyCounts: { ...pane.replyCounts, [msg.threadId]: (pane.replyCounts[msg.threadId] ?? 0) + 1 },
+    };
+  }
+  return { ...pane, messages: [...pane.messages, msg] };
+}
+
+function replaceMessage(pane: ChannelPayload | null, msg: Message): ChannelPayload | null {
+  if (!pane) return pane;
+  if (!pane.messages.some((m) => m.id === msg.id)) return pane;
+  return { ...pane, messages: pane.messages.map((m) => (m.id === msg.id ? msg : m)) };
+}
+
+function upsertById<T extends { id: string }>(list: T[], item: T): T[] {
+  if (list.some((x) => x.id === item.id)) return list.map((x) => (x.id === item.id ? item : x));
+  return [...list, item];
+}
+
+function applyMessageToSnap(snap: Snapshot, msg: Message, viewingId: string | null): Snapshot {
+  const unread = { ...snap.unread };
+  if (msg.authorId !== snap.you.id && msg.channelId !== viewingId) {
+    unread[msg.channelId] = (unread[msg.channelId] ?? 0) + 1;
+  }
+  let mentions = snap.mentions;
+  if (msg.mentions.includes("human") && msg.channelId !== viewingId) {
+    mentions = [msg, ...mentions.filter((m) => m.id !== msg.id)].slice(0, 30);
+  }
+  return { ...snap, unread, mentions };
 }
 
 function setHash(sel: Sel) {
@@ -67,6 +109,10 @@ export function App() {
   const themePainted = useRef(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const threadBottomRef = useRef<HTMLDivElement>(null);
+  const selRef = useRef(sel);
+  selRef.current = sel;
+  const threadIdRef = useRef(threadId);
+  threadIdRef.current = threadId;
 
   const refreshSnap = useCallback(async () => {
     const next = await api.snapshot();
@@ -77,30 +123,63 @@ export function App() {
   const loadChannel = useCallback(async (id: string) => {
     const data = await api.messages(id);
     setPane(data);
+    setSnap((s) =>
+      s
+        ? {
+            ...s,
+            unread: { ...s.unread, [id]: 0 },
+            mentions: s.mentions.filter((m) => m.channelId !== id),
+          }
+        : s,
+    );
   }, []);
 
   useEffect(() => {
     refreshSnap().catch((e) => setErr(String(e.message || e)));
     const off = connectWs((ev) => {
-      if (ev.type === "hello") return;
-      refreshSnap().catch(() => undefined);
-      setSel((current) => {
-        if (current.kind === "channel") {
-          loadChannel(current.id).catch(() => undefined);
+      if (ev.type === "hello") {
+        refreshSnap().catch(() => undefined);
+        return;
+      }
+      if (ev.type === "message") {
+        const msg = ev.payload as Message;
+        setPane((p) => patchPane(p, msg, null));
+        setThreadPane((p) => patchPane(p, msg, threadIdRef.current));
+        const viewing = selRef.current.kind === "channel" ? selRef.current.id : null;
+        setSnap((s) => (s ? applyMessageToSnap(s, msg, viewing) : s));
+        return;
+      }
+      if (ev.type === "reaction") {
+        const payload = ev.payload as { message?: Message };
+        if (payload.message) {
+          setPane((p) => replaceMessage(p, payload.message!));
+          setThreadPane((p) => replaceMessage(p, payload.message!));
         }
-        return current;
-      });
-      setThreadId((tid) => {
-        if (tid) {
-          setSel((current) => {
-            if (current.kind === "channel") {
-              api.messages(current.id, tid).then(setThreadPane).catch(() => undefined);
-            }
-            return current;
-          });
-        }
-        return tid;
-      });
+        return;
+      }
+      if (ev.type === "agent") {
+        const agent = ev.payload as Agent;
+        setSnap((s) => (s ? { ...s, agents: upsertById(s.agents, agent) } : s));
+        return;
+      }
+      if (ev.type === "channel") {
+        const ch = ev.payload as Channel;
+        setSnap((s) => (s ? { ...s, channels: upsertById(s.channels, ch) } : s));
+        return;
+      }
+      if (ev.type === "thread") {
+        const thread = ev.payload as Thread;
+        setPane((p) => {
+          if (!p || p.channel.id !== thread.channelId) return p;
+          return { ...p, threads: upsertById(p.threads, thread) };
+        });
+        return;
+      }
+      if (ev.type === "queued") {
+        const q = ev.payload as { agentId: string; n: number };
+        setSnap((s) => (s ? { ...s, queued: { ...s.queued, [q.agentId]: q.n } } : s));
+        return;
+      }
     }, setLive);
     const onHash = () => {
       setSel(parseHash());
@@ -176,14 +255,17 @@ export function App() {
   const mentionTotal = snap?.mentions.length ?? 0;
   const roomIds = new Set(activeChannel?.memberIds ?? []);
 
-  const send = async (body: string, tid?: string | null) => {
-    if (sel.kind !== "channel" || !body.trim()) return;
-    await api.send(sel.id, body.trim(), tid);
+  const send = async (body: string, tid?: string | null, files?: File[]) => {
+    if (sel.kind !== "channel") return;
+    const attachmentIds: string[] = [];
+    for (const file of files ?? []) {
+      attachmentIds.push((await api.upload(file)).id);
+    }
+    if (!body.trim() && attachmentIds.length === 0) return;
+    await api.send(sel.id, body.trim(), tid, attachmentIds);
     if (tid) setThreadDraft("");
     else setDraft("");
-    await loadChannel(sel.id);
     if (tid) setThreadPane(await api.messages(sel.id, tid));
-    await refreshSnap();
   };
 
   const onCreate = async () => {
@@ -350,7 +432,41 @@ export function App() {
 
       <main className="desk">
         {sel.kind === "inbox" ? (
-          <Inbox mentions={snap.mentions} agents={snap.agents} onOpen={(id) => go({ kind: "channel", id })} />
+          <Inbox
+            mentions={snap.mentions}
+            hasMore={Boolean(snap.mentionsHasMore)}
+            agents={snap.agents}
+            onOpen={(id) => go({ kind: "channel", id })}
+            onOlder={() => {
+              const oldest = snap.mentions[snap.mentions.length - 1]?.seq;
+              if (!oldest) return;
+              api.mentions(oldest).then((page) => {
+                setSnap((s) =>
+                  s
+                    ? {
+                        ...s,
+                        mentions: [...s.mentions, ...page.messages.filter((m) => !s.mentions.some((x) => x.id === m.id))],
+                        mentionsHasMore: page.hasMore,
+                      }
+                    : s,
+                );
+              }).catch((e) => setErr(String(e.message || e)));
+            }}
+            onMarkSeen={() => {
+              api.markMentionsSeen().then((page) => {
+                setSnap((s) =>
+                  s
+                    ? {
+                        ...s,
+                        mentions: page.messages,
+                        mentionsHasMore: page.hasMore,
+                        unread: page.unread,
+                      }
+                    : s,
+                );
+              }).catch((e) => setErr(String(e.message || e)));
+            }}
+          />
         ) : (
           <>
             <header className="desk-h">
@@ -397,6 +513,7 @@ export function App() {
                   replies={pane?.replyCounts[m.id] ?? 0}
                   status={pane?.threads.find((t) => t.id === m.id)?.status ?? null}
                   onThread={() => setThreadId(m.id)}
+                  onReact={(emoji) => api.react(m.seq, emoji).then((r) => setPane((p) => replaceMessage(p, r.message)))}
                 />
               ))}
               <div ref={bottomRef} />
@@ -410,7 +527,7 @@ export function App() {
                   ? `Message ${channelTitle(activeChannel)}`
                   : "Write…"
               }
-              onSend={() => send(draft)}
+              onSend={(files) => send(draft, undefined, files)}
             />
           </>
         )}
@@ -451,7 +568,13 @@ export function App() {
           </header>
           <div className="stream">
             {threadPane.messages.map((m) => (
-              <Msg key={m.id} m={m} replies={0} status={null} />
+              <Msg
+                key={m.id}
+                m={m}
+                replies={0}
+                status={null}
+                onReact={(emoji) => api.react(m.seq, emoji).then((r) => setThreadPane((p) => replaceMessage(p, r.message)))}
+              />
             ))}
             <div ref={threadBottomRef} />
           </div>
@@ -460,7 +583,7 @@ export function App() {
             value={threadDraft}
             onChange={setThreadDraft}
             placeholder="Reply in thread…"
-            onSend={() => send(threadDraft, threadId)}
+            onSend={(files) => send(threadDraft, threadId, files)}
           />
         </aside>
       )}
@@ -470,6 +593,7 @@ export function App() {
         <AgentList
           agents={roomAgents}
           presentIds={roomIds}
+          queued={snap.queued ?? {}}
           onOpen={onAgent}
           confirmClear={confirmClear}
           setConfirmClear={setConfirmClear}
@@ -632,12 +756,18 @@ function ChannelItem({
 
 function Inbox({
   mentions,
+  hasMore,
   agents,
   onOpen,
+  onOlder,
+  onMarkSeen,
 }: {
   mentions: Message[];
+  hasMore: boolean;
   agents: Agent[];
   onOpen: (channelId: string) => void;
+  onOlder: () => void;
+  onMarkSeen: () => void;
 }) {
   return (
     <>
@@ -646,6 +776,11 @@ function Inbox({
           <h1>For you</h1>
           <p>@Human mentions. Brains ask you here when a cycle is done or when they are stuck.</p>
         </div>
+        {mentions.length > 0 && (
+          <button type="button" className="text-btn" onClick={onMarkSeen}>
+            Mark seen
+          </button>
+        )}
       </header>
       <div className="stream">
         {mentions.length === 0 && (
@@ -659,6 +794,11 @@ function Inbox({
             <span className="open-link">open conversation</span>
           </button>
         ))}
+        {hasMore && (
+          <button type="button" className="older" onClick={onOlder}>
+            Older mentions
+          </button>
+        )}
       </div>
       <div className="hint">
         {agents.filter((a) => a.role !== "human").length === 0
@@ -674,11 +814,13 @@ function Msg({
   replies,
   status,
   onThread,
+  onReact,
 }: {
   m: Message;
   replies: number;
   status: ThreadStatus | null;
   onThread?: () => void;
+  onReact?: (emoji: string) => void;
 }) {
   const time = new Date(m.createdAt).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
   return (
@@ -691,7 +833,41 @@ function Msg({
           <time>{time}</time>
           {status && <span className={`st st-${status}`}>{status.replace("_", " ")}</span>}
         </div>
-        <div className="msg-b">{renderBody(m.body)}</div>
+        {m.body && <div className="msg-b">{renderBody(m.body)}</div>}
+        {(m.attachments?.length ?? 0) > 0 && (
+          <div className="atts">
+            {m.attachments!.map((a) =>
+              a.mime.startsWith("image/") ? (
+                <a key={a.id} href={api.fileUrl(a.id)} target="_blank" rel="noreferrer">
+                  <img className="att-img" src={api.fileUrl(a.id)} alt={a.name} />
+                </a>
+              ) : (
+                <a key={a.id} className="att-chip" href={api.fileUrl(a.id)} target="_blank" rel="noreferrer">
+                  {a.name}
+                  <small>{Math.max(1, Math.round(a.bytes / 1024))} KB</small>
+                </a>
+              ),
+            )}
+          </div>
+        )}
+        {m.kind === "chat" && onReact && (
+          <div className="reacts">
+            {REACTION_EMOJIS.map((emoji) => {
+              const hit = m.reactions?.find((r) => r.emoji === emoji);
+              return (
+                <button
+                  key={emoji}
+                  type="button"
+                  className={`react ${hit?.mine ? "mine" : ""}`}
+                  onClick={() => onReact(emoji)}
+                >
+                  {emoji}
+                  {hit && hit.count > 0 && <em>{hit.count}</em>}
+                </button>
+              );
+            })}
+          </div>
+        )}
         {onThread && m.kind === "chat" && (
           <button type="button" className="replies" onClick={onThread}>
             {replies > 0 ? `${replies} ${replies === 1 ? "reply" : "replies"}` : "Thread"}
@@ -712,16 +888,28 @@ function Composer({
   agents: Agent[];
   value: string;
   onChange: (v: string) => void;
-  onSend: () => void;
+  onSend: (files?: File[]) => void;
   placeholder: string;
 }) {
   const [hint, setHint] = useState<Agent[]>([]);
+  const [files, setFiles] = useState<File[]>([]);
   const names = useMemo(() => agents, [agents]);
+  const pick = useRef<HTMLInputElement>(null);
+
+  const addFiles = (list: FileList | File[]) => {
+    const next = [...files, ...Array.from(list)].slice(0, 4);
+    setFiles(next);
+  };
+
+  const flush = () => {
+    onSend(files);
+    setFiles([]);
+  };
 
   const onKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      onSend();
+      flush();
     }
   };
 
@@ -735,7 +923,14 @@ function Composer({
   };
 
   return (
-    <div className="composer">
+    <div
+      className="composer"
+      onDragOver={(e) => e.preventDefault()}
+      onDrop={(e) => {
+        e.preventDefault();
+        if (e.dataTransfer.files.length) addFiles(e.dataTransfer.files);
+      }}
+    >
       {hint.length > 0 && (
         <ul className="hints">
           {hint.map((a) => (
@@ -754,15 +949,51 @@ function Composer({
           ))}
         </ul>
       )}
+      {files.length > 0 && (
+        <ul className="pending-files">
+          {files.map((f, i) => (
+            <li key={`${f.name}-${i}`}>
+              {f.name}
+              <button type="button" onClick={() => setFiles(files.filter((_, j) => j !== i))}>
+                ×
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
       <div className="composer-box">
+        <input
+          ref={pick}
+          type="file"
+          hidden
+          multiple
+          accept="image/*,.pdf,.txt,.csv,.json,.zip"
+          onChange={(e) => {
+            if (e.target.files) addFiles(e.target.files);
+            e.target.value = "";
+          }}
+        />
+        <button type="button" className="clip" title="Attach" onClick={() => pick.current?.click()}>
+          📎
+        </button>
         <textarea
           rows={2}
           value={value}
           placeholder={placeholder}
           onChange={(e) => onInput(e.target.value)}
           onKeyDown={onKey}
+          onPaste={(e) => {
+            const pasted = [...e.clipboardData.items]
+              .filter((item) => item.kind === "file")
+              .map((item) => item.getAsFile())
+              .filter((f): f is File => Boolean(f));
+            if (pasted.length) {
+              e.preventDefault();
+              addFiles(pasted);
+            }
+          }}
         />
-        <button type="button" className="send" onClick={onSend} disabled={!value.trim()}>
+        <button type="button" className="send" onClick={flush} disabled={!value.trim() && files.length === 0}>
           Send
         </button>
       </div>
@@ -790,6 +1021,7 @@ function Avatar({ name, role, online, small }: { name: string; role?: string; on
 function AgentList({
   agents,
   presentIds,
+  queued,
   onOpen,
   confirmClear,
   setConfirmClear,
@@ -797,6 +1029,7 @@ function AgentList({
 }: {
   agents: Agent[];
   presentIds: Set<string>;
+  queued: Record<string, number>;
   onOpen: (a: Agent) => void;
   confirmClear: string | null;
   setConfirmClear: (n: string | null) => void;
@@ -814,13 +1047,14 @@ function AgentList({
       {human && <PersonRow agent={human} onOpen={() => undefined} self away={away(human.id)} />}
       {brains.length > 0 && <div className="subh">brain</div>}
       {brains.map((a) => (
-        <PersonRow key={a.id} agent={a} onOpen={() => onOpen(a)} away={away(a.id)} />
+        <PersonRow key={a.id} agent={a} queued={queued[a.id] ?? 0} onOpen={() => onOpen(a)} away={away(a.id)} />
       ))}
       {workers.length > 0 && <div className="subh">worker</div>}
       {workers.map((a) => (
         <PersonRow
           key={a.id}
           agent={a}
+          queued={queued[a.id] ?? 0}
           onOpen={() => onOpen(a)}
           away={away(a.id)}
           confirmClear={confirmClear}
@@ -840,6 +1074,7 @@ function AgentList({
 
 function PersonRow({
   agent,
+  queued,
   onOpen,
   self,
   away,
@@ -848,6 +1083,7 @@ function PersonRow({
   onClear,
 }: {
   agent: Agent;
+  queued?: number;
   onOpen: () => void;
   self?: boolean;
   away?: boolean;
@@ -870,6 +1106,11 @@ function PersonRow({
         )}
         {agent.seniority && <span className="sen">{agent.seniority}</span>}
         {agent.focus && <span className="focus">{agent.focus}</span>}
+        {queued ? (
+          <em className="queue-badge" title={`${queued} waiting`}>
+            {queued > 99 ? "99+" : queued}
+          </em>
+        ) : null}
       </button>
       {agent.role === "worker" && setConfirmClear && onClear && (
         confirmClear === agent.name ? (

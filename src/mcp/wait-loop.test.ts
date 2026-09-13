@@ -1,15 +1,16 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { isTransientWaitError, waitUntilMail } from "./wait-loop.ts";
-import type { WaitResult } from "../shared/types.ts";
+import { WAIT_NEXT, type WaitResult } from "../shared/types.ts";
 
 function idle(): WaitResult {
-  return { idle: true, you: {} as WaitResult["you"], control: [], mentions: [], messages: [] };
+  return { idle: true, next: WAIT_NEXT, you: {} as WaitResult["you"], control: [], mentions: [], messages: [] };
 }
 
 function mail(): WaitResult {
   return {
     idle: false,
+    next: WAIT_NEXT,
     you: {} as WaitResult["you"],
     control: [],
     mentions: [],
@@ -51,5 +52,40 @@ test("auth errors are not swallowed", async () => {
     /Join first/,
   );
   assert.equal(isTransientWaitError(new Error("HTTP 401")), false);
+  assert.equal(isTransientWaitError(new Error("HTTP 409 superseded")), false);
+  assert.equal(isTransientWaitError(new Error("superseded")), false);
   assert.equal(isTransientWaitError(new Error("fetch failed")), true);
+  assert.equal(isTransientWaitError(new Error("HTTP 500")), true);
+});
+
+test("transient errors stop after a bounded number of retries", async () => {
+  let calls = 0;
+  await assert.rejects(
+    () =>
+      waitUntilMail(
+        async () => {
+          calls += 1;
+          throw new Error("fetch failed");
+        },
+        { delay: async () => undefined, maxTransientErrors: 8 },
+      ),
+    /fetch failed/,
+  );
+  assert.equal(calls, 8);
+});
+
+test("stable HTTP 5xx stops after a few retries", async () => {
+  let calls = 0;
+  await assert.rejects(
+    () =>
+      waitUntilMail(
+        async () => {
+          calls += 1;
+          throw new Error("HTTP 500 boom");
+        },
+        { delay: async () => undefined, maxServerErrors: 5 },
+      ),
+    /HTTP 500/,
+  );
+  assert.equal(calls, 5);
 });

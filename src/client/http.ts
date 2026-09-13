@@ -1,6 +1,9 @@
-import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, existsSync, createReadStream, createWriteStream, statSync } from "node:fs";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import path from "node:path";
 import { hiveHome } from "../server/hive.ts";
+import { safeFileName } from "../server/files.ts";
 import type { Identity } from "../shared/types.ts";
 
 export function identitiesDir(): string {
@@ -70,4 +73,113 @@ export async function agentRequest<T>(
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+export async function agentUpload<T>(
+  pathname: string,
+  bytes: Buffer,
+  token: string,
+  name: string,
+  mime: string,
+): Promise<T> {
+  return parseJsonResponse(
+    await fetch(`${hiveUrl()}${pathname}`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/octet-stream",
+        "x-file-name": name,
+        "x-file-mime": mime,
+      },
+      body: new Uint8Array(bytes),
+    }),
+  );
+}
+
+export async function agentUploadFile<T>(
+  pathname: string,
+  filePath: string,
+  token: string,
+  name: string,
+  mime: string,
+): Promise<T> {
+  const { size } = statSync(filePath);
+  return parseJsonResponse(
+    await fetch(`${hiveUrl()}${pathname}`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/octet-stream",
+        "x-file-name": name,
+        "x-file-mime": mime,
+        "content-length": String(size),
+      },
+      body: Readable.toWeb(createReadStream(filePath)),
+      duplex: "half",
+    } as unknown as RequestInit),
+  );
+}
+
+async function parseJsonResponse<T>(res: Response): Promise<T> {
+  const text = await res.text();
+  const data = text ? JSON.parse(text) : {};
+  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  return data as T;
+}
+
+function fileNameFromDisposition(disp: string): string {
+  return /filename="([^"]+)"/.exec(disp)?.[1] ?? "file";
+}
+
+export async function agentDownloadToFile(
+  pathname: string,
+  token: string,
+  destDir: string,
+  filePrefix: string,
+): Promise<{ path: string; mime: string; name: string; bytes: number }> {
+  const res = await fetch(`${hiveUrl()}${pathname}`, {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    let error = `HTTP ${res.status}`;
+    try {
+      error = JSON.parse(text).error || error;
+    } catch {
+      /* keep */
+    }
+    throw new Error(error);
+  }
+  if (!res.body) throw new Error("Empty download");
+  const name = fileNameFromDisposition(res.headers.get("content-disposition") ?? "");
+  const dest = path.join(destDir, `${filePrefix}-${safeFileName(name)}`);
+  await pipeline(Readable.fromWeb(res.body as import("node:stream/web").ReadableStream), createWriteStream(dest));
+  return {
+    path: dest,
+    mime: res.headers.get("content-type") || "application/octet-stream",
+    name,
+    bytes: statSync(dest).size,
+  };
+}
+
+export async function agentDownload(
+  pathname: string,
+  token: string,
+): Promise<{ bytes: Buffer; mime: string; name: string }> {
+  const res = await fetch(`${hiveUrl()}${pathname}`, {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    let error = `HTTP ${res.status}`;
+    try {
+      error = JSON.parse(text).error || error;
+    } catch {
+      /* keep */
+    }
+    throw new Error(error);
+  }
+  const bytes = Buffer.from(await res.arrayBuffer());
+  const mime = res.headers.get("content-type") || "application/octet-stream";
+  return { bytes, mime, name: fileNameFromDisposition(res.headers.get("content-disposition") ?? "") };
 }

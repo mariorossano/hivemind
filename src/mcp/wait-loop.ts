@@ -1,6 +1,7 @@
 import type { WaitResult } from "../shared/types.ts";
 
-const FATAL = /join first|no token|HTTP 401|HTTP 403|HTTP 404/i;
+const FATAL = /join first|no token|HTTP 401|HTTP 403|HTTP 404|HTTP 409|superseded/i;
+const SERVER = /HTTP 5\d\d/;
 
 export function isTransientWaitError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
@@ -10,16 +11,34 @@ export function isTransientWaitError(err: unknown): boolean {
 
 export async function waitUntilMail(
   callWait: () => Promise<WaitResult>,
-  opts: { delay?: (ms: number) => Promise<void>; retryDelayMs?: number } = {},
+  opts: {
+    delay?: (ms: number) => Promise<void>;
+    retryDelayMs?: number;
+    maxServerErrors?: number;
+    maxTransientErrors?: number;
+  } = {},
 ): Promise<WaitResult> {
   const delay = opts.delay ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
   const retryDelayMs = opts.retryDelayMs ?? 1500;
+  const maxServerErrors = opts.maxServerErrors ?? 5;
+  const maxTransientErrors = opts.maxTransientErrors ?? 20;
+  let serverErrors = 0;
+  let transientErrors = 0;
   for (;;) {
     try {
       const result = await callWait();
+      serverErrors = 0;
+      transientErrors = 0;
       if (!result.idle) return result;
     } catch (err) {
       if (!isTransientWaitError(err)) throw err;
+      const msg = err instanceof Error ? err.message : String(err);
+      transientErrors += 1;
+      if (SERVER.test(msg)) {
+        serverErrors += 1;
+        if (serverErrors >= maxServerErrors) throw err;
+      }
+      if (transientErrors >= maxTransientErrors) throw err;
       await delay(retryDelayMs);
     }
   }

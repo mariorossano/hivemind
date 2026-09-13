@@ -6,3 +6,5 @@ web/dist
 .env
 .env.*
 *.db
+.hivemind-inbox
+telegram.json

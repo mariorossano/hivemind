@@ -1,0 +1,683 @@
+import { existsSync, openAsBlob, readFileSync } from "node:fs";
+import path from "node:path";
+import { FILE_MAX_BYTES, HUMAN_ID, REACTION_EMOJIS, type Channel, type Message } from "../shared/types.ts";
+import { resolveUploadMime } from "../shared/mime.ts";
+import { Hive, channelLabel } from "./hive.ts";
+import { hiveHome } from "./paths.ts";
+import { filePathForHash, safeFileName } from "./files.ts";
+
+export type TelegramConfig = {
+  botToken: string;
+  groupChatId: number;
+  allowUserIds: number[];
+};
+
+export function loadTelegramConfig(home = hiveHome()): TelegramConfig | null {
+  const file = path.join(home, "telegram.json");
+  if (!existsSync(file)) return null;
+  try {
+    const raw = JSON.parse(readFileSync(file, "utf8")) as {
+      botToken?: string;
+      groupChatId?: number;
+      allowUserIds?: Array<number | string>;
+    };
+    const botToken = String(raw.botToken ?? "").trim();
+    const groupChatId = Number(raw.groupChatId);
+    const allowUserIds = (raw.allowUserIds ?? []).map((n) => Number(n)).filter((n) => Number.isFinite(n));
+    if (!botToken || !Number.isFinite(groupChatId) || allowUserIds.length === 0) return null;
+    return { botToken, groupChatId, allowUserIds };
+  } catch {
+    return null;
+  }
+}
+
+export function shouldNotify(msg: Message, ch: Channel, muted: boolean): boolean {
+  if (muted) return false;
+  if (msg.kind !== "chat") return false;
+  if (msg.mentions.includes(HUMAN_ID)) return true;
+  if (ch.type === "brains") return true;
+  if (ch.type === "dm" && ch.memberIds.includes(HUMAN_ID) && msg.authorRole === "brain") return true;
+  return false;
+}
+
+export function formatOutbound(msg: Message): string {
+  const body = msg.body.slice(0, 4000);
+  return `${msg.authorName}\n${body}`.slice(0, 4096);
+}
+
+export function reactionIgnoreKey(telegramMessageId: number, emojis: string[]): string {
+  return `${telegramMessageId}:${[...emojis].sort().join(",")}`;
+}
+
+export function inboundBody(firstName: string | undefined, text: string): string {
+  const name = (firstName ?? "Human").replace(/[\[\]]/g, "").slice(0, 40);
+  const trimmed = text.trim();
+  return (trimmed ? `[${name}] ${trimmed}` : `[${name}]`).slice(0, 4000);
+}
+
+export function inboundPostBody(firstName: string | undefined, text: string, hasFiles: boolean): string {
+  const trimmed = text.trim();
+  if (!trimmed && hasFiles) return "";
+  return inboundBody(firstName, trimmed);
+}
+
+type ApiResult = {
+  ok: boolean;
+  description?: string;
+  parameters?: { retry_after?: number };
+  result?: unknown;
+};
+
+export function requireTelegramOk(sent: ApiResult, what: string): ApiResult {
+  if (!sent.ok) throw new Error(sent.description ?? `telegram ${what} failed`);
+  return sent;
+}
+
+export const TELEGRAM_PENDING_GIVE_UP = 5;
+
+export function telegramJobKey(seq: number, kind: string): string {
+  return `${seq}:${kind}`;
+}
+
+export function nextTelegramFailure(
+  prev: { key: string; n: number } | null,
+  seq: number,
+  kind: string,
+): { key: string; n: number } {
+  const key = telegramJobKey(seq, kind);
+  if (prev?.key === key) return { key, n: prev.n + 1 };
+  return { key, n: 1 };
+}
+
+export function shouldDropTelegramJob(failures: number, giveUp = TELEGRAM_PENDING_GIVE_UP): boolean {
+  return failures >= giveUp;
+}
+
+export function isTelegramTopicRightsError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /not enough rights|bot needs Manage Topics/i.test(msg);
+}
+
+export function telegramFileTooLarge(fileSize: number | undefined, cap = FILE_MAX_BYTES): boolean {
+  return fileSize != null && fileSize > cap;
+}
+
+export function telegramMessageHasFiles(message: { photo?: unknown[]; document?: unknown }): boolean {
+  return Boolean((message.photo && message.photo.length > 0) || message.document);
+}
+
+export function telegramGeneralThreadId(channelId: string): number | null {
+  return channelId === "general" ? 1 : null;
+}
+
+export const TELEGRAM_PENDING_CAP = 200;
+
+export function enqueueTelegramPending(
+  db: Hive["db"],
+  seq: number,
+  kind: "message" | "reaction",
+  cap = TELEGRAM_PENDING_CAP,
+) {
+  db.prepare("INSERT OR IGNORE INTO telegram_pending (seq, kind) VALUES (?, ?)").run(seq, kind);
+  const n = (db.prepare("SELECT COUNT(*) AS n FROM telegram_pending").get() as { n: number }).n;
+  if (n <= cap) return;
+  db.prepare(
+    `DELETE FROM telegram_pending WHERE rowid IN (
+      SELECT rowid FROM telegram_pending ORDER BY seq ASC, kind ASC LIMIT ?
+    )`,
+  ).run(n - cap);
+}
+
+export function startTelegram(hive: Hive, cfg = loadTelegramConfig()): { stop: () => void } | null {
+  if (!cfg) return null;
+  const bridge = new TelegramBridge(hive, cfg);
+  bridge.start();
+  return { stop: () => bridge.stop() };
+}
+
+class TelegramBridge {
+  private stopped = false;
+  private pumping = false;
+  private pumpFails: { key: string; n: number } | null = null;
+  private topicRightsHinted = false;
+  private topicLocks = new Map<string, Promise<number | null>>();
+  private poll: Promise<void> | null = null;
+  private ignoreReaction = new Map<string, number>();
+
+  constructor(
+    private hive: Hive,
+    private cfg: TelegramConfig,
+  ) {}
+
+  start() {
+    this.hive.bus.on("message", this.onHiveMessage);
+    this.hive.bus.on("reaction", this.onHiveReaction);
+    this.poll = this.pollLoop();
+    void this.pump();
+    console.error("hivemind telegram bridge on");
+  }
+
+  stop() {
+    this.stopped = true;
+    this.hive.bus.off("message", this.onHiveMessage);
+    this.hive.bus.off("reaction", this.onHiveReaction);
+  }
+
+  private onHiveMessage = (payload: unknown) => {
+    const msg = payload as Message;
+    if (!msg?.id || this.hive.fromTelegram(msg.id)) return;
+    if (msg.kind !== "chat") return;
+    this.queuePending(msg.seq, "message");
+  };
+
+  private onHiveReaction = (payload: unknown) => {
+    const body = payload as { message?: Message; seq?: number };
+    const seq = body.message?.seq ?? body.seq;
+    if (seq == null) return;
+    this.queuePending(seq, "reaction");
+  };
+
+  private async ensureTopic(ch: Channel): Promise<number | null> {
+    const row = this.hive.db.prepare("SELECT telegram_thread_id AS id FROM telegram_topics WHERE channel_id = ?").get(
+      ch.id,
+    ) as { id: number } | undefined;
+    if (row) return row.id;
+    const generalThread = telegramGeneralThreadId(ch.id);
+    if (generalThread != null) {
+      this.hive.db.prepare("INSERT OR IGNORE INTO telegram_topics (channel_id, telegram_thread_id) VALUES (?, ?)").run(
+        ch.id,
+        generalThread,
+      );
+      await this.flushHolds(generalThread);
+      return generalThread;
+    }
+    const pending = this.topicLocks.get(ch.id);
+    if (pending) return pending;
+    const work = this.createTopic(ch);
+    this.topicLocks.set(ch.id, work);
+    try {
+      return await work;
+    } finally {
+      this.topicLocks.delete(ch.id);
+    }
+  }
+
+  private hintTopicRights() {
+    if (this.topicRightsHinted) return;
+    this.topicRightsHinted = true;
+    console.error(
+      "telegram: the bot is admin but Manage Topics is off. In the forum group: Administrators → the bot → enable Manage Topics.",
+    );
+  }
+
+  private async createTopic(ch: Channel): Promise<number | null> {
+    const again = this.hive.db.prepare("SELECT telegram_thread_id AS id FROM telegram_topics WHERE channel_id = ?").get(
+      ch.id,
+    ) as { id: number } | undefined;
+    if (again) return again.id;
+    const name = channelLabel(ch).slice(0, 128);
+    const created = await this.api("createForumTopic", { chat_id: this.cfg.groupChatId, name });
+    const result = created.result as { message_thread_id?: number } | undefined;
+    if (!created.ok || !result?.message_thread_id) {
+      const description = created.description ?? "";
+      console.error("telegram createForumTopic failed", description);
+      if (/not enough rights/i.test(description)) {
+        this.hintTopicRights();
+        throw new Error("telegram topic not ready: bot needs Manage Topics");
+      }
+      return null;
+    }
+    this.hive.db.prepare("INSERT OR IGNORE INTO telegram_topics (channel_id, telegram_thread_id) VALUES (?, ?)").run(
+      ch.id,
+      result.message_thread_id,
+    );
+    await this.flushHolds(result.message_thread_id);
+    return result.message_thread_id;
+  }
+
+  private async pollLoop() {
+    while (!this.stopped) {
+      try {
+        const offset = Number(this.state("offset") ?? "0");
+        const data = await this.api("getUpdates", {
+          offset: offset || undefined,
+          timeout: 25,
+          allowed_updates: ["message", "message_reaction"],
+        });
+        const updates = (data.result as Array<{
+          update_id: number;
+          message?: TelegramMessage;
+          message_reaction?: TelegramReaction;
+        }>) ?? [];
+        for (const update of updates) {
+          if (this.seen(update.update_id)) {
+            this.setState("offset", String(update.update_id + 1));
+            continue;
+          }
+          try {
+            if (update.message) await this.onTelegramMessage(update.message);
+            if (update.message_reaction) await this.onTelegramReaction(update.message_reaction);
+            this.markSeen(update.update_id);
+            this.setState("offset", String(update.update_id + 1));
+          } catch (err) {
+            console.error("telegram update", err instanceof Error ? err.message : err);
+            break;
+          }
+        }
+      } catch (err) {
+        if (this.stopped) return;
+        console.error("telegram poll", err instanceof Error ? err.message : err);
+        await sleep(2000);
+      }
+    }
+  }
+
+  private async onTelegramMessage(message: TelegramMessage) {
+    if (Number(message.chat?.id) !== this.cfg.groupChatId) return;
+    const already = this.hive.db.prepare("SELECT seq FROM telegram_out WHERE telegram_message_id = ?").get(
+      message.message_id,
+    );
+    if (already) return;
+    const fromId = Number(message.from?.id);
+    if (!Number.isFinite(fromId) || !this.cfg.allowUserIds.includes(fromId)) return;
+    if (message.from?.is_bot) return;
+    const text = String(message.text ?? message.caption ?? "").trim();
+    if (text.startsWith("/")) {
+      await this.onCommand(text, message);
+      return;
+    }
+    if (!text && !telegramMessageHasFiles(message)) return;
+    const channelId = await this.resolveInboundChannel(message);
+    if (!channelId) {
+      this.holdMessage(message);
+      return;
+    }
+    const attachmentIds = await this.filesFromMessage(message);
+    if (!text && attachmentIds.length === 0) return;
+    let threadId: string | null = null;
+    const replyId = message.reply_to_message?.message_id;
+    if (replyId) {
+      const mapped = this.hive.db.prepare("SELECT thread_id AS id FROM telegram_out WHERE telegram_message_id = ?").get(
+        replyId,
+      ) as { id: string | null } | undefined;
+      threadId = mapped?.id ?? null;
+    }
+    const posted = this.hive.postMessage(this.hive.getAgent(HUMAN_ID), {
+      channel: channelId,
+      body: inboundPostBody(message.from?.first_name, text, attachmentIds.length > 0),
+      threadId,
+      source: "telegram",
+      attachmentIds,
+    });
+    this.hive.db.prepare(
+      `INSERT OR REPLACE INTO telegram_out (telegram_message_id, seq, channel_id, thread_id) VALUES (?, ?, ?, ?)`,
+    ).run(message.message_id, posted.seq, posted.channelId, posted.threadId);
+  }
+
+  private async onTelegramReaction(update: TelegramReaction) {
+    if (Number(update.chat?.id) !== this.cfg.groupChatId) return;
+    const fromId = Number(update.user?.id);
+    if (!Number.isFinite(fromId) || !this.cfg.allowUserIds.includes(fromId)) return;
+    if (update.user?.is_bot) return;
+    const mapped = this.hive.db.prepare("SELECT seq FROM telegram_out WHERE telegram_message_id = ?").get(
+      update.message_id,
+    ) as { seq: number } | undefined;
+    if (!mapped) return;
+    const next = new Set(emojisOf(update.new_reaction));
+    const prev = new Set(emojisOf(update.old_reaction));
+    const key = reactionIgnoreKey(update.message_id, [...next]);
+    const ignoredAt = this.ignoreReaction.get(key);
+    if (ignoredAt != null && Date.now() - ignoredAt < 120_000) return;
+    this.pruneIgnoreReactions();
+    const human = this.hive.getAgent(HUMAN_ID);
+    for (const emoji of REACTION_EMOJIS) {
+      const nowOn = next.has(emoji);
+      const wasOn = prev.has(emoji);
+      if (nowOn === wasOn) continue;
+      const current = this.hive.getMessageBySeq(mapped.seq);
+      const mine = this.hive.hasReaction(HUMAN_ID, current.id, emoji);
+      if (nowOn && !mine) this.hive.toggleReaction(human, mapped.seq, emoji);
+      if (!nowOn && mine) this.hive.toggleReaction(human, mapped.seq, emoji);
+    }
+  }
+
+  private async onCommand(text: string, message: TelegramMessage) {
+    const cmd = text.split(/\s+/)[0]?.replace(/@\w+$/, "") ?? "";
+    if (cmd === "/mute") {
+      this.setState("mute", "1");
+      await this.reply(message, "pings muted");
+      return;
+    }
+    if (cmd === "/unmute") {
+      this.setState("mute", "0");
+      await this.reply(message, "pings on");
+      return;
+    }
+    if (cmd === "/who") {
+      const lines = this.hive.listAgents().map((a) => `${a.online ? "•" : "○"} ${a.name} ${a.role}`);
+      await this.reply(message, lines.join("\n") || "empty");
+    }
+  }
+
+  private async reply(message: TelegramMessage, text: string) {
+    await this.api("sendMessage", {
+      chat_id: this.cfg.groupChatId,
+      message_thread_id: message.message_thread_id,
+      text,
+      disable_notification: true,
+    });
+  }
+
+  private async resolveInboundChannel(message: TelegramMessage): Promise<string | null> {
+    const mapped = this.channelForTopic(message.message_thread_id);
+    if (mapped) return mapped;
+    const name =
+      message.forum_topic_created?.name ?? message.reply_to_message?.forum_topic_created?.name ?? null;
+    if (!name || message.message_thread_id == null) return null;
+    const human = this.hive.getAgent(HUMAN_ID);
+    const ch = this.hive.listChannels(human).find(
+      (c) => channelLabel(c) === name || c.name === name || `#${c.name}` === name,
+    );
+    if (!ch) return null;
+    this.hive.db.prepare("INSERT OR IGNORE INTO telegram_topics (channel_id, telegram_thread_id) VALUES (?, ?)").run(
+      ch.id,
+      message.message_thread_id,
+    );
+    await this.flushHolds(message.message_thread_id);
+    return ch.id;
+  }
+
+  private holdMessage(message: TelegramMessage) {
+    const thread = message.message_thread_id;
+    if (thread == null) return;
+    this.hive.db.prepare(
+      "INSERT OR REPLACE INTO telegram_hold (telegram_message_id, telegram_thread_id, payload) VALUES (?, ?, ?)",
+    ).run(message.message_id, thread, JSON.stringify(message));
+  }
+
+  private async flushHolds(telegramThreadId: number) {
+    const rows = this.hive.db.prepare(
+      "SELECT payload FROM telegram_hold WHERE telegram_thread_id = ?",
+    ).all(telegramThreadId) as { payload: string }[];
+    for (const row of rows) {
+      const message = JSON.parse(row.payload) as TelegramMessage;
+      await this.onTelegramMessage(message);
+    }
+    this.hive.db.prepare("DELETE FROM telegram_hold WHERE telegram_thread_id = ?").run(telegramThreadId);
+  }
+
+  private channelForTopic(threadId: number | undefined): string | null {
+    if (threadId == null || threadId === 1) return "general";
+    const row = this.hive.db.prepare("SELECT channel_id AS id FROM telegram_topics WHERE telegram_thread_id = ?").get(
+      threadId,
+    ) as { id: string } | undefined;
+    return row?.id ?? null;
+  }
+
+  private seen(updateId: number): boolean {
+    return Boolean(this.hive.db.prepare("SELECT update_id FROM telegram_in WHERE update_id = ?").get(updateId));
+  }
+
+  private markSeen(updateId: number) {
+    this.hive.db.prepare("INSERT OR IGNORE INTO telegram_in (update_id) VALUES (?)").run(updateId);
+  }
+
+  private pruneIgnoreReactions() {
+    const cutoff = Date.now() - 120_000;
+    for (const [key, at] of this.ignoreReaction) {
+      if (at < cutoff) this.ignoreReaction.delete(key);
+    }
+  }
+
+  private state(key: string): string | undefined {
+    const row = this.hive.db.prepare("SELECT value FROM telegram_state WHERE key = ?").get(key) as { value: string } | undefined;
+    return row?.value;
+  }
+
+  private setState(key: string, value: string) {
+    this.hive.db.prepare(
+      "INSERT INTO telegram_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    ).run(key, value);
+  }
+
+  private queuePending(seq: number, kind: "message" | "reaction") {
+    enqueueTelegramPending(this.hive.db, seq, kind);
+    void this.pump();
+  }
+
+  private nextPending(): { seq: number; kind: "message" | "reaction" } | undefined {
+    return this.hive.db.prepare(
+      "SELECT seq, kind FROM telegram_pending ORDER BY seq ASC, kind ASC LIMIT 1",
+    ).get() as { seq: number; kind: "message" | "reaction" } | undefined;
+  }
+
+  private clearPending(seq: number, kind: string) {
+    this.hive.db.prepare("DELETE FROM telegram_pending WHERE seq = ? AND kind = ?").run(seq, kind);
+  }
+
+  private async pump() {
+    if (this.pumping) return;
+    this.pumping = true;
+    while (!this.stopped) {
+      const job = this.nextPending();
+      if (!job) break;
+      try {
+        if (job.kind === "reaction") await this.sendPendingReaction(job.seq);
+        else await this.sendPendingMessage(job.seq);
+        this.clearPending(job.seq, job.kind);
+        this.pumpFails = null;
+      } catch (err) {
+        console.error("telegram out", err instanceof Error ? err.message : err);
+        if (isTelegramTopicRightsError(err)) {
+          this.hintTopicRights();
+          await sleep(15_000);
+          continue;
+        }
+        this.pumpFails = nextTelegramFailure(this.pumpFails, job.seq, job.kind);
+        if (shouldDropTelegramJob(this.pumpFails.n)) {
+          console.error(`telegram out giving up seq=${job.seq} kind=${job.kind}`);
+          this.clearPending(job.seq, job.kind);
+          this.pumpFails = null;
+          continue;
+        }
+        await sleep(2000);
+        continue;
+      }
+      await sleep(1000);
+    }
+    this.pumping = false;
+  }
+
+  private async sendPendingMessage(seq: number) {
+    const msg = this.hive.getMessageBySeq(seq);
+    if (msg.kind !== "chat" || this.hive.fromTelegram(msg.id)) return;
+    const ch = this.hive.getChannel(msg.channelId);
+    const thread = await this.ensureTopic(ch);
+    if (thread == null) throw new Error("telegram topic not ready");
+    const muted = this.state("mute") === "1";
+    const silent = !shouldNotify(msg, ch, muted);
+    const atts = msg.attachments ?? [];
+    const text = formatOutbound(msg);
+    if (atts.length === 0) {
+      const sent = requireTelegramOk(
+        await this.api("sendMessage", {
+          chat_id: this.cfg.groupChatId,
+          message_thread_id: thread,
+          text,
+          disable_notification: silent,
+        }),
+        "sendMessage",
+      );
+      this.recordOut(sent, msg);
+      return;
+    }
+    if (text.length > 1000) {
+      const sent = requireTelegramOk(
+        await this.api("sendMessage", {
+          chat_id: this.cfg.groupChatId,
+          message_thread_id: thread,
+          text,
+          disable_notification: silent,
+        }),
+        "sendMessage",
+      );
+      this.recordOut(sent, msg);
+    }
+    const human = this.hive.getAgent(HUMAN_ID);
+    for (let i = 0; i < atts.length; i += 1) {
+      const att = atts[i]!;
+      const opened = this.hive.getAttachment(human, att.id);
+      const disk = filePathForHash(opened.sha256, this.hive.home);
+      const caption = text.length <= 1000 && i === 0 ? text : `${msg.authorName} · ${att.name}`;
+      const sent = requireTelegramOk(
+        await this.sendFile(thread, att.mime, att.name, disk, caption, silent && i > 0 ? true : silent),
+        "sendFile",
+      );
+      this.recordOut(sent, msg);
+    }
+  }
+
+  private async sendPendingReaction(seq: number) {
+    const msg = this.hive.getMessageBySeq(seq);
+    const rows = this.hive.db.prepare(
+      "SELECT telegram_message_id AS id FROM telegram_out WHERE seq = ?",
+    ).all(seq) as { id: number }[];
+    if (rows.length === 0) return;
+    const reaction = (msg.reactions ?? [])
+      .map((r) => r.emoji)
+      .filter((e) => REACTION_EMOJIS.includes(e as (typeof REACTION_EMOJIS)[number]))
+      .map((emoji) => ({ type: "emoji", emoji }));
+    const emojis = reaction.map((r) => r.emoji);
+    const now = Date.now();
+    for (const row of rows) this.ignoreReaction.set(reactionIgnoreKey(row.id, emojis), now);
+    for (const row of rows) {
+      requireTelegramOk(
+        await this.api("setMessageReaction", {
+          chat_id: this.cfg.groupChatId,
+          message_id: row.id,
+          reaction,
+        }),
+        "setMessageReaction",
+      );
+    }
+  }
+
+  private recordOut(sent: ApiResult, msg: Message) {
+    const result = sent.result as { message_id?: number } | undefined;
+    if (!sent.ok || !result?.message_id) return;
+    this.hive.db.prepare(
+      `INSERT OR REPLACE INTO telegram_out (telegram_message_id, seq, channel_id, thread_id) VALUES (?, ?, ?, ?)`,
+    ).run(result.message_id, msg.seq, msg.channelId, msg.threadId);
+  }
+
+  private async sendFile(
+    thread: number,
+    mime: string,
+    name: string,
+    filePath: string,
+    caption: string,
+    silent: boolean,
+  ): Promise<ApiResult> {
+    const form = new FormData();
+    form.set("chat_id", String(this.cfg.groupChatId));
+    form.set("message_thread_id", String(thread));
+    form.set("caption", caption.slice(0, 1024));
+    form.set("disable_notification", silent ? "true" : "false");
+    const blob = await openAsBlob(filePath, { type: mime });
+    const field = mime.startsWith("image/") ? "photo" : "document";
+    form.set(field, blob, safeFileName(name));
+    const method = mime.startsWith("image/") ? "sendPhoto" : "sendDocument";
+    const res = await fetch(`https://api.telegram.org/bot${this.cfg.botToken}/${method}`, { method: "POST", body: form });
+    const data = (await res.json().catch(() => ({}))) as ApiResult;
+    if (res.status === 429) {
+      await sleep(Number(data.parameters?.retry_after ?? 2) * 1000);
+      return this.sendFile(thread, mime, name, filePath, caption, silent);
+    }
+    return data;
+  }
+
+  private async filesFromMessage(message: TelegramMessage): Promise<string[]> {
+    const out: string[] = [];
+    const photos = message.photo ?? [];
+    if (photos.length) {
+      const best = photos[photos.length - 1]!;
+      const id = await this.ingestTelegramFile(best.file_id, "photo.jpg", "image/jpeg");
+      if (id) out.push(id);
+    }
+    if (message.document) {
+      const name = message.document.file_name ?? "file";
+      const mime = resolveUploadMime(message.document.mime_type, name);
+      if (mime !== "application/octet-stream") {
+        const id = await this.ingestTelegramFile(message.document.file_id, name, mime);
+        if (id) out.push(id);
+      }
+    }
+    return out;
+  }
+
+  private async ingestTelegramFile(fileId: string, name: string, mime: string): Promise<string | null> {
+    const meta = await this.api("getFile", { file_id: fileId });
+    const file = meta.result as { file_path?: string; file_size?: number } | undefined;
+    if (!meta.ok || !file?.file_path) return null;
+    if (telegramFileTooLarge(file.file_size)) return null;
+    const res = await fetch(`https://api.telegram.org/file/bot${this.cfg.botToken}/${file.file_path}`);
+    if (!res.ok || !res.body) return null;
+    try {
+      const created = await this.hive.createFile(this.hive.getAgent(HUMAN_ID), {
+        name,
+        mime,
+        body: res.body,
+      });
+      return created.id;
+    } catch (err) {
+      console.error("telegram inbound file", err instanceof Error ? err.message : err);
+      return null;
+    }
+  }
+
+  private async api(method: string, body: Record<string, unknown>): Promise<ApiResult> {
+    const res = await fetch(`https://api.telegram.org/bot${this.cfg.botToken}/${method}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = (await res.json().catch(() => ({}))) as ApiResult;
+    if (res.status === 429) {
+      const wait = Number(data.parameters?.retry_after ?? 2);
+      await sleep(wait * 1000);
+      return this.api(method, body);
+    }
+    return data;
+  }
+}
+
+type TelegramMessage = {
+  message_id: number;
+  message_thread_id?: number;
+  text?: string;
+  caption?: string;
+  chat?: { id: number };
+  from?: { id: number; first_name?: string; is_bot?: boolean };
+  reply_to_message?: { message_id: number; forum_topic_created?: { name: string } };
+  forum_topic_created?: { name: string };
+  photo?: Array<{ file_id: string }>;
+  document?: { file_id: string; file_name?: string; mime_type?: string };
+};
+
+type TelegramReaction = {
+  chat?: { id: number };
+  message_id: number;
+  user?: { id: number; is_bot?: boolean };
+  new_reaction?: Array<{ type?: string; emoji?: string }>;
+  old_reaction?: Array<{ type?: string; emoji?: string }>;
+};
+
+function emojisOf(list: Array<{ type?: string; emoji?: string }> | undefined): string[] {
+  return (list ?? [])
+    .map((r) => r.emoji)
+    .filter((e): e is string => Boolean(e) && REACTION_EMOJIS.includes(e as (typeof REACTION_EMOJIS)[number]));
+}
+
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
