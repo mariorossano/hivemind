@@ -573,6 +573,24 @@ html.dark .queue-badge { color: #1b2017; }
 .boot-fail { padding: 3rem; max-width: 36rem; }
 .boot-fail .muted { color: var(--mute); }
 
+.inbox-tabs {
+  display: flex;
+  gap: 0.35rem;
+  margin-top: 0.65rem;
+}
+.inbox-tabs button {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0.18rem 0.7rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--mute);
+}
+.inbox-tabs button.on {
+  color: var(--ink);
+  background: rgba(184, 146, 42, 0.16);
+  border-color: transparent;
+}
 .inbox-item {
   display: block;
   width: 100%;

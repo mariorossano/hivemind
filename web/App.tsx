@@ -3,17 +3,31 @@ import type { Agent, Channel, Message, Thread, ThreadStatus } from "../src/share
 import { REACTION_EMOJIS } from "../src/shared/types.ts";
 import { api, connectWs, type ChannelPayload, type Snapshot, type TelegramSettings } from "./api.ts";
 import { LaunchSheet } from "./LaunchSheet.tsx";
+import { loadMailLog, mergeMailLog, saveMailLog } from "./mail-log.ts";
 import { renderBody } from "./markdown.tsx";
 
-type Sel = { kind: "inbox"; project: string } | { kind: "channel"; id: string };
+type InboxBox = "unread" | "all";
+
+type Sel =
+  | { kind: "inbox"; project: string; box?: InboxBox }
+  | { kind: "channel"; id: string; thread?: string | null };
 
 const STATUSES: ThreadStatus[] = ["open", "in_progress", "blocked", "done"];
 
 function parseHash(): Sel {
   const raw = location.hash.replace(/^#/, "") || "/c/general";
   const parts = raw.split("/").filter(Boolean);
-  if (parts[0] === "inbox") return { kind: "inbox", project: parts[1] ? decodeURIComponent(parts[1]) : "" };
-  if (parts[1]) return { kind: "channel", id: decodeURIComponent(parts[1]) };
+  if (parts[0] === "inbox") {
+    return {
+      kind: "inbox",
+      project: parts[1] ? decodeURIComponent(parts[1]) : "",
+      box: parts[2] === "all" ? "all" : "unread",
+    };
+  }
+  if (parts[1]) {
+    const thread = parts[2] === "t" && parts[3] ? decodeURIComponent(parts[3]) : undefined;
+    return { kind: "channel", id: decodeURIComponent(parts[1]), thread };
+  }
   return { kind: "channel", id: "general" };
 }
 
@@ -46,13 +60,20 @@ function upsertById<T extends { id: string }>(list: T[], item: T): T[] {
   return [...list, item];
 }
 
-function applyMessageToSnap(snap: Snapshot, msg: Message, viewingId: string | null): Snapshot {
+function applyMessageToSnap(
+  snap: Snapshot,
+  msg: Message,
+  viewingId: string | null,
+  viewingThread: string | null = null,
+): Snapshot {
   const unread = { ...snap.unread };
-  if (msg.authorId !== snap.you.id && msg.channelId !== viewingId) {
+  const viewingThis =
+    msg.channelId === viewingId && (!msg.threadId || msg.threadId === viewingThread);
+  if (msg.authorId !== snap.you.id && !viewingThis) {
     unread[msg.channelId] = (unread[msg.channelId] ?? 0) + 1;
   }
   let mentions = snap.mentions;
-  if (msg.mentions.includes("human") && msg.channelId !== viewingId) {
+  if (msg.mentions.includes("human") && !viewingThis) {
     mentions = [msg, ...mentions.filter((m) => m.id !== msg.id)].slice(0, 30);
   }
   return { ...snap, unread, mentions };
@@ -61,18 +82,16 @@ function applyMessageToSnap(snap: Snapshot, msg: Message, viewingId: string | nu
 function setHash(sel: Sel) {
   location.hash =
     sel.kind === "inbox"
-      ? sel.project
-        ? `/inbox/${encodeURIComponent(sel.project)}`
-        : "/inbox"
-      : `/c/${encodeURIComponent(sel.id)}`;
+      ? `${sel.project ? `/inbox/${encodeURIComponent(sel.project)}` : "/inbox"}${sel.box === "all" ? "/all" : ""}`
+      : `/c/${encodeURIComponent(sel.id)}${sel.thread ? `/t/${encodeURIComponent(sel.thread)}` : ""}`;
 }
 
 function repairSel(sel: Sel, snap: Snapshot): Sel | null {
   if (sel.kind === "inbox") {
-    if (!sel.project) return snap.projects[0] ? { kind: "inbox", project: snap.projects[0].slug } : null;
+    if (!sel.project) return snap.projects[0] ? { kind: "inbox", project: snap.projects[0].slug, box: sel.box } : null;
     if (snap.projects.some((p) => p.slug === sel.project)) return null;
     const fallback = snap.projects[0];
-    return fallback ? { kind: "inbox", project: fallback.slug } : { kind: "inbox", project: "" };
+    return fallback ? { kind: "inbox", project: fallback.slug, box: sel.box } : { kind: "inbox", project: "", box: sel.box };
   }
   if (snap.channels.some((c) => c.id === sel.id)) return null;
   const fallback = snap.projects[0];
@@ -102,7 +121,10 @@ export function App() {
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [sel, setSel] = useState<Sel>(parseHash);
   const [pane, setPane] = useState<ChannelPayload | null>(null);
-  const [threadId, setThreadId] = useState<string | null>(null);
+  const [threadId, setThreadId] = useState<string | null>(() => {
+    const start = parseHash();
+    return start.kind === "channel" ? start.thread ?? null : null;
+  });
   const [threadPane, setThreadPane] = useState<ChannelPayload | null>(null);
   const [draft, setDraft] = useState("");
   const [threadDraft, setThreadDraft] = useState("");
@@ -137,6 +159,7 @@ export function App() {
   const [projectDeleteConfirm, setProjectDeleteConfirm] = useState("");
   const [deletingProject, setDeletingProject] = useState(false);
   const [createIn, setCreateIn] = useState<string | null>(null);
+  const [mailLog, setMailLog] = useState<Message[]>(loadMailLog);
   const stickBottom = useRef(true);
   const themePainted = useRef(false);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -145,6 +168,7 @@ export function App() {
   selRef.current = sel;
   const threadIdRef = useRef(threadId);
   threadIdRef.current = threadId;
+  const channelsRef = useRef<Channel[]>([]);
 
   const refreshSnap = useCallback(async () => {
     const next = await api.snapshot();
@@ -178,7 +202,12 @@ export function App() {
         setPane((p) => patchPane(p, msg, null));
         setThreadPane((p) => patchPane(p, msg, threadIdRef.current));
         const viewing = selRef.current.kind === "channel" ? selRef.current.id : null;
-        setSnap((s) => (s ? applyMessageToSnap(s, msg, viewing) : s));
+        setSnap((s) => (s ? applyMessageToSnap(s, msg, viewing, threadIdRef.current) : s));
+        setMailLog((prev) => {
+          const next = mergeMailLog(prev, [msg], channelsRef.current);
+          if (next !== prev) saveMailLog(next);
+          return next;
+        });
         return;
       }
       if (ev.type === "reaction") {
@@ -218,8 +247,9 @@ export function App() {
       }
     }, setLive);
     const onHash = () => {
-      setSel(parseHash());
-      setThreadId(null);
+      const next = parseHash();
+      setSel(next);
+      setThreadId(next.kind === "channel" ? next.thread ?? null : null);
     };
     window.addEventListener("hashchange", onHash);
     return () => {
@@ -293,13 +323,33 @@ export function App() {
     threadBottomRef.current?.scrollIntoView({ block: "end" });
   }, [threadPane?.messages.length]);
 
+  useEffect(() => {
+    if (!snap) return;
+    setMailLog((prev) => {
+      const next = mergeMailLog(prev, snap.mentions, snap.channels);
+      if (next !== prev) saveMailLog(next);
+      return next;
+    });
+  }, [snap]);
+
+  useEffect(() => {
+    const incoming = [...(pane?.messages ?? []), ...(threadPane?.messages ?? [])];
+    if (incoming.length === 0) return;
+    setMailLog((prev) => {
+      const next = mergeMailLog(prev, incoming, channelsRef.current);
+      if (next !== prev) saveMailLog(next);
+      return next;
+    });
+  }, [pane, threadPane]);
+
   const go = (next: Sel) => {
-    setThreadId(null);
     setSel(next);
+    setThreadId(next.kind === "channel" ? next.thread ?? null : null);
     setHash(next);
   };
 
   const channels = snap?.channels ?? [];
+  channelsRef.current = channels;
   const projects = snap?.projects ?? [];
   const q = query.trim().toLowerCase();
   const match = (name: string) => !q || name.toLowerCase().includes(q);
@@ -324,6 +374,9 @@ export function App() {
   const inboxMentions = (snap?.mentions ?? []).filter(
     (m) => channels.find((c) => c.id === m.channelId)?.project === (sel.kind === "inbox" ? sel.project : selectedProject),
   );
+  const inboxProject = sel.kind === "inbox" ? sel.project : selectedProject;
+  const allForYou = mailLog.filter((m) => channels.find((c) => c.id === m.channelId)?.project === inboxProject);
+  const inboxBox: InboxBox = sel.kind === "inbox" && sel.box === "all" ? "all" : "unread";
 
   const send = async (body: string, tid?: string | null, files?: File[]) => {
     if (sel.kind !== "channel") return;
@@ -505,7 +558,7 @@ export function App() {
                 <>
                   <button
                     className={`nav ${sel.kind === "inbox" && sel.project === project.slug ? "active" : ""}`}
-                    onClick={() => go({ kind: "inbox", project: project.slug })}
+                    onClick={() => go({ kind: "inbox", project: project.slug, box: inboxBox })}
                   >
                     <span>For you</span>
                     {n > 0 && <em>{n}</em>}
@@ -596,10 +649,15 @@ export function App() {
           </header>
         ) : sel.kind === "inbox" ? (
           <Inbox
-            mentions={inboxMentions}
-            hasMore={Boolean(snap.mentionsHasMore)}
+            box={inboxBox}
+            mentions={inboxBox === "all" ? allForYou : inboxMentions}
+            hasMore={inboxBox === "unread" && Boolean(snap.mentionsHasMore)}
+            channels={channels}
             agents={snap.agents.filter((a) => a.role === "human" || a.project === sel.project)}
-            onOpen={(id) => go({ kind: "channel", id })}
+            onBox={(box) => go({ kind: "inbox", project: sel.project, box })}
+            onOpen={(m) =>
+              go({ kind: "channel", id: m.channelId, thread: m.threadId ?? undefined })
+            }
             onOlder={() => {
               const oldest = inboxMentions[inboxMentions.length - 1]?.seq;
               if (!oldest || !projects.some((p) => p.slug === sel.project)) return;
@@ -679,7 +737,10 @@ export function App() {
                   m={m}
                   replies={pane?.replyCounts[m.id] ?? 0}
                   status={pane?.threads.find((t) => t.id === m.id)?.status ?? null}
-                  onThread={() => setThreadId(m.id)}
+                  onThread={() => {
+                    if (sel.kind !== "channel") return;
+                    go({ kind: "channel", id: sel.id, thread: m.id });
+                  }}
                   onReact={(emoji) => api.react(m.seq, emoji).then((r) => setPane((p) => replaceMessage(p, r.message)))}
                 />
               ))}
@@ -728,7 +789,14 @@ export function App() {
                   </option>
                 ))}
               </select>
-              <button type="button" className="plus" onClick={() => setThreadId(null)}>
+              <button
+                type="button"
+                className="plus"
+                onClick={() => {
+                  if (sel.kind === "channel") go({ kind: "channel", id: sel.id });
+                  else setThreadId(null);
+                }}
+              >
                 ×
               </button>
             </div>
@@ -1139,17 +1207,23 @@ function ChannelItem({
 }
 
 function Inbox({
+  box,
   mentions,
   hasMore,
+  channels,
   agents,
+  onBox,
   onOpen,
   onOlder,
   onMarkSeen,
 }: {
+  box: InboxBox;
   mentions: Message[];
   hasMore: boolean;
+  channels: Channel[];
   agents: Agent[];
-  onOpen: (channelId: string) => void;
+  onBox: (box: InboxBox) => void;
+  onOpen: (message: Message) => void;
   onOlder: () => void;
   onMarkSeen: () => void;
 }) {
@@ -1158,9 +1232,21 @@ function Inbox({
       <header className="desk-h">
         <div>
           <h1>For you</h1>
-          <p>@Human mentions. Brains ask you here when a cycle is done or when they are stuck.</p>
+          <p>
+            {box === "all"
+              ? "Every @Human mention and brain DM this browser has seen, newest first."
+              : "@Human mentions not marked seen. Brains ask you here when a cycle is done or when they are stuck."}
+          </p>
+          <div className="inbox-tabs" role="tablist">
+            <button type="button" className={box === "unread" ? "on" : ""} onClick={() => onBox("unread")}>
+              Unread
+            </button>
+            <button type="button" className={box === "all" ? "on" : ""} onClick={() => onBox("all")}>
+              All
+            </button>
+          </div>
         </div>
-        {mentions.length > 0 && (
+        {box === "unread" && mentions.length > 0 && (
           <button type="button" className="text-btn" onClick={onMarkSeen}>
             Mark seen
           </button>
@@ -1169,15 +1255,24 @@ function Inbox({
       <div className="stream">
         {mentions.length === 0 && (
           <div className="empty">
-            No mentions. When a brain needs you, it shows up here.
+            {box === "all"
+              ? "Nothing in this browser log yet. New @Human mail and brain DMs collect here while the UI is open. Opening a conversation also adds it. Older seen mail is not available without a hive change."
+              : "No mentions. When a brain needs you, it shows up here."}
           </div>
         )}
-        {mentions.map((m) => (
-          <button key={m.id} className="inbox-item" onClick={() => onOpen(m.channelId)}>
-            <Msg m={m} replies={0} status={null} />
-            <span className="open-link">open conversation</span>
-          </button>
-        ))}
+        {mentions.map((m) => {
+          const ch = channels.find((c) => c.id === m.channelId);
+          const where = ch ? (ch.type === "dm" ? ch.name : `#${ch.name}`) : "";
+          return (
+            <button key={m.id} className="inbox-item" onClick={() => onOpen(m)}>
+              <Msg m={m} replies={0} status={null} />
+              <span className="open-link">
+                {where ? `${where} · ` : ""}
+                {m.threadId ? "open thread" : "open conversation"}
+              </span>
+            </button>
+          );
+        })}
         {hasMore && (
           <button type="button" className="older" onClick={onOlder}>
             Older mentions
