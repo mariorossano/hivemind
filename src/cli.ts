@@ -89,6 +89,7 @@ async function main() {
           env: {
             HIVEMIND_URL: hiveUrl(),
           },
+          tool_timeout_sec: 28800,
         },
       },
     };

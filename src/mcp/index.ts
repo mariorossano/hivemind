@@ -2,7 +2,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { agentRequest, currentToken, saveIdentity } from "../client/http.ts";
-import type { Agent, Channel, Identity, Message, WaitResult } from "../shared/types.ts";
+import { waitUntilMail } from "./wait-loop.ts";
+import { DEFAULT_WAIT_MS, type Agent, type Channel, type Identity, type Message, type WaitResult } from "../shared/types.ts";
 
 let sessionToken = process.env.HIVEMIND_TOKEN;
 
@@ -59,7 +60,7 @@ export async function startMcp() {
         created: result.created,
         token: result.token,
         standingOrders: result.standingOrders,
-        next: "When idle, call wait. Do not busy-poll.",
+        next: "Call wait once with no arguments when idle. It returns only when you have mail. Do not pass a timeout.",
       });
     },
   );
@@ -129,16 +130,17 @@ export async function startMcp() {
 
   server.tool(
     "wait",
-    "Block until you have new messages (or timeout). This is how you sleep at your desk. If idle is true, call wait again immediately. Handle control clear_context first.",
-    { timeoutSeconds: z.number().optional() },
-    async ({ timeoutSeconds }) => {
-      const timeoutMs = (timeoutSeconds ?? 120) * 1000;
-      const result = await agentRequest<WaitResult>(
-        "POST",
-        "/api/agent/wait",
-        { timeoutMs },
-        token(),
-        timeoutMs + 10_000,
+    "Sleep at your desk. Call once with no arguments. This tool does not return until you have mail — idle and transient network errors are retried inside the tool, not by you. Codex may show Working; that is sleep, not a model turn. Do not pass a timeout. Do not call wait in a loop. Do not call other Hivemind tools while waiting. Handle control clear_context first when it returns.",
+    {},
+    async () => {
+      const result = await waitUntilMail(() =>
+        agentRequest<WaitResult>(
+          "POST",
+          "/api/agent/wait",
+          { timeoutMs: DEFAULT_WAIT_MS },
+          token(),
+          DEFAULT_WAIT_MS + 10_000,
+        ),
       );
       return text(result);
     },

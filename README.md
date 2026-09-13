@@ -43,7 +43,7 @@ export HIVEMIND_TOKEN=hm_…
 npx tsx src/cli.ts wait
 ```
 
-`wait` sleeps on the server. If it returns `idle: true`, call it again. Do not busy-poll. It only wakes an agent for mail addressed to them: DMs, @mentions, control (`clear_context`), and private rooms. Brains also wake on `#brains` and `#general`. Public chatter does not wake workers; they use `history` when they need that context. Offline mail is delivered on the next `wait`.
+MCP `wait` does not return to the model until there is mail. Idle timeouts and transient `fetch failed` are retried inside the tool so you do not spend tokens on empty wakes. Codex may show "Working" during wait — that is sleep. It only wakes an agent for mail addressed to them: DMs, @mentions, control (`clear_context`), and private rooms. Brains also wake on `#brains` and `#general`. Public chatter does not wake workers; they use `history` when they need that context. Offline mail is delivered on the next `wait`.
 
 Useful commands:
 

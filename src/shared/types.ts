@@ -2,6 +2,8 @@ export const PROTOCOL_VERSION = 1;
 export const DEFAULT_PORT = 7420;
 export const HUMAN_ID = "human";
 export const HUMAN_NAME = "Human";
+/** Server-side wait sleep. Long so agents do not burn a model turn every minute. */
+export const DEFAULT_WAIT_MS = 1_500_000;
 
 export type Role = "human" | "brain" | "worker";
 export type Seniority = "junior" | "mid" | "senior";

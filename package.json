@@ -13,7 +13,7 @@
     "build": "vite build",
     "mcp": "tsx src/mcp/index.ts",
     "hivemind": "tsx src/cli.ts",
-    "test": "tsx --test src/server/hive.test.ts src/server/http.test.ts src/shared/join-args.test.ts src/mcp/mcp.test.ts"
+    "test": "tsx --test src/server/hive.test.ts src/server/http.test.ts src/shared/join-args.test.ts src/mcp/mcp.test.ts src/mcp/wait-loop.test.ts"
   },
   "engines": {
     "node": ">=22"

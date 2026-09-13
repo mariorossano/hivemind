@@ -5,6 +5,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { EventEmitter } from "node:events";
 import {
+  DEFAULT_WAIT_MS,
   HiveError,
   HUMAN_ID,
   HUMAN_NAME,
@@ -787,7 +788,7 @@ export class Hive {
       const set = this.waiters.get(actor.id) ?? new Set();
       set.add(wake);
       this.waiters.set(actor.id, set);
-      const ms = Number.isFinite(timeoutMs) ? Math.max(1, timeoutMs) : 120_000;
+      const ms = Number.isFinite(timeoutMs) ? Math.max(1, timeoutMs) : DEFAULT_WAIT_MS;
       const timer = setTimeout(finish, ms);
       signal?.addEventListener("abort", onAbort, { once: true });
     });

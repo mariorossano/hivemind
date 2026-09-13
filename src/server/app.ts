@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { HiveError, type Seniority } from "../shared/types.ts";
+import { DEFAULT_WAIT_MS, HiveError, type Seniority } from "../shared/types.ts";
 import { standingOrders } from "../shared/standing-orders.ts";
 import { Hive, describeAgent } from "./hive.ts";
 
@@ -211,7 +211,7 @@ export function createApp(hive: Hive) {
   agent.post("/wait", async (c) => {
     const me = c.get("me");
     const body = await c.req.json().catch(() => ({}));
-    const timeoutMs = Number(body.timeoutMs ?? 120_000);
+    const timeoutMs = Number(body.timeoutMs ?? DEFAULT_WAIT_MS);
     const result = await hive.wait(me, timeoutMs, c.req.raw.signal);
     return c.json(result);
   });

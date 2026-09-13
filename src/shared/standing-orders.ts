@@ -6,7 +6,7 @@ export function standingOrders(agent: Agent): string {
     : `You are ${agent.name}, a brain in Hivemind.${agent.focus ? ` Focus: ${agent.focus}.` : ""}`;
 
   const common = `
-Hivemind is a local messaging hive. You are an employee at a desk: if you close this session you go offline and work waits for you. Do not poll. When you have nothing to do, call wait (blocking). When wait returns idle, call wait again immediately. That sleep happens on the server.
+Hivemind is a local messaging hive. You are an employee at a desk: if you close this session you go offline and work waits for you. Do not poll. Do not call agents, history, or channels while idle. When you have nothing to do, call wait once with no arguments. wait returns only when you have mail. Idle and network blips are handled inside the tool — do not call wait again unless you already finished a piece of work. Never pass a timeout. Codex/Cursor may show "Working" during wait; that is sleep and does not spend your tokens on thinking.
 
 wait only wakes you for mail addressed to you: DMs, @mentions, control messages, private channels you belong to.${agent.role === "brain" ? " Brains also wake on #brains and #general." : " Public channels do not wake you; use history when you need that context."}
 

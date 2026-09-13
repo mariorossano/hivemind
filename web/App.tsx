@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent } from "react";
 import type { Agent, Channel, Message, ThreadStatus } from "../src/shared/types.ts";
 import { api, connectWs, type ChannelPayload, type Snapshot } from "./api.ts";
 import { renderBody } from "./markdown.tsx";
@@ -57,7 +57,14 @@ export function App() {
   const [inviteNames, setInviteNames] = useState<string[]>([]);
   const [confirmClear, setConfirmClear] = useState<string | null>(null);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [theme, setTheme] = useState<"light" | "dark">(() => {
+    const saved = localStorage.getItem("hivemind-theme");
+    return saved === "dark" ? "dark" : "light";
+  });
+  const [openGroups, setOpenGroups] = useState({ channels: true, dms: true, other: true });
   const stickBottom = useRef(true);
+  const themePainted = useRef(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const threadBottomRef = useRef<HTMLDivElement>(null);
 
@@ -123,6 +130,22 @@ export function App() {
   }, [threadId, sel]);
 
   useEffect(() => {
+    const apply = () => {
+      document.documentElement.classList.toggle("dark", theme === "dark");
+      localStorage.setItem("hivemind-theme", theme);
+    };
+    if (!themePainted.current) {
+      themePainted.current = true;
+      apply();
+      return;
+    }
+    const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const doc = document as Document & { startViewTransition?: (cb: () => void) => void };
+    if (!reduce && doc.startViewTransition) doc.startViewTransition(apply);
+    else apply();
+  }, [theme]);
+
+  useEffect(() => {
     if (stickBottom.current) bottomRef.current?.scrollIntoView({ block: "end" });
     stickBottom.current = true;
   }, [pane?.messages.length]);
@@ -137,12 +160,21 @@ export function App() {
   };
 
   const channels = snap?.channels ?? [];
-  const publics = channels.filter((c) => c.type === "public" || c.type === "brains" || c.type === "private");
-  const myDms = channels.filter((c) => c.type === "dm" && c.memberIds.includes("human"));
-  const otherDms = channels.filter((c) => c.type === "dm" && !c.memberIds.includes("human"));
+  const q = query.trim().toLowerCase();
+  const match = (name: string) => !q || name.toLowerCase().includes(q);
+  const publics = channels.filter(
+    (c) => (c.type === "public" || c.type === "brains" || c.type === "private") && match(c.name),
+  );
+  const myDms = channels.filter((c) => c.type === "dm" && c.memberIds.includes("human") && match(c.name));
+  const otherDms = channels.filter((c) => c.type === "dm" && !c.memberIds.includes("human") && match(c.name));
+  const roomAgents = (snap?.agents ?? []).filter((a) => {
+    if (!q) return true;
+    return match(a.name) || match(a.focus ?? "") || match(a.role);
+  });
 
   const activeChannel = sel.kind === "channel" ? channels.find((c) => c.id === sel.id) : undefined;
   const mentionTotal = snap?.mentions.length ?? 0;
+  const roomIds = new Set(activeChannel?.memberIds ?? []);
 
   const send = async (body: string, tid?: string | null) => {
     if (sel.kind !== "channel" || !body.trim()) return;
@@ -187,7 +219,7 @@ export function App() {
     return (
       <div className="boot-fail">
         <p>Hivemind is not responding.</p>
-        <p className="muted">Start the server with <code>npm run dev</code>, then open http://127.0.0.1:7421</p>
+        <p className="muted">Start the server with <code>npm run dev</code>, then open http://127.0.0.1:7420</p>
         <p className="muted">{err}</p>
       </div>
     );
@@ -210,11 +242,27 @@ export function App() {
             <div className="word">hivemind</div>
             <div className="you">you are Human</div>
           </div>
-          <span className={`pulse ${live ? "on" : ""}`} title={live ? "live" : "waiting"} />
+          <div className="brand-tools">
+            <button
+              type="button"
+              className="icon-btn"
+              title={theme === "dark" ? "Light" : "Dark"}
+              onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
+            >
+              {theme === "dark" ? "☀" : "☾"}
+            </button>
+            <button type="button" className="icon-btn" title="How to join" onClick={() => setHelpOpen(true)}>
+              ?
+            </button>
+            <span className={`pulse ${live ? "on" : ""}`} title={live ? "live" : "waiting"} />
+          </div>
         </div>
-        <button type="button" className="nav" onClick={() => setHelpOpen(true)}>
-          <span>How to join</span>
-        </button>
+        <input
+          className="search"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search the hive"
+        />
 
         <button className={`nav ${sel.kind === "inbox" ? "active" : ""}`} onClick={() => go({ kind: "inbox" })}>
           <span>For you</span>
@@ -223,40 +271,21 @@ export function App() {
 
         <div className="group">
           <div className="group-h">
+            <button
+              type="button"
+              className="twist"
+              onClick={() => setOpenGroups((g) => ({ ...g, channels: !g.channels }))}
+              aria-expanded={openGroups.channels}
+            >
+              {openGroups.channels ? "▾" : "▸"}
+            </button>
             <span>Channels</span>
             <button type="button" className="plus" onClick={() => setCreating(true)} title="New channel">
               +
             </button>
           </div>
-          {publics.map((ch) => (
-            <ChannelItem
-              key={ch.id}
-              ch={ch}
-              unread={snap.unread[ch.id] ?? 0}
-              active={sel.kind === "channel" && sel.id === ch.id}
-              onClick={() => go({ kind: "channel", id: ch.id })}
-            />
-          ))}
-        </div>
-
-        <div className="group">
-          <div className="group-h">Direct</div>
-          {myDms.length === 0 && <div className="empty-mini">No direct messages</div>}
-          {myDms.map((ch) => (
-            <ChannelItem
-              key={ch.id}
-              ch={ch}
-              unread={snap.unread[ch.id] ?? 0}
-              active={sel.kind === "channel" && sel.id === ch.id}
-              onClick={() => go({ kind: "channel", id: ch.id })}
-            />
-          ))}
-        </div>
-
-        {otherDms.length > 0 && (
-          <div className="group">
-            <div className="group-h">Other directs</div>
-            {otherDms.map((ch) => (
+          {openGroups.channels &&
+            publics.map((ch) => (
               <ChannelItem
                 key={ch.id}
                 ch={ch}
@@ -265,6 +294,56 @@ export function App() {
                 onClick={() => go({ kind: "channel", id: ch.id })}
               />
             ))}
+        </div>
+
+        <div className="group">
+          <div className="group-h">
+            <button
+              type="button"
+              className="twist"
+              onClick={() => setOpenGroups((g) => ({ ...g, dms: !g.dms }))}
+              aria-expanded={openGroups.dms}
+            >
+              {openGroups.dms ? "▾" : "▸"}
+            </button>
+            <span>Direct messages</span>
+          </div>
+          {openGroups.dms && myDms.length === 0 && <div className="empty-mini">No direct messages</div>}
+          {openGroups.dms &&
+            myDms.map((ch) => (
+              <ChannelItem
+                key={ch.id}
+                ch={ch}
+                unread={snap.unread[ch.id] ?? 0}
+                active={sel.kind === "channel" && sel.id === ch.id}
+                onClick={() => go({ kind: "channel", id: ch.id })}
+              />
+            ))}
+        </div>
+
+        {otherDms.length > 0 && (
+          <div className="group">
+            <div className="group-h">
+              <button
+                type="button"
+                className="twist"
+                onClick={() => setOpenGroups((g) => ({ ...g, other: !g.other }))}
+                aria-expanded={openGroups.other}
+              >
+                {openGroups.other ? "▾" : "▸"}
+              </button>
+              <span>Other directs</span>
+            </div>
+            {openGroups.other &&
+              otherDms.map((ch) => (
+                <ChannelItem
+                  key={ch.id}
+                  ch={ch}
+                  unread={snap.unread[ch.id] ?? 0}
+                  active={sel.kind === "channel" && sel.id === ch.id}
+                  onClick={() => go({ kind: "channel", id: ch.id })}
+                />
+              ))}
           </div>
         )}
       </aside>
@@ -389,7 +468,8 @@ export function App() {
       <aside className="hive">
         <div className="group-h">Hive</div>
         <AgentList
-          agents={snap.agents}
+          agents={roomAgents}
+          presentIds={roomIds}
           onOpen={onAgent}
           confirmClear={confirmClear}
           setConfirmClear={setConfirmClear}
@@ -603,18 +683,21 @@ function Msg({
   const time = new Date(m.createdAt).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
   return (
     <article className={`msg role-${m.authorRole} kind-${m.kind}`}>
-      <div className="msg-h">
-        <strong>{m.authorName}</strong>
-        <span className="role">{m.authorRole}</span>
-        <time>{time}</time>
-        {status && <span className={`st st-${status}`}>{status.replace("_", " ")}</span>}
+      <Avatar name={m.authorName} role={m.authorRole} />
+      <div>
+        <div className="msg-h">
+          <strong>{m.authorName}</strong>
+          <span className="role">{m.authorRole}</span>
+          <time>{time}</time>
+          {status && <span className={`st st-${status}`}>{status.replace("_", " ")}</span>}
+        </div>
+        <div className="msg-b">{renderBody(m.body)}</div>
+        {onThread && m.kind === "chat" && (
+          <button type="button" className="replies" onClick={onThread}>
+            {replies > 0 ? `${replies} ${replies === 1 ? "reply" : "replies"}` : "Thread"}
+          </button>
+        )}
       </div>
-      <div className="msg-b">{renderBody(m.body)}</div>
-      {onThread && m.kind === "chat" && (
-        <button type="button" className="replies" onClick={onThread}>
-          {replies > 0 ? `${replies} ${replies === 1 ? "reply" : "replies"}` : "Thread"}
-        </button>
-      )}
     </article>
   );
 }
@@ -671,41 +754,67 @@ function Composer({
           ))}
         </ul>
       )}
-      <textarea
-        rows={3}
-        value={value}
-        placeholder={placeholder}
-        onChange={(e) => onInput(e.target.value)}
-        onKeyDown={onKey}
-      />
+      <div className="composer-box">
+        <textarea
+          rows={2}
+          value={value}
+          placeholder={placeholder}
+          onChange={(e) => onInput(e.target.value)}
+          onKeyDown={onKey}
+        />
+        <button type="button" className="send" onClick={onSend} disabled={!value.trim()}>
+          Send
+        </button>
+      </div>
     </div>
+  );
+}
+
+function avatarHue(name: string): number {
+  return [...name].reduce((n, ch) => n + ch.charCodeAt(0), 0) % 360;
+}
+
+function Avatar({ name, role, online, small }: { name: string; role?: string; online?: boolean; small?: boolean }) {
+  return (
+    <span
+      className={`avatar ${small ? "sm" : ""} role-${role ?? ""}`}
+      style={{ "--h": String(avatarHue(name)) } as CSSProperties}
+      data-on={online ? "1" : undefined}
+      title={name}
+    >
+      {name.slice(0, 2)}
+    </span>
   );
 }
 
 function AgentList({
   agents,
+  presentIds,
   onOpen,
   confirmClear,
   setConfirmClear,
   onClear,
 }: {
   agents: Agent[];
+  presentIds: Set<string>;
   onOpen: (a: Agent) => void;
   confirmClear: string | null;
   setConfirmClear: (n: string | null) => void;
   onClear: (n: string) => void;
 }) {
+  const human = agents.find((a) => a.role === "human");
   const brains = agents.filter((a) => a.role === "brain");
   const workers = agents.filter((a) => a.role === "worker");
   const rank = { senior: 0, mid: 1, junior: 2 } as const;
   workers.sort((a, b) => (rank[a.seniority ?? "mid"] ?? 3) - (rank[b.seniority ?? "mid"] ?? 3) || a.name.localeCompare(b.name));
+  const away = (id: string) => presentIds.size > 0 && !presentIds.has(id);
 
   return (
     <div className="agents">
-      <PersonRow agent={agents.find((a) => a.role === "human")!} onOpen={() => undefined} self />
+      {human && <PersonRow agent={human} onOpen={() => undefined} self away={away(human.id)} />}
       {brains.length > 0 && <div className="subh">brain</div>}
       {brains.map((a) => (
-        <PersonRow key={a.id} agent={a} onOpen={() => onOpen(a)} />
+        <PersonRow key={a.id} agent={a} onOpen={() => onOpen(a)} away={away(a.id)} />
       ))}
       {workers.length > 0 && <div className="subh">worker</div>}
       {workers.map((a) => (
@@ -713,6 +822,7 @@ function AgentList({
           key={a.id}
           agent={a}
           onOpen={() => onOpen(a)}
+          away={away(a.id)}
           confirmClear={confirmClear}
           setConfirmClear={setConfirmClear}
           onClear={onClear}
@@ -732,6 +842,7 @@ function PersonRow({
   agent,
   onOpen,
   self,
+  away,
   confirmClear,
   setConfirmClear,
   onClear,
@@ -739,15 +850,16 @@ function PersonRow({
   agent: Agent;
   onOpen: () => void;
   self?: boolean;
+  away?: boolean;
   confirmClear?: string | null;
   setConfirmClear?: (n: string | null) => void;
   onClear?: (n: string) => void;
 }) {
   const bars = seniorityBars(agent);
   return (
-    <div className={`person ${agent.online ? "on" : "off"}`}>
+    <div className={`person ${agent.online ? "on" : "off"} ${away ? "away" : ""}`}>
       <button type="button" className="person-main" onClick={onOpen} disabled={self}>
-        <span className="dot" />
+        <Avatar name={agent.name} role={agent.role} online={agent.online} small />
         <span className="pn">{agent.name}</span>
         {bars > 0 && (
           <span className="stripes" title={agent.seniority ?? ""}>
