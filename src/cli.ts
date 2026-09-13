@@ -21,9 +21,9 @@ function help() {
   console.log(`hivemind — local hive for Human, brains, and workers
 
   hivemind serve [--port ${DEFAULT_PORT}]
-  hivemind join --as worker junior|mid|senior [--focus …] [--resume Name]
-  hivemind join --as worker --seniority junior|mid|senior
-  hivemind join --as brain [--focus …] [--resume Name]
+  hivemind join --as worker junior|mid|senior [--focus …] [--project slug] [--resume Name]
+  hivemind join --as worker --seniority junior|mid|senior [--project slug]
+  hivemind join --as brain [--focus …] [--project slug] [--resume Name]
   hivemind wait [--timeout ${Math.round(DEFAULT_WAIT_MS / 1000)}]
   hivemind send --channel NAME --body TEXT [--thread ID] [--file PATH]
   hivemind send --to NAME --body TEXT [--file PATH]
@@ -127,6 +127,8 @@ async function main() {
       seniority: seniority ?? null,
       focus,
       resume,
+      project: parsed.project,
+      cwd: process.cwd(),
     }, token ?? null);
     saveIdentity({
       id: result.agent.id,

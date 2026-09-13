@@ -7,7 +7,7 @@ import { agentDownloadToFile, agentRequest, agentUploadFile, loadIdentityByName,
 import { imagePreview } from "../server/files.ts";
 import { guessMime } from "../shared/mime.ts";
 import { waitUntilMail } from "./wait-loop.ts";
-import { DEFAULT_WAIT_MS, IMAGE_PREVIEW_MAX_BYTES, MCP_HEARTBEAT_MS, type Agent, type Channel, type Identity, type WaitResult } from "../shared/types.ts";
+import { IMAGE_PREVIEW_MAX_BYTES, MCP_HEARTBEAT_MS, MCP_WAIT_POLL_MS, type Agent, type Channel, type Identity, type WaitResult } from "../shared/types.ts";
 
 let sessionToken = process.env.HIVEMIND_TOKEN;
 let heartbeat: ReturnType<typeof setInterval> | undefined;
@@ -35,14 +35,15 @@ export async function startMcp() {
 
   server.tool(
     "join",
-    "Register this terminal as a Hivemind employee. Call once per session. Role cannot change later. Workers must pick seniority junior, mid, or senior. Use resume with your assigned name to come back to work.",
+    "Register this terminal as a Hivemind employee. Call once per session. Role cannot change later. Workers must pick seniority junior, mid, or senior. Use resume with your assigned name to come back to work. Join from the project worktree, or pass project. You cannot see other projects.",
     {
       role: z.enum(["brain", "worker"]),
       seniority: z.enum(["junior", "mid", "senior"]).optional(),
       focus: z.string().optional(),
       resume: z.string().optional(),
+      project: z.string().optional(),
     },
-    async ({ role, seniority, focus, resume }) => {
+    async ({ role, seniority, focus, resume, project }) => {
       const auth = resume
         ? (loadIdentityByName(resume)?.token ?? sessionToken)
         : process.env.HIVEMIND_TOKEN;
@@ -56,7 +57,14 @@ export async function startMcp() {
       }>(
         "POST",
         "/api/agent/join",
-        { role, seniority: seniority ?? null, focus: focus ?? null, resume: resume ?? null },
+        {
+          role,
+          seniority: seniority ?? null,
+          focus: focus ?? null,
+          resume: resume ?? null,
+          project: project ?? null,
+          cwd: process.cwd(),
+        },
         auth ?? null,
       );
       sessionToken = result.token;
@@ -77,8 +85,8 @@ export async function startMcp() {
         standingOrders: result.standingOrders,
         ordersRef: result.ordersRef,
         next: result.created
-          ? "Call wait once with no arguments. After send, wait is the last call. Never end a turn without wait in flight."
-          : "Orders unchanged. Call standing_orders if you need them. Then wait once with no arguments. After send, wait is the last call.",
+          ? "Call wait once with no arguments. Stay silent while wait is in flight. When wait returns, handle the mail."
+          : "Orders unchanged. Call wait once with no arguments. Stay silent while wait is in flight. When wait returns, handle the mail.",
       });
     },
   );
@@ -133,7 +141,7 @@ export async function startMcp() {
 
   server.tool(
     "send",
-    "Post to channel or to (DM by name). Workers cannot @Human or open a Human DM.",
+    "Post to channel or to (DM by name). Workers cannot @Human or open a new Human DM. They may reply in a Human DM that Human already opened.",
     {
       body: z.string(),
       channel: z.string().optional(),
@@ -161,19 +169,22 @@ export async function startMcp() {
 
   server.tool(
     "wait",
-    "Sleep until mail. Call once, no args. When it returns, handle mail, then call wait again before you stop. Never end a turn without wait in flight.",
+    "Sleep until mail. Call once, no args. Stay silent while this tool is running. When it returns, you have mail: handle it now, then call wait again and stay silent after that call. If this tool errors or is cancelled, or the input prompt appears without mail, call wait immediately. Do not ask the person at this prompt.",
     {},
     async () => {
       const result = await waitUntilMail(() =>
         agentRequest<WaitResult>(
           "POST",
           "/api/agent/wait",
-          { timeoutMs: DEFAULT_WAIT_MS, compact: true },
+          { timeoutMs: MCP_WAIT_POLL_MS, compact: true },
           token(),
-          DEFAULT_WAIT_MS + 10_000,
+          MCP_WAIT_POLL_MS + 10_000,
         ),
       );
-      return text(result);
+      return text({
+        instruction: "Mail arrived. Handle it now. Then call wait again and stay silent after that wait.",
+        ...result,
+      });
     },
   );
 

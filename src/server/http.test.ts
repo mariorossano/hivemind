@@ -37,6 +37,7 @@ test("HTTP protocol: join, isolate, wait, Human admin", async () => {
 
     const snap = await json(base, "GET", "/api/ui/snapshot");
     assert.equal(snap.data.you.name, "Human");
+    assert.ok(snap.data.projects.some((p: { slug: string }) => p.slug === "chapter"));
     assert.ok(snap.data.channels.some((c: { name: string }) => c.name === "brains"));
 
     const brain = await json(base, "POST", "/api/agent/join", { role: "brain", focus: "coord" });
@@ -158,6 +159,66 @@ test("HTTP protocol: join, isolate, wait, Human admin", async () => {
     assert.equal(seen.status, 200);
     assert.equal(seen.data.messages.length, 0);
     assert.equal(seen.data.unread.general ?? 0, 0);
+  } finally {
+    started.shutdown();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Human Telegram UI saves settings and never returns the bot token", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "hive-http-tg-"));
+  const hive = new Hive(path.join(dir, "hive.db"));
+  const started = startServer({ port: 0, hive, telegram: false });
+  const port = await started.ready;
+  const base = `http://127.0.0.1:${port}`;
+  const token = "123456:SECRET-telegram-token-ui";
+  try {
+    const put = await json(base, "PUT", "/api/ui/telegram", {
+      botToken: token,
+      allowUserIds: [42],
+      projects: { chapter: { groupChatId: -1001 } },
+    });
+    assert.equal(put.status, 200);
+    assert.equal(put.data.tokenSet, true);
+    assert.equal(put.data.configured, true);
+    assert.equal(put.data.projects.chapter, -1001);
+    assert.ok(!JSON.stringify(put.data).includes(token));
+    const got = await json(base, "GET", "/api/ui/telegram");
+    assert.equal(got.data.tokenHint, "…n-ui");
+    assert.ok(!JSON.stringify(got.data).includes(token));
+    const keep = await json(base, "PUT", "/api/ui/telegram", {
+      allowUserIds: [42],
+      projects: { chapter: { groupChatId: -1002 } },
+    });
+    assert.equal(keep.data.projects.chapter, -1002);
+    assert.ok(!JSON.stringify(keep.data).includes(token));
+    const bad = await json(base, "PUT", "/api/ui/telegram", {
+      allowUserIds: [42],
+      projects: { missing: { groupChatId: -9 } },
+    });
+    assert.equal(bad.status, 404);
+    const other = await json(base, "POST", "/api/ui/projects", { name: "Altro", slug: "altro" });
+    assert.equal(other.status, 200);
+    const mapped = await json(base, "PUT", "/api/ui/telegram", {
+      allowUserIds: [42],
+      projects: { chapter: { groupChatId: -1002 }, altro: { groupChatId: -1003 } },
+    });
+    assert.equal(mapped.data.projects.altro, -1003);
+    const live = await json(base, "POST", "/api/agent/join", { role: "brain", project: "altro" });
+    const blocked = await json(base, "DELETE", "/api/ui/projects/altro");
+    assert.equal(blocked.status, 409);
+    const stillMapped = await json(base, "GET", "/api/ui/telegram");
+    assert.equal(stillMapped.data.projects.altro, -1003);
+    const badSlug = await json(base, "DELETE", "/api/ui/projects/NOPE!");
+    assert.equal(badSlug.status, 400);
+    hive.setOffline(live.data.agent.id);
+    const gone = await json(base, "DELETE", "/api/ui/projects/altro");
+    assert.equal(gone.status, 200);
+    const snap = await json(base, "GET", "/api/ui/snapshot");
+    assert.equal(snap.data.projects.some((p: { slug: string }) => p.slug === "altro"), false);
+    const tg = await json(base, "GET", "/api/ui/telegram");
+    assert.equal(tg.data.projects.altro, undefined);
+    assert.equal(tg.data.projects.chapter, -1002);
   } finally {
     started.shutdown();
     rmSync(dir, { recursive: true, force: true });

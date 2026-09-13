@@ -1,17 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent } from "react";
 import type { Agent, Channel, Message, Thread, ThreadStatus } from "../src/shared/types.ts";
 import { REACTION_EMOJIS } from "../src/shared/types.ts";
-import { api, connectWs, type ChannelPayload, type Snapshot } from "./api.ts";
+import { api, connectWs, type ChannelPayload, type Snapshot, type TelegramSettings } from "./api.ts";
+import { LaunchSheet } from "./LaunchSheet.tsx";
 import { renderBody } from "./markdown.tsx";
 
-type Sel = { kind: "inbox" } | { kind: "channel"; id: string };
+type Sel = { kind: "inbox"; project: string } | { kind: "channel"; id: string };
 
 const STATUSES: ThreadStatus[] = ["open", "in_progress", "blocked", "done"];
 
 function parseHash(): Sel {
   const raw = location.hash.replace(/^#/, "") || "/c/general";
   const parts = raw.split("/").filter(Boolean);
-  if (parts[0] === "inbox") return { kind: "inbox" };
+  if (parts[0] === "inbox") return { kind: "inbox", project: parts[1] ? decodeURIComponent(parts[1]) : "" };
   if (parts[1]) return { kind: "channel", id: decodeURIComponent(parts[1]) };
   return { kind: "channel", id: "general" };
 }
@@ -58,7 +59,24 @@ function applyMessageToSnap(snap: Snapshot, msg: Message, viewingId: string | nu
 }
 
 function setHash(sel: Sel) {
-  location.hash = sel.kind === "inbox" ? "/inbox" : `/c/${encodeURIComponent(sel.id)}`;
+  location.hash =
+    sel.kind === "inbox"
+      ? sel.project
+        ? `/inbox/${encodeURIComponent(sel.project)}`
+        : "/inbox"
+      : `/c/${encodeURIComponent(sel.id)}`;
+}
+
+function repairSel(sel: Sel, snap: Snapshot): Sel | null {
+  if (sel.kind === "inbox") {
+    if (!sel.project) return snap.projects[0] ? { kind: "inbox", project: snap.projects[0].slug } : null;
+    if (snap.projects.some((p) => p.slug === sel.project)) return null;
+    const fallback = snap.projects[0];
+    return fallback ? { kind: "inbox", project: fallback.slug } : { kind: "inbox", project: "" };
+  }
+  if (snap.channels.some((c) => c.id === sel.id)) return null;
+  const fallback = snap.projects[0];
+  return fallback ? { kind: "inbox", project: fallback.slug } : { kind: "inbox", project: "" };
 }
 
 function seniorityBars(agent: Agent): number {
@@ -99,12 +117,26 @@ export function App() {
   const [inviteNames, setInviteNames] = useState<string[]>([]);
   const [confirmClear, setConfirmClear] = useState<string | null>(null);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [launchOpen, setLaunchOpen] = useState(false);
+  const [telegramOpen, setTelegramOpen] = useState(false);
+  const [telegram, setTelegram] = useState<TelegramSettings | null>(null);
+  const [tgToken, setTgToken] = useState("");
+  const [tgUsers, setTgUsers] = useState("");
+  const [tgGroups, setTgGroups] = useState<Record<string, string>>({});
   const [query, setQuery] = useState("");
   const [theme, setTheme] = useState<"light" | "dark">(() => {
     const saved = localStorage.getItem("hivemind-theme");
     return saved === "dark" ? "dark" : "light";
   });
-  const [openGroups, setOpenGroups] = useState({ channels: true, dms: true, other: true });
+  const [openProjects, setOpenProjects] = useState<Record<string, boolean>>({});
+  const [creatingProject, setCreatingProject] = useState(false);
+  const [editingProject, setEditingProject] = useState<string | null>(null);
+  const [newProjectName, setNewProjectName] = useState("");
+  const [newProjectSlug, setNewProjectSlug] = useState("");
+  const [newProjectTree, setNewProjectTree] = useState("");
+  const [projectDeleteConfirm, setProjectDeleteConfirm] = useState("");
+  const [deletingProject, setDeletingProject] = useState(false);
+  const [createIn, setCreateIn] = useState<string | null>(null);
   const stickBottom = useRef(true);
   const themePainted = useRef(false);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -180,6 +212,10 @@ export function App() {
         setSnap((s) => (s ? { ...s, queued: { ...s.queued, [q.agentId]: q.n } } : s));
         return;
       }
+      if (ev.type === "project") {
+        refreshSnap().catch(() => undefined);
+        return;
+      }
     }, setLive);
     const onHash = () => {
       setSel(parseHash());
@@ -192,21 +228,46 @@ export function App() {
     };
   }, [loadChannel, refreshSnap]);
 
+  const missingChannel = Boolean(snap && sel.kind === "channel" && !snap.channels.some((c) => c.id === sel.id));
+
+  useEffect(() => {
+    if (!snap) return;
+    const next = repairSel(sel, snap);
+    if (!next) return;
+    setThreadId(null);
+    setSel(next);
+    setHash(next);
+  }, [snap, sel]);
+
+  useEffect(() => {
+    if (!snap) return;
+    if (editingProject && !snap.projects.some((p) => p.slug === editingProject)) {
+      setEditingProject(null);
+      setProjectDeleteConfirm("");
+      setDeletingProject(false);
+    }
+    if (createIn && !snap.projects.some((p) => p.slug === createIn)) setCreateIn(null);
+  }, [snap, editingProject, createIn]);
+
   useEffect(() => {
     if (sel.kind !== "channel") {
       setPane(null);
       return;
     }
+    if (missingChannel) {
+      setPane(null);
+      return;
+    }
     loadChannel(sel.id).catch((e) => setErr(String(e.message || e)));
-  }, [sel, loadChannel]);
+  }, [sel, loadChannel, missingChannel]);
 
   useEffect(() => {
-    if (!threadId || sel.kind !== "channel") {
+    if (!threadId || sel.kind !== "channel" || missingChannel) {
       setThreadPane(null);
       return;
     }
     api.messages(sel.id, threadId).then(setThreadPane).catch((e) => setErr(String(e.message || e)));
-  }, [threadId, sel]);
+  }, [threadId, sel, missingChannel]);
 
   useEffect(() => {
     const apply = () => {
@@ -239,21 +300,30 @@ export function App() {
   };
 
   const channels = snap?.channels ?? [];
+  const projects = snap?.projects ?? [];
   const q = query.trim().toLowerCase();
   const match = (name: string) => !q || name.toLowerCase().includes(q);
-  const publics = channels.filter(
-    (c) => (c.type === "public" || c.type === "brains" || c.type === "private") && match(c.name),
-  );
-  const myDms = channels.filter((c) => c.type === "dm" && c.memberIds.includes("human") && match(c.name));
-  const otherDms = channels.filter((c) => c.type === "dm" && !c.memberIds.includes("human") && match(c.name));
+  const activeChannel = sel.kind === "channel" ? channels.find((c) => c.id === sel.id) : undefined;
+  const selectedProject =
+    sel.kind === "inbox" ? sel.project : (activeChannel?.project ?? projects[0]?.slug ?? "chapter");
+  const editingBusy = editingProject
+    ? (snap?.agents ?? []).filter((a) => a.role !== "human" && a.project === editingProject && a.online)
+    : [];
+  const canDeleteProject =
+    Boolean(editingProject) &&
+    !deletingProject &&
+    projectDeleteConfirm.trim().toLowerCase() === editingProject &&
+    editingBusy.length === 0;
   const roomAgents = (snap?.agents ?? []).filter((a) => {
+    if (a.role !== "human" && a.project && a.project !== selectedProject) return false;
     if (!q) return true;
     return match(a.name) || match(a.focus ?? "") || match(a.role);
   });
-
-  const activeChannel = sel.kind === "channel" ? channels.find((c) => c.id === sel.id) : undefined;
-  const mentionTotal = snap?.mentions.length ?? 0;
-  const roomIds = new Set(activeChannel?.memberIds ?? []);
+  const mentionTotal = (slug: string) =>
+    (snap?.mentions ?? []).filter((m) => channels.find((c) => c.id === m.channelId)?.project === slug).length;
+  const inboxMentions = (snap?.mentions ?? []).filter(
+    (m) => channels.find((c) => c.id === m.channelId)?.project === (sel.kind === "inbox" ? sel.project : selectedProject),
+  );
 
   const send = async (body: string, tid?: string | null, files?: File[]) => {
     if (sel.kind !== "channel") return;
@@ -270,13 +340,16 @@ export function App() {
 
   const onCreate = async () => {
     if (!newName.trim()) return;
+    const project = createIn ?? activeChannel?.project ?? snap?.projects[0]?.slug;
     const { channel } = await api.createChannel(
       newName.trim(),
       newType,
       newTopic.trim() || undefined,
       newType === "private" ? newMembers : undefined,
+      project,
     );
     setCreating(false);
+    setCreateIn(null);
     setNewName("");
     setNewTopic("");
     setNewMembers([]);
@@ -333,6 +406,35 @@ export function App() {
             >
               {theme === "dark" ? "☀" : "☾"}
             </button>
+            <button
+              type="button"
+              className="icon-btn"
+              title="Telegram"
+              onClick={() => {
+                api
+                  .telegram()
+                  .then((t) => {
+                    setTelegram(t);
+                    setTgToken("");
+                    setTgUsers(t.allowUserIds.join(", "));
+                    setTgGroups(
+                      Object.fromEntries(
+                        (snap?.projects ?? []).map((p) => [
+                          p.slug,
+                          t.projects[p.slug] != null ? String(t.projects[p.slug]) : "",
+                        ]),
+                      ),
+                    );
+                    setTelegramOpen(true);
+                  })
+                  .catch((e) => setErr(String(e.message || e)));
+              }}
+            >
+              {snap.telegram?.running ? "✈" : "⌬"}
+            </button>
+            <button type="button" className="icon-btn" title="Launch agent" onClick={() => setLaunchOpen(true)}>
+              ▶
+            </button>
             <button type="button" className="icon-btn" title="How to join" onClick={() => setHelpOpen(true)}>
               ?
             </button>
@@ -346,101 +448,162 @@ export function App() {
           placeholder="Search the hive"
         />
 
-        <button className={`nav ${sel.kind === "inbox" ? "active" : ""}`} onClick={() => go({ kind: "inbox" })}>
-          <span>For you</span>
-          {mentionTotal > 0 && <em>{mentionTotal}</em>}
-        </button>
-
-        <div className="group">
-          <div className="group-h">
-            <button
-              type="button"
-              className="twist"
-              onClick={() => setOpenGroups((g) => ({ ...g, channels: !g.channels }))}
-              aria-expanded={openGroups.channels}
-            >
-              {openGroups.channels ? "▾" : "▸"}
-            </button>
-            <span>Channels</span>
-            <button type="button" className="plus" onClick={() => setCreating(true)} title="New channel">
-              +
-            </button>
-          </div>
-          {openGroups.channels &&
-            publics.map((ch) => (
-              <ChannelItem
-                key={ch.id}
-                ch={ch}
-                unread={snap.unread[ch.id] ?? 0}
-                active={sel.kind === "channel" && sel.id === ch.id}
-                onClick={() => go({ kind: "channel", id: ch.id })}
-              />
-            ))}
+        <div className="group-h">
+          <span>Projects</span>
+          <button type="button" className="plus" onClick={() => setCreatingProject(true)} title="New project">
+            +
+          </button>
         </div>
 
-        <div className="group">
-          <div className="group-h">
-            <button
-              type="button"
-              className="twist"
-              onClick={() => setOpenGroups((g) => ({ ...g, dms: !g.dms }))}
-              aria-expanded={openGroups.dms}
-            >
-              {openGroups.dms ? "▾" : "▸"}
-            </button>
-            <span>Direct messages</span>
-          </div>
-          {openGroups.dms && myDms.length === 0 && <div className="empty-mini">No direct messages</div>}
-          {openGroups.dms &&
-            myDms.map((ch) => (
-              <ChannelItem
-                key={ch.id}
-                ch={ch}
-                unread={snap.unread[ch.id] ?? 0}
-                active={sel.kind === "channel" && sel.id === ch.id}
-                onClick={() => go({ kind: "channel", id: ch.id })}
-              />
-            ))}
-        </div>
-
-        {otherDms.length > 0 && (
-          <div className="group">
-            <div className="group-h">
-              <button
-                type="button"
-                className="twist"
-                onClick={() => setOpenGroups((g) => ({ ...g, other: !g.other }))}
-                aria-expanded={openGroups.other}
-              >
-                {openGroups.other ? "▾" : "▸"}
-              </button>
-              <span>Other directs</span>
+        {projects.length === 0 && <p className="help-p">No projects.</p>}
+        {projects.map((project) => {
+          const open = openProjects[project.slug] ?? project.slug === selectedProject;
+          const publics = channels.filter(
+            (c) =>
+              c.project === project.slug &&
+              (c.type === "public" || c.type === "brains" || c.type === "private") &&
+              match(c.name),
+          );
+          const myDms = channels.filter(
+            (c) => c.project === project.slug && c.type === "dm" && c.memberIds.includes("human") && match(c.name),
+          );
+          const otherDms = channels.filter(
+            (c) => c.project === project.slug && c.type === "dm" && !c.memberIds.includes("human") && match(c.name),
+          );
+          const hiveAgents = (snap.agents ?? []).filter(
+            (a) => a.role === "human" || a.project === project.slug,
+          ).filter((a) => !q || match(a.name) || match(a.focus ?? "") || match(a.role));
+          const n = mentionTotal(project.slug);
+          return (
+            <div key={project.id} className="project-sec">
+              <div className="group-h">
+                <button
+                  type="button"
+                  className="twist"
+                  onClick={() => setOpenProjects((g) => ({ ...g, [project.slug]: !open }))}
+                  aria-expanded={open}
+                >
+                  {open ? "▾" : "▸"}
+                </button>
+                <span>{project.name}</span>
+                {n > 0 && <em className="sec-badge">{n}</em>}
+                <button
+                  type="button"
+                  className="plus"
+                  title="Project settings"
+                  onClick={() => {
+                    setEditingProject(project.slug);
+                    setNewProjectName(project.name);
+                    setNewProjectTree(project.worktree ?? "");
+                    setProjectDeleteConfirm("");
+                  }}
+                >
+                  …
+                </button>
+              </div>
+              {open && (
+                <>
+                  <button
+                    className={`nav ${sel.kind === "inbox" && sel.project === project.slug ? "active" : ""}`}
+                    onClick={() => go({ kind: "inbox", project: project.slug })}
+                  >
+                    <span>For you</span>
+                    {n > 0 && <em>{n}</em>}
+                  </button>
+                  <div className="group">
+                    <div className="group-h">
+                      <span>Channels</span>
+                      <button
+                        type="button"
+                        className="plus"
+                        onClick={() => {
+                          setCreateIn(project.slug);
+                          setCreating(true);
+                        }}
+                        title="New channel"
+                      >
+                        +
+                      </button>
+                    </div>
+                    {publics.map((ch) => (
+                      <ChannelItem
+                        key={ch.id}
+                        ch={ch}
+                        unread={snap.unread[ch.id] ?? 0}
+                        active={sel.kind === "channel" && sel.id === ch.id}
+                        onClick={() => go({ kind: "channel", id: ch.id })}
+                      />
+                    ))}
+                  </div>
+                  <div className="group">
+                    <div className="group-h">
+                      <span>Direct messages</span>
+                    </div>
+                    {myDms.length === 0 && <div className="empty-mini">No direct messages</div>}
+                    {myDms.map((ch) => (
+                      <ChannelItem
+                        key={ch.id}
+                        ch={ch}
+                        unread={snap.unread[ch.id] ?? 0}
+                        active={sel.kind === "channel" && sel.id === ch.id}
+                        onClick={() => go({ kind: "channel", id: ch.id })}
+                      />
+                    ))}
+                  </div>
+                  {otherDms.length > 0 && (
+                    <div className="group">
+                      <div className="group-h">
+                        <span>Other directs</span>
+                      </div>
+                      {otherDms.map((ch) => (
+                        <ChannelItem
+                          key={ch.id}
+                          ch={ch}
+                          unread={snap.unread[ch.id] ?? 0}
+                          active={sel.kind === "channel" && sel.id === ch.id}
+                          onClick={() => go({ kind: "channel", id: ch.id })}
+                        />
+                      ))}
+                    </div>
+                  )}
+                  <div className="group">
+                    <div className="group-h">
+                      <span>Hive</span>
+                    </div>
+                    <AgentList
+                      agents={hiveAgents}
+                      queued={snap.queued ?? {}}
+                      onOpen={onAgent}
+                      confirmClear={confirmClear}
+                      setConfirmClear={setConfirmClear}
+                      onClear={onClear}
+                    />
+                  </div>
+                </>
+              )}
             </div>
-            {openGroups.other &&
-              otherDms.map((ch) => (
-                <ChannelItem
-                  key={ch.id}
-                  ch={ch}
-                  unread={snap.unread[ch.id] ?? 0}
-                  active={sel.kind === "channel" && sel.id === ch.id}
-                  onClick={() => go({ kind: "channel", id: ch.id })}
-                />
-              ))}
-          </div>
-        )}
+          );
+        })}
       </aside>
 
       <main className="desk">
-        {sel.kind === "inbox" ? (
+        {projects.length === 0 ? (
+          <header className="desk-h">
+            <div>
+              <h1>No projects</h1>
+              <p>Create one from the sidebar. The worktree on disk is never deleted.</p>
+            </div>
+          </header>
+        ) : sel.kind === "inbox" ? (
           <Inbox
-            mentions={snap.mentions}
+            mentions={inboxMentions}
             hasMore={Boolean(snap.mentionsHasMore)}
-            agents={snap.agents}
+            agents={snap.agents.filter((a) => a.role === "human" || a.project === sel.project)}
             onOpen={(id) => go({ kind: "channel", id })}
             onOlder={() => {
-              const oldest = snap.mentions[snap.mentions.length - 1]?.seq;
-              if (!oldest) return;
-              api.mentions(oldest).then((page) => {
+              const oldest = inboxMentions[inboxMentions.length - 1]?.seq;
+              if (!oldest || !projects.some((p) => p.slug === sel.project)) return;
+              api.mentions(oldest, sel.project).then((page) => {
                 setSnap((s) =>
                   s
                     ? {
@@ -453,12 +616,16 @@ export function App() {
               }).catch((e) => setErr(String(e.message || e)));
             }}
             onMarkSeen={() => {
-              api.markMentionsSeen().then((page) => {
+              if (!projects.some((p) => p.slug === sel.project)) return;
+              api.markMentionsSeen(sel.project).then((page) => {
                 setSnap((s) =>
                   s
                     ? {
                         ...s,
-                        mentions: page.messages,
+                        mentions: [
+                          ...s.mentions.filter((m) => channels.find((c) => c.id === m.channelId)?.project !== sel.project),
+                          ...page.messages,
+                        ],
                         mentionsHasMore: page.hasMore,
                         unread: page.unread,
                       }
@@ -519,7 +686,7 @@ export function App() {
               <div ref={bottomRef} />
             </div>
             <Composer
-              agents={snap.agents}
+              agents={roomAgents}
               value={draft}
               onChange={setDraft}
               placeholder={
@@ -579,7 +746,7 @@ export function App() {
             <div ref={threadBottomRef} />
           </div>
           <Composer
-            agents={snap.agents}
+            agents={roomAgents}
             value={threadDraft}
             onChange={setThreadDraft}
             placeholder="Reply in thread…"
@@ -587,19 +754,6 @@ export function App() {
           />
         </aside>
       )}
-
-      <aside className="hive">
-        <div className="group-h">Hive</div>
-        <AgentList
-          agents={roomAgents}
-          presentIds={roomIds}
-          queued={snap.queued ?? {}}
-          onOpen={onAgent}
-          confirmClear={confirmClear}
-          setConfirmClear={setConfirmClear}
-          onClear={onClear}
-        />
-      </aside>
 
       {creating && (
         <div className="modal" onClick={() => setCreating(false)}>
@@ -630,7 +784,9 @@ export function App() {
             {newType === "private" && (
               <fieldset className="checks">
                 <legend>Members</legend>
-                {snap.agents.filter((a) => a.role !== "human").map((a) => (
+                {snap.agents
+                  .filter((a) => a.role !== "human" && (!createIn || a.project === createIn))
+                  .map((a) => (
                   <label key={a.id} className="check">
                     <input
                       type="checkbox"
@@ -680,7 +836,12 @@ export function App() {
             <fieldset className="checks">
               <legend>Agents</legend>
               {snap.agents
-                .filter((a) => a.role !== "human" && !activeChannel.memberIds.includes(a.id))
+                .filter(
+                  (a) =>
+                    a.role !== "human" &&
+                    a.project === activeChannel.project &&
+                    !activeChannel.memberIds.includes(a.id),
+                )
                 .map((a) => (
                   <label key={a.id} className="check">
                     <input
@@ -708,12 +869,235 @@ export function App() {
         </div>
       )}
 
+      {editingProject && (
+        <div
+          className="modal"
+          onClick={() => {
+            setEditingProject(null);
+            setProjectDeleteConfirm("");
+          }}
+        >
+          <form
+            className="sheet"
+            onClick={(e) => e.stopPropagation()}
+            onSubmit={(e) => {
+              e.preventDefault();
+              api
+                .updateProject(editingProject, {
+                  name: newProjectName.trim(),
+                  worktree: newProjectTree.trim() || null,
+                })
+                .then(async () => {
+                  setEditingProject(null);
+                  setProjectDeleteConfirm("");
+                  await refreshSnap();
+                })
+                .catch((ex) => setErr(String(ex.message || ex)));
+            }}
+          >
+            <h2>Project {editingProject}</h2>
+            <label>
+              Name
+              <input value={newProjectName} onChange={(e) => setNewProjectName(e.target.value)} autoFocus />
+            </label>
+            <label>
+              Worktree
+              <input value={newProjectTree} onChange={(e) => setNewProjectTree(e.target.value)} placeholder="absolute path" />
+            </label>
+            <p className="help-p">Join from this path, or pass project={editingProject}. Agents cannot see other projects.</p>
+            <div className="row">
+              <button
+                type="button"
+                onClick={() => {
+                  setEditingProject(null);
+                  setProjectDeleteConfirm("");
+                }}
+              >
+                Cancel
+              </button>
+              <button type="submit" className="primary">
+                Save
+              </button>
+            </div>
+            <div className="danger-block">
+              <p className="help-p">
+                Deletes this hive (channels, mail, roster, Telegram map). Does not touch the worktree.
+              </p>
+              {editingBusy.length > 0 && (
+                <p className="help-p">
+                  Cannot delete while {editingBusy.map((a) => a.name).join(", ")}{" "}
+                  {editingBusy.length === 1 ? "is" : "are"} still online or waiting.
+                </p>
+              )}
+              <label>
+                Type {editingProject} to delete
+                <input
+                  value={projectDeleteConfirm}
+                  onChange={(e) => setProjectDeleteConfirm(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") e.preventDefault();
+                  }}
+                  autoComplete="off"
+                />
+              </label>
+              <div className="row">
+                <button
+                  type="button"
+                  className="danger"
+                  disabled={!canDeleteProject}
+                  onClick={() => {
+                    setDeletingProject(true);
+                    api
+                      .deleteProject(editingProject)
+                      .then(async () => {
+                        setEditingProject(null);
+                        setProjectDeleteConfirm("");
+                        await refreshSnap();
+                      })
+                      .catch((ex) => setErr(String(ex.message || ex)))
+                      .finally(() => setDeletingProject(false));
+                  }}
+                >
+                  Delete project
+                </button>
+              </div>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {creatingProject && (
+        <div className="modal" onClick={() => setCreatingProject(false)}>
+          <form
+            className="sheet"
+            onClick={(e) => e.stopPropagation()}
+            onSubmit={(e) => {
+              e.preventDefault();
+              api
+                .createProject(newProjectName.trim(), newProjectSlug.trim() || undefined, newProjectTree.trim() || undefined)
+                .then(async ({ project }) => {
+                  setCreatingProject(false);
+                  setNewProjectName("");
+                  setNewProjectSlug("");
+                  setNewProjectTree("");
+                  await refreshSnap();
+                  setOpenProjects((g) => ({ ...g, [project.slug]: true }));
+                })
+                .catch((ex) => setErr(String(ex.message || ex)));
+            }}
+          >
+            <h2>New project</h2>
+            <label>
+              Name
+              <input value={newProjectName} onChange={(e) => setNewProjectName(e.target.value)} placeholder="Another" autoFocus />
+            </label>
+            <label>
+              Slug
+              <input value={newProjectSlug} onChange={(e) => setNewProjectSlug(e.target.value)} placeholder="altro" />
+            </label>
+            <label>
+              Worktree
+              <input value={newProjectTree} onChange={(e) => setNewProjectTree(e.target.value)} placeholder="absolute path" />
+            </label>
+            <div className="row">
+              <button type="button" onClick={() => setCreatingProject(false)}>
+                Cancel
+              </button>
+              <button type="submit" className="primary">
+                Create
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {telegramOpen && telegram && (
+        <div className="modal" onClick={() => setTelegramOpen(false)}>
+          <form
+            className="sheet"
+            onClick={(e) => e.stopPropagation()}
+            onSubmit={(e) => {
+              e.preventDefault();
+              const known = new Set(projects.map((p) => p.slug));
+              const mapped: Record<string, { groupChatId: string }> = {};
+              for (const [slug, raw] of Object.entries(tgGroups)) {
+                if (!known.has(slug) || !raw.trim()) continue;
+                mapped[slug] = { groupChatId: raw.trim() };
+              }
+              api
+                .saveTelegram({
+                  botToken: tgToken.trim() || undefined,
+                  allowUserIds: tgUsers.split(/[,\s]+/).filter(Boolean),
+                  projects: mapped,
+                })
+                .then((t) => {
+                  setTelegram(t);
+                  setTgToken("");
+                  setSnap((s) => (s ? { ...s, telegram: { running: t.running, configured: t.configured } } : s));
+                })
+                .catch((ex) => setErr(String(ex.message || ex)));
+            }}
+          >
+            <h2>Telegram</h2>
+            <p className="help-p">
+              One bot, one forum group per project. The bot needs admin and Manage Topics. {telegram.running ? "Bridge is on." : "Bridge is off."}
+            </p>
+            <label>
+              Bot token
+              <input
+                type="password"
+                value={tgToken}
+                onChange={(e) => setTgToken(e.target.value)}
+                placeholder={telegram.tokenHint ? `saved ${telegram.tokenHint}` : "from BotFather"}
+                autoComplete="off"
+              />
+            </label>
+            <label>
+              Allowed user ids
+              <input
+                value={tgUsers}
+                onChange={(e) => setTgUsers(e.target.value)}
+                placeholder="123456789"
+              />
+            </label>
+            {projects.map((p) => (
+              <label key={p.id}>
+                {p.name} group chat id
+                <input
+                  value={tgGroups[p.slug] ?? ""}
+                  onChange={(e) => setTgGroups((cur) => ({ ...cur, [p.slug]: e.target.value }))}
+                  placeholder="-100…"
+                />
+              </label>
+            ))}
+            <p className="help-p">Unmapped groups are ignored. Saved next to the hive db, never in git.</p>
+            <div className="row">
+              <button type="button" onClick={() => setTelegramOpen(false)}>
+                Close
+              </button>
+              <button type="submit" className="primary">
+                Save
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {launchOpen && (
+        <LaunchSheet
+          projects={projects}
+          agents={snap.agents}
+          defaultProject={selectedProject}
+          onClose={() => setLaunchOpen(false)}
+        />
+      )}
+
       {helpOpen && (
         <div className="modal" onClick={() => setHelpOpen(false)}>
           <div className="sheet" onClick={(e) => e.stopPropagation()}>
             <h2>How to join</h2>
             <p className="help-p">
-              You open Codex, Claude, or Cursor yourself, pick the model, then register that terminal. Hivemind never wakes a closed session.
+              You open Codex, Claude, or Cursor yourself, pick the model, then register that terminal. Hivemind never wakes a closed session. Or use Launch to copy a command plus prompt.
             </p>
             <pre>{`npx tsx src/cli.ts mcp-config
 npx tsx src/cli.ts join --as brain
@@ -823,6 +1207,7 @@ function Msg({
   onReact?: (emoji: string) => void;
 }) {
   const time = new Date(m.createdAt).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  const placed = (m.reactions ?? []).filter((r) => r.count > 0);
   return (
     <article className={`msg role-${m.authorRole} kind-${m.kind}`}>
       <Avatar name={m.authorName} role={m.authorRole} />
@@ -850,28 +1235,44 @@ function Msg({
             )}
           </div>
         )}
-        {m.kind === "chat" && onReact && (
+        {m.kind === "chat" && placed.length > 0 && (
           <div className="reacts">
-            {REACTION_EMOJIS.map((emoji) => {
-              const hit = m.reactions?.find((r) => r.emoji === emoji);
-              return (
-                <button
-                  key={emoji}
-                  type="button"
-                  className={`react ${hit?.mine ? "mine" : ""}`}
-                  onClick={() => onReact(emoji)}
-                >
-                  {emoji}
-                  {hit && hit.count > 0 && <em>{hit.count}</em>}
-                </button>
-              );
-            })}
+            {placed.map((hit) => (
+              <button
+                key={hit.emoji}
+                type="button"
+                className={`react ${hit.mine ? "mine" : ""}`}
+                disabled={!onReact}
+                onClick={() => onReact?.(hit.emoji)}
+              >
+                {hit.emoji}
+                <em>{hit.count}</em>
+              </button>
+            ))}
           </div>
         )}
         {onThread && m.kind === "chat" && (
           <button type="button" className="replies" onClick={onThread}>
             {replies > 0 ? `${replies} ${replies === 1 ? "reply" : "replies"}` : "Thread"}
           </button>
+        )}
+        {m.kind === "chat" && onReact && (
+          <div className="react-pick" role="toolbar" aria-label="Add reaction">
+            {REACTION_EMOJIS.map((emoji) => {
+              const hit = m.reactions?.find((r) => r.emoji === emoji);
+              return (
+                <button
+                  key={emoji}
+                  type="button"
+                  className={`react-pick-btn ${hit?.mine ? "mine" : ""}`}
+                  title={emoji}
+                  onClick={() => onReact(emoji)}
+                >
+                  {emoji}
+                </button>
+              );
+            })}
+          </div>
         )}
       </div>
     </article>
@@ -1020,7 +1421,6 @@ function Avatar({ name, role, online, small }: { name: string; role?: string; on
 
 function AgentList({
   agents,
-  presentIds,
   queued,
   onOpen,
   confirmClear,
@@ -1028,7 +1428,6 @@ function AgentList({
   onClear,
 }: {
   agents: Agent[];
-  presentIds: Set<string>;
   queued: Record<string, number>;
   onOpen: (a: Agent) => void;
   confirmClear: string | null;
@@ -1040,14 +1439,13 @@ function AgentList({
   const workers = agents.filter((a) => a.role === "worker");
   const rank = { senior: 0, mid: 1, junior: 2 } as const;
   workers.sort((a, b) => (rank[a.seniority ?? "mid"] ?? 3) - (rank[b.seniority ?? "mid"] ?? 3) || a.name.localeCompare(b.name));
-  const away = (id: string) => presentIds.size > 0 && !presentIds.has(id);
 
   return (
     <div className="agents">
-      {human && <PersonRow agent={human} onOpen={() => undefined} self away={away(human.id)} />}
+      {human && <PersonRow agent={human} onOpen={() => undefined} self />}
       {brains.length > 0 && <div className="subh">brain</div>}
       {brains.map((a) => (
-        <PersonRow key={a.id} agent={a} queued={queued[a.id] ?? 0} onOpen={() => onOpen(a)} away={away(a.id)} />
+        <PersonRow key={a.id} agent={a} queued={queued[a.id] ?? 0} onOpen={() => onOpen(a)} />
       ))}
       {workers.length > 0 && <div className="subh">worker</div>}
       {workers.map((a) => (
@@ -1056,7 +1454,6 @@ function AgentList({
           agent={a}
           queued={queued[a.id] ?? 0}
           onOpen={() => onOpen(a)}
-          away={away(a.id)}
           confirmClear={confirmClear}
           setConfirmClear={setConfirmClear}
           onClear={onClear}
@@ -1077,7 +1474,6 @@ function PersonRow({
   queued,
   onOpen,
   self,
-  away,
   confirmClear,
   setConfirmClear,
   onClear,
@@ -1086,14 +1482,13 @@ function PersonRow({
   queued?: number;
   onOpen: () => void;
   self?: boolean;
-  away?: boolean;
   confirmClear?: string | null;
   setConfirmClear?: (n: string | null) => void;
   onClear?: (n: string) => void;
 }) {
   const bars = seniorityBars(agent);
   return (
-    <div className={`person ${agent.online ? "on" : "off"} ${away ? "away" : ""}`}>
+    <div className={`person ${agent.online ? "on" : "off"}`}>
       <button type="button" className="person-main" onClick={onOpen} disabled={self}>
         <Avatar name={agent.name} role={agent.role} online={agent.online} small />
         <span className="pn">{agent.name}</span>

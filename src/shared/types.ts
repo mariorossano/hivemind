@@ -2,8 +2,13 @@ export const PROTOCOL_VERSION = 2;
 export const DEFAULT_PORT = 7420;
 export const HUMAN_ID = "human";
 export const HUMAN_NAME = "Human";
+/** Seed slug for the first project when an existing hive is migrated. Not a special runtime mode. */
+export const DEFAULT_PROJECT_SLUG = "chapter";
+export const DEFAULT_PROJECT_NAME = "Chapter";
 /** Server-side wait sleep. Long so agents do not burn a model turn every minute. */
 export const DEFAULT_WAIT_MS = 1_500_000;
+/** MCP wait HTTP poll. Short so localhost fetch does not die mid-sleep. */
+export const MCP_WAIT_POLL_MS = 20_000;
 export const BODY_MAX = 4_000;
 export const WAIT_MAIL_CAP = 8;
 export const PRESENCE_IDLE_MS = 10 * 60 * 1000;
@@ -12,7 +17,7 @@ export const FILE_MAX_BYTES = 512 * 1024 * 1024;
 export const IMAGE_PREVIEW_MAX_BYTES = 1_500_000;
 export const FILES_PER_MESSAGE = 4;
 export const WAIT_NEXT =
-  "Handle this mail. Then call wait again with no arguments before you stop. Never end a turn without wait in flight.";
+  "This is mail. Handle it now. Do not stay silent. After you finish (and after send), call wait again and then output no text.";
 
 export const REACTION_EMOJIS = ["👍", "👎", "👀", "🚩", "✅", "❓"] as const;
 export type ReactionEmoji = (typeof REACTION_EMOJIS)[number];
@@ -37,6 +42,14 @@ export type MessageKind = "chat" | "system" | "control";
 export type ControlAction = "clear_context";
 export type MessageSource = "hive" | "telegram";
 
+export type Project = {
+  id: string;
+  slug: string;
+  name: string;
+  worktree: string | null;
+  createdAt: number;
+};
+
 export type Agent = {
   id: string;
   name: string;
@@ -46,6 +59,8 @@ export type Agent = {
   online: boolean;
   lastSeenAt: number;
   createdAt: number;
+  projectId: string | null;
+  project: string | null;
 };
 
 export type Channel = {
@@ -56,6 +71,8 @@ export type Channel = {
   createdBy: string;
   createdAt: number;
   memberIds: string[];
+  projectId: string;
+  project: string;
 };
 
 export type AttachmentMeta = {
@@ -122,7 +139,7 @@ export type WaitMailItem = {
   attachments?: AttachmentMeta[];
 };
 
-export type WaitYou = Pick<Agent, "name" | "role" | "seniority" | "focus" | "online">;
+export type WaitYou = Pick<Agent, "name" | "role" | "seniority" | "focus" | "online" | "project">;
 
 export type WaitResult = {
   idle: boolean;

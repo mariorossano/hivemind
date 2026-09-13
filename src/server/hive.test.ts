@@ -431,3 +431,88 @@ test("Human can see brain-worker DMs and invite to private rooms", () => {
   assert.ok(room.memberIds.includes(worker.agent.id));
   rmSync(dir, { recursive: true, force: true });
 });
+
+test("projects are isolated: roster, DM, mentions, wait, join cwd", async () => {
+  const { hive, dir } = tempHive();
+  const human = hive.getAgent("human");
+  const chapter = hive.listProjects()[0]!;
+  assert.equal(chapter.slug, "chapter");
+  hive.updateProject(human, "chapter", { worktree: dir });
+  const solace = hive.join({ role: "brain" });
+  const dowel = hive.join({ role: "worker", seniority: "senior" });
+  const other = hive.createProject(human, { name: "Altro", slug: "altro", worktree: path.join(dir, "altro") });
+  const atlas = hive.join({ role: "brain", project: "altro" });
+  const rivet = hive.join({ role: "worker", seniority: "mid", cwd: path.join(dir, "altro") });
+  assert.equal(atlas.agent.project, "altro");
+  assert.equal(rivet.agent.project, "altro");
+  assert.throws(() => hive.createProject(atlas.agent, { name: "Nope", slug: "nope" }), /Only Human/);
+  assert.deepEqual(
+    hive.listAgents(atlas.agent).filter((a) => a.role !== "human").map((a) => a.name).sort(),
+    [atlas.agent.name, rivet.agent.name].sort(),
+  );
+  assert.ok(!hive.listChannels(atlas.agent).some((c) => c.id === "general" || c.project === "chapter"));
+  assert.notEqual(hive.getChannel("general", atlas.agent.projectId).id, "general");
+  assert.throws(() => hive.openDm(atlas.agent, dowel.agent.name), /not in your project/);
+  assert.throws(() => hive.join({ role: "worker", seniority: "junior", cwd: path.join(dir, "unknown") }), /Pass project=slug/);
+  assert.throws(
+    () => hive.join({ role: "brain", resumeName: solace.agent.name, project: "altro" }),
+    /project cannot change/,
+  );
+  const back = hive.join({ role: "brain", resumeName: solace.agent.name });
+  assert.equal(back.agent.project, "chapter");
+  hive.postMessage(atlas.agent, { channel: "general", body: `take this @${rivet.agent.name}` });
+  const idle = await hive.wait(dowel.agent, 200);
+  assert.equal(idle.idle, true);
+  const hit = await hive.wait(rivet.agent, 200);
+  assert.equal(hit.idle, false);
+  const mention = hive.postMessage(atlas.agent, { channel: "general", body: "need a goal @Human" });
+  const inbox = hive.mentionInbox(human, 30, undefined, other.id);
+  assert.ok(inbox.messages.some((m) => m.id === mention.id));
+  const chapterInbox = hive.mentionInbox(human, 30, undefined, chapter.id);
+  assert.ok(!chapterInbox.messages.some((m) => m.id === mention.id));
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("Human can delete an idle project but not one with online or waiting agents", async () => {
+  const { hive, dir } = tempHive();
+  const human = hive.getAgent("human");
+  hive.createProject(human, { name: "Altro", slug: "altro" });
+  const brain = hive.join({ role: "brain", project: "altro" });
+  hive.postMessage(brain.agent, { channel: "general", body: "keep this until delete" });
+  assert.throws(() => hive.deleteProject(brain.agent, "altro"), /Only Human/);
+  assert.throws(() => hive.deleteProject(human, "altro"), /still online or waiting/);
+  const ac = new AbortController();
+  const pending = hive.wait(brain.agent, 8_000, ac.signal);
+  await new Promise((r) => setTimeout(r, 30));
+  assert.throws(() => hive.deleteProject(human, "altro"), new RegExp(brain.agent.name));
+  ac.abort();
+  await pending;
+  hive.setOffline(brain.agent.id);
+  hive.db.prepare(
+    "INSERT INTO telegram_hold (telegram_chat_id, telegram_message_id, telegram_thread_id, payload) VALUES (?, ?, ?, ?)",
+  ).run(-1003, 7, 2, "{}");
+  hive.db.prepare("INSERT INTO telegram_state (key, value) VALUES (?, ?)").run("mute:-1003", "1");
+  hive.db.prepare("INSERT INTO telegram_state (key, value) VALUES (?, ?)").run("offset", "9");
+  const chapterGeneral = hive.getChannel("general", hive.listProjects()[0]!.id);
+  hive.postMessage(human, { channel: chapterGeneral.id, body: "chapter stays" });
+  hive.deleteProject(human, "altro", { telegramChatId: -1003 });
+  assert.equal(hive.listProjects().some((p) => p.slug === "altro"), false);
+  assert.equal(hive.getAgentByName(brain.agent.name), null);
+  assert.equal(hive.listProjects()[0]?.slug, "chapter");
+  assert.ok(hive.getChannel("general", hive.listProjects()[0]!.id));
+  assert.equal(
+    (hive.db.prepare("SELECT COUNT(*) AS n FROM telegram_hold WHERE telegram_chat_id = -1003").get() as { n: number }).n,
+    0,
+  );
+  assert.equal(hive.db.prepare("SELECT value FROM telegram_state WHERE key = 'mute:-1003'").get(), undefined);
+  assert.equal((hive.db.prepare("SELECT value FROM telegram_state WHERE key = 'offset'").get() as { value: string }).value, "9");
+  assert.ok(hive.listMessages(human, chapterGeneral.id).messages.some((m) => /chapter stays/.test(m.body)));
+  assert.equal(hive.findProjectBySlug("altro"), null);
+  assert.equal(hive.findProjectBySlug("!!!"), null);
+  assert.equal(hive.findProjectBySlug("chapter")?.slug, "chapter");
+  hive.deleteProject(human, "chapter");
+  assert.equal(hive.listProjects().length, 0);
+  const again = hive.createProject(human, { name: "Nuovo", slug: "nuovo" });
+  assert.equal(again.slug, "nuovo");
+  rmSync(dir, { recursive: true, force: true });
+});

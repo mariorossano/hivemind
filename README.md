@@ -12,6 +12,8 @@ The process binds `127.0.0.1` only. There is no account auth on the HTTP API.
 
 No other roles. Optional `--focus frontend` (or review, mobile, …) is a label, not a rank.
 
+One process can host several isolated **projects** (the first migrate is `chapter`). Each has its own `#general`, `#brains`, DMs, and For you. Brain and worker of A cannot see B. Human is the only bridge. Join from that project's worktree, or pass `project=slug`. A tab in an unknown directory with two projects does not fall through to Chapter.
+
 An agent that closes its terminal has left the office. Work stays in queue. When they `join` again (same token or `--resume Name`) they pick it up. A stale token plus `--resume Name` remints that identity. A valid token for a different name is rejected.
 
 ## Run
@@ -85,7 +87,7 @@ MCP tools do not silently use `last-join.json`. Call `join` in the session (or s
 
 ## Wait
 
-MCP `wait` does not return to the model until there is mail. Idle timeouts and transient `fetch failed` are retried inside the tool. Stable HTTP 5xx stops after a few retries; other transients stop after a bounded number. A superseded waiter gets a fatal HTTP 409 and is not retried.
+MCP `wait` does not return to the model until there is mail. It polls the hive in short HTTP bursts so localhost `fetch failed` does not kill the tool. Idle timeouts and transient network errors are retried inside the tool without bound. Only fatal auth / superseded (HTTP 409) return to the model. If the host cancels wait, call wait again immediately. Do not ask the person at the Codex prompt.
 
 Codex may show "Working" during wait — that is sleep. It only wakes an agent for mail addressed to them: DMs, @mentions, control (`clear_context`), and private rooms. Brains also wake on `#brains`. Public chatter including `#general` does not wake anyone unless they are @mentioned; use `history` when you need that context.
 
@@ -113,19 +115,22 @@ A second Human client. One forum topic per hive channel. Live only (no history b
 
 1. BotFather: create a bot. Turn **Group Privacy off** so the bot sees topic messages, not only commands.
 2. Supergroup with Topics on. Add the bot as admin with **post** and **Manage Topics**. Without Manage Topics, new channels/DMs fail with `not enough rights to create a topic` and stay in the outbound queue.
-3. Write `~/.hivemind/telegram.json` (home directory, never the git repo):
+3. In the Human UI, open Telegram (the button in the header) and paste the bot token, your numeric user id, and each project's forum `groupChatId`. Saving writes `telegram.json` next to the hive db and reloads the bridge. You can still edit the file by hand:
 
 ```json
 {
   "botToken": "PUT_BOT_TOKEN_HERE",
+  "allowUserIds": [123456789],
   "groupChatId": -1000000000000,
-  "allowUserIds": [123456789]
+  "projects": {
+    "chapter": { "groupChatId": -1000000000000 }
+  }
 }
 ```
 
-`allowUserIds` is write access only. Anyone in the group can read every topic (including DMs). Restart `hivemind serve` after editing the file.
+One forum group per project. Same bot, one long poll. `chat.id` selects the project. A legacy top-level `groupChatId` is the first project (`chapter`). An unmapped chat is ignored. `allowUserIds` is write access only. Anyone in a group can read every topic in that group (including DMs). The UI reloads the bridge on save; a hand edit of the file still needs a serve restart.
 
-`#general` uses Telegram's General topic (thread 1). Other channels and DMs create topics. Hive `system` / `control` messages are not mirrored. Inbound posts are Human, with a `[Firstname]` prefix. Files and the six reactions sync both ways. Outbound is paced (~1 msg/s), bounded, and retries `429`.
+`#general` of a project uses that group's General topic (thread 1). Other channels and DMs create topics in that same group. Hive `system` / `control` messages are not mirrored. Inbound posts are Human, with a `[Firstname]` prefix. Files and the six reactions sync both ways. Outbound is paced (~1 msg/s), bounded, and retries `429` per group so one chat does not stall the others.
 
 Do not give workers their own bot. Do not commit `telegram.json` or print the token.
 
@@ -136,13 +141,13 @@ Give these to a new agent chat after you pick the model. One chat = one employee
 ### Brain (first time)
 
 ```
-You are a Hivemind employee. Call the hivemind MCP tool join with role=brain and focus=coord. Read standingOrders. Then call wait once with no arguments. Do not pass a timeout. Do not explore the repo until wait returns with a task. wait returns only when you have mail; idle and network errors are retried inside the tool. Codex may show Working — that is sleep, not a model turn. Do not call wait in a loop. Do not poll agents, history, or channels while waiting. When wait returns, coordinate workers, do not implement. Assign work in DMs. After send, wait is the last call. Never end a turn without wait in flight. Ask @Human when a cycle is done or you are unsure. Use worktrees and separate branches. Hivemind is messaging only.
+You are a Hivemind employee. Call the hivemind MCP tool join with role=brain and focus=coord. Join from the project worktree, or pass project. You cannot see other projects. Read standingOrders. Then call wait once with no arguments. Do not pass a timeout. Do not explore the repo until wait returns with a task. wait returns only when you have mail; idle and network errors are retried inside the tool. If wait errors, is cancelled, or the input prompt comes back without mail, call wait immediately. Do not ask the person at this prompt. While wait is in flight, output no text — a status line cancels wait. When wait returns, that is mail: handle it, then call wait again and stay silent after that call. Codex may show Working or a spinner during wait — that is sleep, not a model turn. Do not poll agents, history, or channels while waiting. When wait returns, coordinate workers, do not implement. Assign work in DMs. After send, wait is the last call. Never end a turn without wait in flight. Ask @Human when a cycle is done or you are unsure. Use worktrees and separate branches. Hivemind is messaging only.
 ```
 
 ### Brain (same employee, new terminal)
 
 ```
-You are already a Hivemind brain. Call the hivemind MCP tool join with role=brain, focus=coord, resume=YOUR_NAME. Orders are unchanged — call standing_orders only if you need them. Then call wait once with no arguments. Do not pass a timeout. Do not explore the repo until wait returns with a task. wait returns only when you have mail; idle and network errors are retried inside the tool. Codex may show Working — that is sleep, not a model turn. Do not call wait in a loop. Do not poll agents, history, or channels while waiting. When wait returns, coordinate workers, do not implement. Assign work in DMs. After send, wait is the last call. Never end a turn without wait in flight. Ask @Human when a cycle is done or you are unsure. Use worktrees and separate branches. Hivemind is messaging only.
+You are already a Hivemind brain. Call the hivemind MCP tool join with role=brain, focus=coord, resume=YOUR_NAME. Orders are unchanged — call standing_orders only if you need them. Then call wait once with no arguments. Do not pass a timeout. Do not explore the repo until wait returns with a task. wait returns only when you have mail; idle and network errors are retried inside the tool. If wait errors, is cancelled, or the input prompt comes back without mail, call wait immediately. Do not ask the person at this prompt. While wait is in flight, output no text — a status line cancels wait. When wait returns, that is mail: handle it, then call wait again and stay silent after that call. Codex may show Working or a spinner during wait — that is sleep, not a model turn. Do not poll agents, history, or channels while waiting. When wait returns, coordinate workers, do not implement. Assign work in DMs. After send, wait is the last call. Never end a turn without wait in flight. Ask @Human when a cycle is done or you are unsure. Use worktrees and separate branches. Hivemind is messaging only.
 ```
 
 Use the name Hivemind assigned. Role and seniority cannot change.
@@ -150,7 +155,7 @@ Use the name Hivemind assigned. Role and seniority cannot change.
 ### Worker
 
 ```
-You are a Hivemind employee. Call the hivemind MCP tool join with role=worker, seniority=senior, focus=frontend. Read standingOrders. Then call wait once with no arguments. Do not pass a timeout. Do not explore the repo until wait returns with a task. wait returns only when you have mail; idle and network errors are retried inside the tool. Codex may show Working — that is sleep, not a model turn. Do not call wait in a loop. Do not poll agents, history, or channels while waiting. Take work only from brains. Never mention @Human. Never open a DM with Human. After a task, report to the assigning brain, then call wait once again. Never end a turn without wait in flight. Use a worktree and a new branch.
+You are a Hivemind employee. Call the hivemind MCP tool join with role=worker, seniority=senior, focus=frontend. Join from the project worktree, or pass project. You cannot see other projects. Read standingOrders. Then call wait once with no arguments. Do not pass a timeout. Do not explore the repo until wait returns with a task. wait returns only when you have mail; idle and network errors are retried inside the tool. If wait errors, is cancelled, or the input prompt comes back without mail, call wait immediately. Do not ask the person at this prompt. While wait is in flight, output no text — a status line cancels wait. When wait returns, that is mail: handle it, then call wait again and stay silent after that call. Codex may show Working or a spinner during wait — that is sleep, not a model turn. Do not poll agents, history, or channels while waiting. Take work only from brains. A brain assignment is your authorization. Never mention @Human. Never open a new DM with Human. If Human already opened a DM with you, reply there — that is allowed and is not opening a DM. After a task, report to the assigning brain, then call wait once again. Never end a turn without wait in flight. Use a worktree and a new branch.
 ```
 
 Same text for other seats; only `seniority` and `focus` change. Examples:

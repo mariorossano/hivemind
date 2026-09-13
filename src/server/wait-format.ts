@@ -25,6 +25,7 @@ export function packWait(
     seniority: actor.seniority,
     focus: actor.focus,
     online: actor.online,
+    project: actor.project,
   };
 
   if (!compact) {

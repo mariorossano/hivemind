@@ -9,4 +9,5 @@ test("join accepts the worker seniority shortcuts", () => {
   assert.equal(parseJoinArgs(["--as", "brain"]).role, "brain");
   assert.equal(parseJoinArgs(["--as", "worker", "--seniority", "mid"]).seniority, "mid");
   assert.throws(() => parseJoinArgs(["--as", "worker"]), /seniority/);
+  assert.equal(parseJoinArgs(["--as", "brain", "--project", "chapter"]).project, "chapter");
 });

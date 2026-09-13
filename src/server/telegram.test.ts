@@ -1,12 +1,19 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { Hive } from "./hive.ts";
 import {
   TELEGRAM_PENDING_CAP,
+  chatIdForProject,
   enqueueTelegramPending,
+  loadTelegramConfig,
+  maskTelegramToken,
+  projectSlugForChat,
+  publicTelegramView,
+  writeTelegramFile,
+  removeTelegramProjectSlug,
   formatOutbound,
   inboundBody,
   inboundPostBody,
@@ -49,6 +56,8 @@ function ch(over: Partial<Channel> = {}): Channel {
     createdBy: "human",
     createdAt: 0,
     memberIds: ["human", "b"],
+    projectId: "p1",
+    project: "chapter",
     ...over,
   };
 }
@@ -129,6 +138,51 @@ test("telegram inbound rejects oversized files before download", () => {
 test("telegram outbound does not treat a failed API result as delivered", () => {
   assert.throws(() => requireTelegramOk({ ok: false, description: "bad" }, "sendMessage"), /bad/);
   assert.equal(requireTelegramOk({ ok: true, result: { message_id: 1 } }, "sendMessage").ok, true);
+});
+
+test("telegram file save keeps a prior token and never returns it in the public view", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "hive-tg-ui-"));
+  const token = "123456:SECRET-telegram-token-ui";
+  writeTelegramFile(
+    { botToken: token, allowUserIds: [9], projects: { chapter: { groupChatId: -1001 } } },
+    dir,
+  );
+  writeTelegramFile({ allowUserIds: [9, 8], projects: { chapter: { groupChatId: -1002 } } }, dir);
+  const cfg = loadTelegramConfig(dir);
+  assert.equal(cfg?.botToken, token);
+  assert.equal(cfg?.groups.chapter, -1002);
+  const view = publicTelegramView(dir, true);
+  assert.equal(view.tokenHint, maskTelegramToken(token));
+  assert.equal(view.running, true);
+  assert.ok(!JSON.stringify(view).includes(token));
+  const after = removeTelegramProjectSlug("chapter", dir);
+  assert.equal(after?.projects.chapter, undefined);
+  assert.equal(after?.botToken, token);
+  const gone = publicTelegramView(dir, false);
+  assert.equal(gone.projects.chapter, undefined);
+  assert.ok(!JSON.stringify(gone).includes(token));
+  assert.equal(removeTelegramProjectSlug("missing", dir)?.botToken, token);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("telegram config maps each group chat to a project and ignores unknown chats", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "hive-tg-cfg-"));
+  writeFileSync(
+    path.join(dir, "telegram.json"),
+    JSON.stringify({
+      botToken: "tok",
+      allowUserIds: [1],
+      groupChatId: -1001,
+      projects: { altro: { groupChatId: -1002 } },
+    }),
+  );
+  const cfg = loadTelegramConfig(dir);
+  assert.ok(cfg);
+  assert.equal(chatIdForProject(cfg!, "chapter"), -1001);
+  assert.equal(chatIdForProject(cfg!, "altro"), -1002);
+  assert.equal(projectSlugForChat(cfg!, -1002), "altro");
+  assert.equal(projectSlugForChat(cfg!, -1999), undefined);
+  rmSync(dir, { recursive: true, force: true });
 });
 
 test("telegram text format stays under Telegram and hive caps", () => {

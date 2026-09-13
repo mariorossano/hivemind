@@ -8,6 +8,7 @@ export function parseJoinArgs(argv: string[]): {
   focus: string | null;
   resume: string | null;
   token: string | null;
+  project: string | null;
 } {
   const asIdx = argv.indexOf("--as");
   let as = asIdx >= 0 ? argv[asIdx + 1] : undefined;
@@ -34,6 +35,7 @@ export function parseJoinArgs(argv: string[]): {
     focus: flag(argv, "--focus"),
     resume: flag(argv, "--resume"),
     token: flag(argv, "--token"),
+    project: flag(argv, "--project"),
   };
 }
 

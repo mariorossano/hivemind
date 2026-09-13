@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { isTransientWaitError, waitUntilMail } from "./wait-loop.ts";
+import { isTransientWaitError, waitHasMail, waitUntilMail } from "./wait-loop.ts";
 import { WAIT_NEXT, type WaitResult } from "../shared/types.ts";
 
 function idle(): WaitResult {
@@ -18,6 +18,12 @@ function mail(): WaitResult {
   };
 }
 
+test("empty idle-false payloads are not mail", () => {
+  assert.equal(waitHasMail(idle()), false);
+  assert.equal(waitHasMail({ ...idle(), idle: false }), false);
+  assert.equal(waitHasMail(mail()), true);
+});
+
 test("waitUntilMail does not return idle to the model", async () => {
   let calls = 0;
   const result = await waitUntilMail(async () => {
@@ -30,17 +36,28 @@ test("waitUntilMail does not return idle to the model", async () => {
   assert.equal(result.messages.length, 1);
 });
 
+test("waitUntilMail keeps sleeping on idle-false with no mail items", async () => {
+  let calls = 0;
+  const result = await waitUntilMail(async () => {
+    calls += 1;
+    if (calls < 3) return { ...idle(), idle: false };
+    return mail();
+  });
+  assert.equal(calls, 3);
+  assert.equal(result.idle, false);
+});
+
 test("waitUntilMail retries fetch failed without throwing", async () => {
   let calls = 0;
   const result = await waitUntilMail(
     async () => {
       calls += 1;
-      if (calls === 1) throw new Error("fetch failed");
+      if (calls < 25) throw new Error("fetch failed");
       return mail();
     },
     { delay: async () => undefined },
   );
-  assert.equal(calls, 2);
+  assert.equal(calls, 25);
   assert.equal(result.idle, false);
 });
 

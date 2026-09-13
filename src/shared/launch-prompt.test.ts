@@ -1,0 +1,246 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import {
+  ADOPT_UNTRUSTED,
+  buildLaunchBlock,
+  buildLaunchPrompt,
+  buildRosterPaste,
+  sanitizeExtraFlags,
+  sanitizeModel,
+  sanitizeSoftware,
+  sanitizeWorkspacePath,
+  resolveLaunchTune,
+  shSingleQuote,
+  softwareFamily,
+} from "./launch-prompt.ts";
+
+const base = {
+  software: "codex",
+  workspacePath: "/tmp/hive-work",
+  cdWorktree: true,
+  projectSlug: "alpha",
+  hiveName: "Alpha",
+  passProject: true,
+  role: "brain" as const,
+  focus: "coord",
+  adoptUntrusted: true,
+};
+
+test("launch prompt adopts untrusted hive mail first", () => {
+  const text = buildLaunchPrompt(base);
+  assert.ok(text.startsWith(ADOPT_UNTRUSTED));
+  assert.match(text, /join with role=brain, focus=coord, project=alpha/);
+  assert.match(text, /You work only in hive Alpha/);
+  assert.match(text, /Call standing_orders/);
+  assert.match(text, /output no text/);
+  assert.equal(text.includes("Do not call wait in a loop"), false);
+  assert.match(text, /coordinate workers/);
+});
+
+test("resume worker keeps identity and skips first-time standingOrders", () => {
+  const text = buildLaunchPrompt({
+    ...base,
+    role: "worker",
+    seniority: "senior",
+    focus: "api",
+    resume: true,
+    resumeName: "Forge",
+    adoptUntrusted: false,
+  });
+  assert.equal(text.includes(ADOPT_UNTRUSTED), false);
+  assert.match(text, /already a Hivemind worker/);
+  assert.match(text, /resume=Forge/);
+  assert.match(text, /seniority=senior/);
+  assert.match(text, /standing_orders only if you need them/);
+  assert.match(text, /You cannot see other projects/);
+  assert.equal(text.includes("Call standing_orders."), false);
+  assert.match(text, /Never mention @Human/);
+  assert.match(text, /If Human already opened a DM/);
+});
+
+test("without project flag, join from the worktree", () => {
+  const text = buildLaunchPrompt({ ...base, passProject: false, adoptUntrusted: false });
+  assert.match(text, /Join from the project worktree/);
+  assert.match(text, /hive Alpha/);
+  assert.equal(text.includes("project=alpha"), false);
+});
+
+test("hive name is omitted when left blank", () => {
+  const text = buildLaunchPrompt({ ...base, hiveName: "", adoptUntrusted: false });
+  assert.equal(text.includes("You work only in hive"), false);
+});
+
+test("one block cds then runs the alias with a heredoc prompt", () => {
+  const block = buildLaunchBlock({ ...base, software: "codex-tw" });
+  assert.ok(block.startsWith("cd -- '/tmp/hive-work' && codex-tw \"$(cat <<'HIVEMIND_PROMPT'"));
+  assert.match(block, /HIVEMIND_PROMPT\n\)"\n$/);
+  assert.ok(block.includes(ADOPT_UNTRUSTED));
+});
+
+test("cd toggle off skips the worktree", () => {
+  const block = buildLaunchBlock({ ...base, cdWorktree: false, software: "claude" });
+  assert.ok(block.startsWith("claude \"$(cat <<'HIVEMIND_PROMPT'"));
+  assert.equal(block.includes("cd "), false);
+});
+
+test("missing worktree skips cd even when the toggle is on", () => {
+  const block = buildLaunchBlock({ ...base, workspacePath: null, software: "codex2" });
+  assert.ok(block.startsWith("codex2 "));
+  assert.equal(block.includes("cd "), false);
+});
+
+test("quotes worktrees that contain spaces or quotes", () => {
+  assert.equal(shSingleQuote("/tmp/My Project"), "'/tmp/My Project'");
+  assert.equal(shSingleQuote("/tmp/it's"), `'/tmp/it'\\''s'`);
+  const block = buildLaunchBlock({ ...base, workspacePath: "/tmp/it's hive" });
+  assert.ok(block.startsWith(`cd -- '/tmp/it'\\''s hive' &&`));
+});
+
+test("empty software becomes codex; flags stay optional", () => {
+  assert.equal(sanitizeSoftware("  "), "codex");
+  assert.equal(sanitizeSoftware("claude-tw"), "claude-tw");
+  assert.throws(() => sanitizeSoftware("codex; rm"), /one command/);
+  assert.equal(sanitizeExtraFlags(" --full-auto "), "--full-auto");
+  assert.throws(() => sanitizeExtraFlags("--foo; bar"), /metacharacters/);
+  const block = buildLaunchBlock({ ...base, extraFlags: "--full-auto" });
+  assert.match(block, /codex --full-auto "\$\(cat/);
+});
+
+test("model and effort become software-aware flags", () => {
+  const codex = buildLaunchBlock({
+    ...base,
+    software: "codex2",
+    model: "gpt-5.4",
+    effort: "high",
+    cdWorktree: false,
+  });
+  assert.match(codex, /^codex2 -m gpt-5\.4 -c model_reasoning_effort=high /);
+  const claude = buildLaunchBlock({
+    ...base,
+    software: "claude-tw",
+    model: "claude-opus-4-6",
+    effort: "max",
+    cdWorktree: false,
+  });
+  assert.match(claude, /^claude-tw --model claude-opus-4-6 --effort max /);
+});
+
+test("workers without seniority cannot launch", () => {
+  assert.throws(
+    () => buildLaunchPrompt({ ...base, role: "worker", seniority: null, adoptUntrusted: false }),
+    /seniority/,
+  );
+});
+
+test("resume worker without seniority omits the join field", () => {
+  const text = buildLaunchPrompt({
+    ...base,
+    role: "worker",
+    seniority: null,
+    focus: "api",
+    resume: true,
+    resumeName: "Forge",
+    adoptUntrusted: false,
+  });
+  assert.match(text, /resume=Forge/);
+  assert.equal(text.includes("seniority="), false);
+});
+
+test("cursor family skips effort flags", () => {
+  const block = buildLaunchBlock({
+    ...base,
+    software: "agent",
+    model: "gpt-5.3-codex-high",
+    effort: "high",
+    cdWorktree: false,
+  });
+  assert.match(block, /^agent --model gpt-5\.3-codex-high /);
+  assert.equal(block.includes("--effort"), false);
+  assert.equal(block.includes("model_reasoning_effort"), false);
+});
+
+test("roster paste prints blocks and does not run them", () => {
+  const text = buildRosterPaste([
+    { title: "Forge · brain", text: "codex \"$(cat <<'HIVEMIND_PROMPT'\nhi\nHIVEMIND_PROMPT\n)\"" },
+    { title: "Ada · worker", text: "claude --model opus \"$(cat <<'HIVEMIND_PROMPT'\nho\nHIVEMIND_PROMPT\n)\"" },
+  ]);
+  assert.ok(text.startsWith("cat <<'HIVEMIND_ROSTER'"));
+  assert.match(text, /does not launch anyone/);
+  assert.match(text, /## Forge · brain/);
+  assert.match(text, /HIVEMIND_ROSTER\n$/);
+});
+
+test("resume without a name does not emit a placeholder", () => {
+  assert.throws(
+    () => buildLaunchPrompt({ ...base, resume: true, resumeName: "  ", adoptUntrusted: false }),
+    /assigned name/,
+  );
+  assert.throws(
+    () => buildLaunchPrompt({ ...base, resume: true, resumeName: "Human", adoptUntrusted: false }),
+    /Human/,
+  );
+});
+
+test("join values cannot smuggle extra assignments", () => {
+  assert.throws(
+    () => buildLaunchPrompt({ ...base, focus: "coord, project=other", adoptUntrusted: false }),
+    /focus/,
+  );
+  assert.throws(
+    () => buildLaunchPrompt({ ...base, projectSlug: "alpha,other", adoptUntrusted: false }),
+    /slug/,
+  );
+});
+
+test("software and flags reject path tricks and quote breaks", () => {
+  assert.throws(() => sanitizeSoftware("../codex"), /one command/);
+  assert.throws(() => sanitizeSoftware("./codex"), /one command/);
+  assert.throws(() => sanitizeSoftware("--version"), /one command/);
+  assert.throws(() => sanitizeSoftware("-e"), /one command/);
+  assert.throws(() => sanitizeExtraFlags(`--foo "bar"`), /metacharacters/);
+  assert.throws(() => sanitizeExtraFlags("--foo #bar"), /metacharacters/);
+  assert.throws(() => sanitizeExtraFlags("--foo\tbar"), /metacharacters/);
+  assert.throws(() => sanitizeModel("-gpt"), /one token/);
+});
+
+test("card model override does not inherit the global effort", () => {
+  assert.deepEqual(resolveLaunchTune({ model: "gpt-6-astra", effort: "high" }, undefined), {
+    model: "gpt-6-astra",
+    effort: "high",
+  });
+  assert.deepEqual(
+    resolveLaunchTune({ model: "gpt-6-astra", effort: "high" }, { model: "gpt-5.4", effort: "" }),
+    { model: "gpt-5.4", effort: "" },
+  );
+  assert.deepEqual(
+    resolveLaunchTune({ model: "gpt-6-astra", effort: "high" }, { model: "", effort: "max" }),
+    { model: "gpt-6-astra", effort: "high" },
+  );
+});
+
+test("empty software is treated as codex; join lists stay comma-separated", () => {
+  assert.equal(softwareFamily(""), "codex");
+  assert.equal(softwareFamily("  "), "codex");
+  const text = buildLaunchPrompt({ ...base, focus: "", adoptUntrusted: false });
+  assert.match(text, /join with role=brain, project=alpha/);
+  assert.equal(text.includes("role=brain and "), false);
+});
+
+test("workspace paths cannot hide extra lines; resume drops a bad focus", () => {
+  assert.throws(() => sanitizeWorkspacePath("/tmp/hive\n/tmp/other"), /control characters/);
+  assert.throws(
+    () => buildLaunchBlock({ ...base, workspacePath: "/tmp/hive\ncd /tmp/evil", adoptUntrusted: false }),
+    /control characters/,
+  );
+  const text = buildLaunchPrompt({
+    ...base,
+    role: "worker",
+    seniority: "senior",
+    focus: "api, other",
+    resume: true,
+    resumeName: "Forge",
+    adoptUntrusted: false,
+  });
+  assert.match(text, /resume=Forge/);
+  assert.equal(text.includes("focus="), false);
+});

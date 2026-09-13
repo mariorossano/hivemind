@@ -1,4 +1,4 @@
-import type { Agent, AttachmentMeta, Channel, Message, Thread, ThreadStatus } from "../src/shared/types.ts";
+import type { Agent, AttachmentMeta, Channel, Message, Project, Thread, ThreadStatus } from "../src/shared/types.ts";
 import { resolveUploadMime } from "../src/shared/mime.ts";
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
@@ -13,12 +13,23 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 
 export type Snapshot = {
   you: Agent;
+  projects: Project[];
   agents: Agent[];
   channels: Channel[];
   unread: Record<string, number>;
   mentions: Message[];
   mentionsHasMore?: boolean;
   queued: Record<string, number>;
+  telegram?: { running: boolean; configured: boolean };
+};
+
+export type TelegramSettings = {
+  running: boolean;
+  configured: boolean;
+  tokenSet: boolean;
+  tokenHint: string | null;
+  allowUserIds: number[];
+  projects: Record<string, number>;
 };
 
 export type ChannelPayload = {
@@ -31,13 +42,39 @@ export type ChannelPayload = {
 
 export const api = {
   snapshot: () => req<Snapshot>("/api/ui/snapshot"),
-  mentions: (beforeSeq?: number) => {
-    const q = beforeSeq ? `?beforeSeq=${beforeSeq}` : "";
-    return req<{ messages: Message[]; hasMore: boolean }>(`/api/ui/mentions${q}`);
+  mentions: (beforeSeq?: number, project?: string) => {
+    const q = new URLSearchParams();
+    if (beforeSeq) q.set("beforeSeq", String(beforeSeq));
+    if (project) q.set("project", project);
+    const suffix = q.toString() ? `?${q}` : "";
+    return req<{ messages: Message[]; hasMore: boolean }>(`/api/ui/mentions${suffix}`);
   },
-  markMentionsSeen: () =>
+  markMentionsSeen: (project?: string) =>
     req<{ messages: Message[]; hasMore: boolean; unread: Record<string, number> }>("/api/ui/mentions/seen", {
       method: "POST",
+      body: JSON.stringify({ project }),
+    }),
+  createProject: (name: string, slug?: string, worktree?: string) =>
+    req<{ project: Project }>("/api/ui/projects", {
+      method: "POST",
+      body: JSON.stringify({ name, slug, worktree }),
+    }),
+  updateProject: (slug: string, patch: { name?: string; worktree?: string | null }) =>
+    req<{ project: Project }>(`/api/ui/projects/${encodeURIComponent(slug)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+  deleteProject: (slug: string) =>
+    req<{ ok: true }>(`/api/ui/projects/${encodeURIComponent(slug)}`, { method: "DELETE" }),
+  telegram: () => req<TelegramSettings>("/api/ui/telegram"),
+  saveTelegram: (body: {
+    botToken?: string;
+    allowUserIds: Array<number | string>;
+    projects: Record<string, { groupChatId: number | string }>;
+  }) =>
+    req<TelegramSettings>("/api/ui/telegram", {
+      method: "PUT",
+      body: JSON.stringify(body),
     }),
   messages: (id: string, threadId?: string | null, beforeSeq?: number) => {
     const q = new URLSearchParams();
@@ -70,10 +107,10 @@ export const api = {
       body: JSON.stringify({ emoji }),
     }),
   fileUrl: (id: string) => `/api/ui/files/${encodeURIComponent(id)}`,
-  createChannel: (name: string, type: "public" | "private", topic?: string, memberNames?: string[]) =>
+  createChannel: (name: string, type: "public" | "private", topic?: string, memberNames?: string[], project?: string) =>
     req<{ channel: Channel }>("/api/ui/channels", {
       method: "POST",
-      body: JSON.stringify({ name, type, topic, memberNames }),
+      body: JSON.stringify({ name, type, topic, memberNames, project }),
     }),
   openDm: (name: string) =>
     req<{ channel: Channel }>("/api/ui/dms", { method: "POST", body: JSON.stringify({ name }) }),

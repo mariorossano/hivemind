@@ -10,6 +10,8 @@ import {
   PRESENCE_IDLE_MS,
   REACTION_EMOJIS,
   HiveError,
+  DEFAULT_PROJECT_NAME,
+  DEFAULT_PROJECT_SLUG,
   HUMAN_ID,
   HUMAN_NAME,
   WAIT_MAIL_CAP,
@@ -19,6 +21,7 @@ import {
   type ChannelType,
   type ControlAction,
   type Message,
+  type Project,
   type ReactionCount,
   type Role,
   type Seniority,
@@ -26,6 +29,7 @@ import {
   type ThreadStatus,
   type WaitResult,
 } from "../shared/types.ts";
+import { canonicalWorktree, parseProjectSlug, resolveJoinProject } from "../shared/project.ts";
 import { pickName } from "./names.ts";
 import { hiveHome } from "./paths.ts";
 import { packWait } from "./wait-format.ts";
@@ -44,6 +48,7 @@ type AgentRow = {
   last_seen_at: number;
   created_at: number;
   inbox_cursor: number;
+  project_id: string | null;
 };
 
 type ChannelRow = {
@@ -52,6 +57,15 @@ type ChannelRow = {
   type: ChannelType;
   topic: string | null;
   created_by: string;
+  created_at: number;
+  project_id: string;
+};
+
+type ProjectRow = {
+  id: string;
+  slug: string;
+  name: string;
+  worktree: string | null;
   created_at: number;
 };
 
@@ -101,6 +115,7 @@ export class Hive {
     this.db.exec("PRAGMA journal_mode = WAL");
     this.db.exec("PRAGMA foreign_keys = ON");
     this.migrate();
+    this.migrateProjects();
     this.bootstrap();
   }
 
@@ -205,6 +220,327 @@ export class Hive {
     `);
   }
 
+  private tableSql(name: string): string {
+    const row = this.db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) as
+      | { sql: string }
+      | undefined;
+    return row?.sql ?? "";
+  }
+
+  private hasColumn(table: string, col: string): boolean {
+    const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+    return cols.some((c) => c.name === col);
+  }
+
+  private mapProject(row: ProjectRow): Project {
+    return {
+      id: row.id,
+      slug: row.slug,
+      name: row.name,
+      worktree: row.worktree,
+      createdAt: row.created_at,
+    };
+  }
+
+  private migrateProjects() {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS projects (
+        id TEXT PRIMARY KEY,
+        slug TEXT NOT NULL UNIQUE,
+        name TEXT NOT NULL,
+        worktree TEXT,
+        created_at INTEGER NOT NULL
+      );
+    `);
+    if (!this.hasColumn("agents", "project_id")) {
+      this.db.exec("ALTER TABLE agents ADD COLUMN project_id TEXT");
+    }
+    if (!this.hasColumn("channels", "project_id")) {
+      this.db.exec("ALTER TABLE channels ADD COLUMN project_id TEXT");
+    }
+    const holdSql = this.tableSql("telegram_hold");
+    if (!this.hasColumn("telegram_hold", "telegram_chat_id") || /telegram_message_id INTEGER PRIMARY KEY/i.test(holdSql)) {
+      const holds = holdSql
+        ? (this.db.prepare("SELECT * FROM telegram_hold").all() as Array<{
+            telegram_message_id: number;
+            telegram_thread_id: number;
+            payload: string;
+            telegram_chat_id?: number | null;
+          }>)
+        : [];
+      this.db.exec(`
+        DROP TABLE IF EXISTS telegram_hold;
+        CREATE TABLE telegram_hold (
+          telegram_chat_id INTEGER NOT NULL,
+          telegram_message_id INTEGER NOT NULL,
+          telegram_thread_id INTEGER NOT NULL,
+          payload TEXT NOT NULL,
+          PRIMARY KEY (telegram_chat_id, telegram_message_id)
+        );
+      `);
+      const insHold = this.db.prepare(
+        "INSERT INTO telegram_hold (telegram_chat_id, telegram_message_id, telegram_thread_id, payload) VALUES (?, ?, ?, ?)",
+      );
+      for (const row of holds) {
+        insHold.run(row.telegram_chat_id ?? 0, row.telegram_message_id, row.telegram_thread_id, row.payload);
+      }
+    }
+    const topicSql = this.tableSql("telegram_topics");
+    if (!this.hasColumn("telegram_out", "telegram_chat_id") || /telegram_message_id INTEGER PRIMARY KEY/i.test(this.tableSql("telegram_out"))) {
+      const rows = this.db.prepare("SELECT * FROM telegram_out").all() as Array<{
+        telegram_message_id: number;
+        seq: number;
+        channel_id: string;
+        thread_id: string | null;
+        telegram_chat_id?: number | null;
+      }>;
+      this.db.exec(`
+        DROP TABLE telegram_out;
+        CREATE TABLE telegram_out (
+          telegram_chat_id INTEGER NOT NULL,
+          telegram_message_id INTEGER NOT NULL,
+          seq INTEGER NOT NULL,
+          channel_id TEXT NOT NULL,
+          thread_id TEXT,
+          PRIMARY KEY (telegram_chat_id, telegram_message_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_telegram_out_seq ON telegram_out(seq);
+      `);
+      const ins = this.db.prepare(
+        "INSERT INTO telegram_out (telegram_chat_id, telegram_message_id, seq, channel_id, thread_id) VALUES (?, ?, ?, ?, ?)",
+      );
+      for (const row of rows) {
+        ins.run(row.telegram_chat_id ?? 0, row.telegram_message_id, row.seq, row.channel_id, row.thread_id);
+      }
+    }
+
+    if (
+      !this.hasColumn("telegram_topics", "telegram_chat_id") ||
+      /telegram_thread_id INTEGER NOT NULL UNIQUE/i.test(topicSql)
+    ) {
+      const rows = this.db.prepare("SELECT * FROM telegram_topics").all() as Array<{
+        channel_id: string;
+        telegram_thread_id: number;
+        telegram_chat_id?: number | null;
+      }>;
+      this.db.exec(`
+        DROP TABLE telegram_topics;
+        CREATE TABLE telegram_topics (
+          channel_id TEXT PRIMARY KEY,
+          telegram_thread_id INTEGER NOT NULL,
+          telegram_chat_id INTEGER
+        );
+      `);
+      const ins = this.db.prepare(
+        "INSERT INTO telegram_topics (channel_id, telegram_thread_id, telegram_chat_id) VALUES (?, ?, ?)",
+      );
+      for (const row of rows) ins.run(row.channel_id, row.telegram_thread_id, row.telegram_chat_id ?? null);
+    }
+
+    const count = (this.db.prepare("SELECT COUNT(*) AS n FROM projects").get() as { n: number }).n;
+    if (count === 0) {
+      this.db.prepare("INSERT INTO projects (id, slug, name, worktree, created_at) VALUES (?, ?, ?, NULL, ?)").run(
+        crypto.randomUUID(),
+        DEFAULT_PROJECT_SLUG,
+        DEFAULT_PROJECT_NAME,
+        now(),
+      );
+    }
+    const seed = this.db.prepare("SELECT * FROM projects ORDER BY created_at ASC LIMIT 1").get() as ProjectRow;
+    this.db.prepare("UPDATE agents SET project_id = ? WHERE project_id IS NULL AND id != ?").run(seed.id, HUMAN_ID);
+    this.db.prepare("UPDATE channels SET project_id = ? WHERE project_id IS NULL").run(seed.id);
+  }
+
+  listProjects(): Project[] {
+    return (this.db.prepare("SELECT * FROM projects ORDER BY created_at ASC, slug ASC").all() as ProjectRow[]).map(
+      (r) => this.mapProject(r),
+    );
+  }
+
+  getProject(id: string): Project {
+    const row = this.db.prepare("SELECT * FROM projects WHERE id = ?").get(id) as ProjectRow | undefined;
+    if (!row) throw new HiveError(404, "Project not found");
+    return this.mapProject(row);
+  }
+
+  getProjectBySlug(slug: string): Project {
+    const row = this.db.prepare("SELECT * FROM projects WHERE slug = ?").get(parseProjectSlug(slug)) as
+      | ProjectRow
+      | undefined;
+    if (!row) throw new HiveError(404, `No project named ${slug}`);
+    return this.mapProject(row);
+  }
+
+  findProjectBySlug(slug: string): Project | null {
+    try {
+      return this.getProjectBySlug(slug);
+    } catch (err) {
+      if (err instanceof HiveError && (err.status === 404 || err.status === 400)) return null;
+      throw err;
+    }
+  }
+
+  private requireActorProject(actor: Agent, projectRef?: string | null): Project {
+    if (actor.role === "human") {
+      if (projectRef) {
+        const byId = this.db.prepare("SELECT * FROM projects WHERE id = ?").get(projectRef) as ProjectRow | undefined;
+        if (byId) return this.mapProject(byId);
+        return this.getProjectBySlug(projectRef);
+      }
+      throw new HiveError(400, "Pass project");
+    }
+    if (!actor.projectId) throw new HiveError(409, `${actor.name} has no project`);
+    if (projectRef) {
+      const wanted = (() => {
+        const byId = this.db.prepare("SELECT * FROM projects WHERE id = ?").get(projectRef) as ProjectRow | undefined;
+        if (byId) return this.mapProject(byId);
+        return this.getProjectBySlug(projectRef);
+      })();
+      if (wanted.id !== actor.projectId) {
+        throw new HiveError(403, `${actor.name} cannot use project ${wanted.slug}`);
+      }
+      return wanted;
+    }
+    return this.getProject(actor.projectId);
+  }
+
+  createProject(
+    actor: Agent,
+    input: { name: string; slug?: string; worktree?: string | null },
+  ): Project {
+    if (actor.role !== "human") throw new HiveError(403, "Only Human can create projects");
+    const name = input.name.trim();
+    if (!name) throw new HiveError(400, "Project name required");
+    const slug = parseProjectSlug(input.slug?.trim() || name.replace(/[^a-z0-9]+/gi, "-").toLowerCase());
+    const exists = this.db.prepare("SELECT id FROM projects WHERE slug = ?").get(slug);
+    if (exists) throw new HiveError(409, `Project ${slug} already exists`);
+    const id = crypto.randomUUID();
+    this.db.prepare("INSERT INTO projects (id, slug, name, worktree, created_at) VALUES (?, ?, ?, ?, ?)").run(
+      id,
+      slug,
+      name.slice(0, 80),
+      canonicalWorktree(input.worktree),
+      now(),
+    );
+    const project = this.getProject(id);
+    this.ensureBuiltinChannel(project, "general", "public", "Town square");
+    this.ensureBuiltinChannel(project, "brains", "brains", "Human and brains only");
+    this.addHumanToAllChannels();
+    return this.getProject(id);
+  }
+
+  updateProject(
+    actor: Agent,
+    slug: string,
+    input: { name?: string; worktree?: string | null },
+  ): Project {
+    if (actor.role !== "human") throw new HiveError(403, "Only Human can edit projects");
+    const project = this.getProjectBySlug(slug);
+    const name = input.name != null ? input.name.trim().slice(0, 80) : project.name;
+    if (!name) throw new HiveError(400, "Project name required");
+    const worktree = input.worktree === undefined ? project.worktree : canonicalWorktree(input.worktree);
+    this.db.prepare("UPDATE projects SET name = ?, worktree = ? WHERE id = ?").run(name, worktree, project.id);
+    return this.getProject(project.id);
+  }
+
+  private projectBusyAgents(projectId: string): Agent[] {
+    const rows = this.db.prepare(
+      "SELECT * FROM agents WHERE project_id = ? AND id != ? AND role != 'human'",
+    ).all(projectId, HUMAN_ID) as AgentRow[];
+    return rows.map((row) => this.mapAgent(row)).filter((agent) => agent.online || this.waiters.has(agent.id));
+  }
+
+  deleteProject(actor: Agent, slug: string, opts: { telegramChatId?: number | null } = {}): void {
+    if (actor.role !== "human") throw new HiveError(403, "Only Human can delete projects");
+    const project = this.getProjectBySlug(slug);
+
+    try {
+      this.db.exec("BEGIN IMMEDIATE");
+      const busy = this.projectBusyAgents(project.id);
+      if (busy.length > 0) {
+        const names = busy.map((agent) => agent.name).join(", ");
+        const verb = busy.length === 1 ? "is" : "are";
+        throw new HiveError(409, `Cannot delete ${project.slug}: ${names} ${verb} still online or waiting`);
+      }
+
+      const channels = this.db.prepare("SELECT id FROM channels WHERE project_id = ?").all(project.id) as { id: string }[];
+      const channelIds = channels.map((row) => row.id);
+      const goneAgents = this.db.prepare("SELECT id FROM agents WHERE project_id = ? AND id != ?").all(
+        project.id,
+        HUMAN_ID,
+      ) as { id: string }[];
+      const chatIds = new Set<number>();
+      if (opts.telegramChatId != null && Number.isFinite(opts.telegramChatId)) chatIds.add(Number(opts.telegramChatId));
+
+      if (channelIds.length > 0) {
+        const ph = channelIds.map(() => "?").join(",");
+        const chatRows = this.db.prepare(
+          `SELECT telegram_chat_id AS id FROM telegram_out WHERE channel_id IN (${ph})
+           UNION
+           SELECT telegram_chat_id AS id FROM telegram_topics WHERE channel_id IN (${ph})`,
+        ).all(...channelIds, ...channelIds) as { id: number | null }[];
+        for (const row of chatRows) {
+          if (row.id != null) chatIds.add(row.id);
+        }
+        this.db.prepare(
+          `DELETE FROM reactions WHERE message_id IN (SELECT id FROM messages WHERE channel_id IN (${ph}))`,
+        ).run(...channelIds);
+        this.db.prepare(
+          `DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE channel_id IN (${ph}))`,
+        ).run(...channelIds);
+        this.db.prepare(
+          `DELETE FROM telegram_pending WHERE seq IN (SELECT seq FROM messages WHERE channel_id IN (${ph}))`,
+        ).run(...channelIds);
+        this.db.prepare(`DELETE FROM telegram_out WHERE channel_id IN (${ph})`).run(...channelIds);
+        this.db.prepare(`DELETE FROM telegram_topics WHERE channel_id IN (${ph})`).run(...channelIds);
+        this.db.prepare(`DELETE FROM threads WHERE channel_id IN (${ph})`).run(...channelIds);
+        this.db.prepare(`DELETE FROM reads WHERE channel_id IN (${ph})`).run(...channelIds);
+        this.db.prepare(`DELETE FROM channel_members WHERE channel_id IN (${ph})`).run(...channelIds);
+        this.db.prepare(`DELETE FROM messages WHERE channel_id IN (${ph})`).run(...channelIds);
+        this.db.prepare(`DELETE FROM channels WHERE id IN (${ph})`).run(...channelIds);
+      }
+
+      for (const chatId of chatIds) {
+        this.db.prepare("DELETE FROM telegram_hold WHERE telegram_chat_id = ?").run(chatId);
+        this.db.prepare("DELETE FROM telegram_state WHERE key = ?").run(`mute:${chatId}`);
+      }
+
+      for (const agent of goneAgents) {
+        this.db.prepare("DELETE FROM channel_members WHERE agent_id = ?").run(agent.id);
+        this.db.prepare("DELETE FROM reads WHERE agent_id = ?").run(agent.id);
+        this.db.prepare("DELETE FROM reactions WHERE agent_id = ?").run(agent.id);
+        this.db.prepare("DELETE FROM attachments WHERE created_by = ? AND message_id IS NULL").run(agent.id);
+        this.db.prepare("DELETE FROM agents WHERE id = ?").run(agent.id);
+      }
+
+      this.db.prepare("DELETE FROM projects WHERE id = ?").run(project.id);
+      this.db.exec("COMMIT");
+    } catch (err) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        /* no open transaction */
+      }
+      throw err;
+    }
+
+    try {
+      const used = new Set(
+        (this.db.prepare("SELECT DISTINCT sha256 AS h FROM attachments").all() as { h: string }[]).map((row) => row.h),
+      );
+      removeOrphanBlobs(used, this.home);
+    } catch {
+      /* sweep can drop leftover blobs later */
+    }
+    this.bus.emit("project", { deleted: project.slug });
+  }
+
+  forgetTelegramChat(chatId: number) {
+    if (!Number.isFinite(chatId)) return;
+    this.db.prepare("DELETE FROM telegram_hold WHERE telegram_chat_id = ?").run(chatId);
+    this.db.prepare("DELETE FROM telegram_state WHERE key = ?").run(`mute:${chatId}`);
+  }
+
   private bootstrap() {
     const existing = this.db.prepare("SELECT id FROM agents WHERE id = ?").get(HUMAN_ID);
     if (!existing) {
@@ -215,24 +551,36 @@ export class Hive {
       ).run(HUMAN_ID, HUMAN_NAME, hashToken("human-local"), t, t);
     }
 
-    this.ensureChannel("general", "general", "public", HUMAN_ID, "Town square");
-    this.ensureChannel("brains", "brains", "brains", HUMAN_ID, "Human and brains only");
+    const home = this.listProjects()[0];
+    if (home) {
+      this.ensureBuiltinChannel(home, "general", "public", "Town square");
+      this.ensureBuiltinChannel(home, "brains", "brains", "Human and brains only");
+    }
     this.addHumanToAllChannels();
   }
 
-  private ensureChannel(
-    id: string,
-    name: string,
-    type: ChannelType,
-    createdBy: string,
-    topic: string,
-  ) {
-    const found = this.db.prepare("SELECT id FROM channels WHERE id = ?").get(id);
-    if (!found) {
-      this.db.prepare(
-        `INSERT INTO channels (id, name, type, topic, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
-      ).run(id, name, type, topic, createdBy, now());
+  private ensureBuiltinChannel(project: Project, name: string, type: ChannelType, topic: string) {
+    const existing = this.db.prepare("SELECT * FROM channels WHERE project_id = ? AND lower(name) = ?").get(
+      project.id,
+      name,
+    ) as ChannelRow | undefined;
+    if (existing) {
+      this.addMember(existing.id, HUMAN_ID);
+      return;
     }
+    const legacy = this.db.prepare("SELECT * FROM channels WHERE id = ?").get(name) as ChannelRow | undefined;
+    if (legacy && (!legacy.project_id || legacy.project_id === project.id)) {
+      if (!legacy.project_id) {
+        this.db.prepare("UPDATE channels SET project_id = ? WHERE id = ?").run(project.id, name);
+      }
+      this.addMember(name, HUMAN_ID);
+      return;
+    }
+    const taken = this.db.prepare("SELECT id FROM channels WHERE id = ?").get(name);
+    const id = taken ? `${project.id}:${name}` : name;
+    this.db.prepare(
+      `INSERT INTO channels (id, name, type, topic, created_by, created_at, project_id) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(id, name, type, topic, HUMAN_ID, now(), project.id);
     this.addMember(id, HUMAN_ID);
   }
 
@@ -281,6 +629,9 @@ export class Hive {
   }
 
   private mapAgent(row: AgentRow): Agent {
+    const project = row.project_id
+      ? this.db.prepare("SELECT * FROM projects WHERE id = ?").get(row.project_id) as ProjectRow | undefined
+      : undefined;
     return {
       id: row.id,
       name: row.name,
@@ -290,12 +641,23 @@ export class Hive {
       online: row.id === HUMAN_ID ? true : Boolean(row.online),
       lastSeenAt: row.last_seen_at,
       createdAt: row.created_at,
+      projectId: row.project_id,
+      project: project?.slug ?? null,
     };
   }
 
-  listAgents(): Agent[] {
+  listAgents(viewer?: Agent): Agent[] {
     const rows = this.db.prepare("SELECT * FROM agents ORDER BY role, seniority, name").all() as AgentRow[];
-    return rows.map((r) => this.mapAgent(r));
+    const all = rows.map((r) => this.mapAgent(r));
+    if (!viewer || viewer.role === "human") return all;
+    return all.filter((a) => a.role === "human" || a.projectId === viewer.projectId);
+  }
+
+  private assertSameProject(agent: Agent, project: Project) {
+    if (agent.role === "human") return;
+    if (agent.project && agent.project !== project.slug) {
+      throw new HiveError(409, `${agent.name} is in ${agent.project}; project cannot change`);
+    }
   }
 
   join(input: {
@@ -304,6 +666,8 @@ export class Hive {
     focus?: string | null;
     token?: string | null;
     resumeName?: string | null;
+    project?: string | null;
+    cwd?: string | null;
   }): { agent: Agent; token: string; created: boolean } {
     if (input.role !== "brain" && input.role !== "worker") {
       throw new HiveError(400, "role must be brain or worker");
@@ -323,6 +687,7 @@ export class Hive {
         if (input.role === "worker" && input.seniority && agent.seniority !== input.seniority) {
           throw new HiveError(409, `${agent.name} is ${agent.seniority}; seniority cannot change`);
         }
+        if (input.project) this.assertSameProject(agent, this.getProjectBySlug(input.project));
         this.touch(agent.id, true);
         return { agent, token: input.token, created: false };
       }
@@ -338,6 +703,7 @@ export class Hive {
       if (input.role === "worker" && input.seniority && agent.seniority !== input.seniority) {
         throw new HiveError(409, `${agent.name} is ${agent.seniority}; seniority cannot change`);
       }
+      if (input.project) this.assertSameProject(agent, this.getProjectBySlug(input.project));
       const token = newToken();
       this.db.prepare("UPDATE agents SET token_hash = ? WHERE id = ?").run(hashToken(token), agent.id);
       this.touch(agent.id, true);
@@ -351,6 +717,7 @@ export class Hive {
       throw new HiveError(400, "Brains have no seniority; only workers do");
     }
 
+    const project = resolveJoinProject(this.listProjects(), { project: input.project, cwd: input.cwd });
     const taken = new Set(
       (this.db.prepare("SELECT lower(name) AS n FROM agents").all() as { n: string }[]).map((r) => r.n),
     );
@@ -359,8 +726,8 @@ export class Hive {
     const token = newToken();
     const t = now();
     this.db.prepare(
-      `INSERT INTO agents (id, name, role, seniority, focus, token_hash, online, last_seen_at, created_at, inbox_cursor)
-       VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, 0)`,
+      `INSERT INTO agents (id, name, role, seniority, focus, token_hash, online, last_seen_at, created_at, inbox_cursor, project_id)
+       VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, 0, ?)`,
     ).run(
       id,
       name,
@@ -370,18 +737,24 @@ export class Hive {
       hashToken(token),
       t,
       t,
+      project.id,
     );
 
-    for (const ch of this.db.prepare("SELECT id, type FROM channels").all() as { id: string; type: ChannelType }[]) {
+    for (const ch of this.db.prepare("SELECT id, type FROM channels WHERE project_id = ?").all(project.id) as {
+      id: string;
+      type: ChannelType;
+    }[]) {
       if (ch.type === "public") this.addMember(ch.id, id);
       if (ch.type === "brains" && input.role === "brain") this.addMember(ch.id, id);
     }
 
     const agent = this.getAgent(id);
-    this.postSystem(
-      "general",
-      `${agent.name} has joined as ${describeAgent(agent)}.`,
-    );
+    const general = this.db.prepare(
+      "SELECT id FROM channels WHERE project_id = ? AND lower(name) = 'general'",
+    ).get(project.id) as { id: string } | undefined;
+    if (general) {
+      this.postSystem(general.id, `${agent.name} has joined as ${describeAgent(agent)}.`);
+    }
     const maxSeq = this.db.prepare("SELECT COALESCE(MAX(seq), 0) AS n FROM messages").get() as { n: number };
     this.db.prepare("UPDATE agents SET inbox_cursor = ? WHERE id = ?").run(maxSeq.n, id);
     this.bus.emit("agent", agent);
@@ -395,18 +768,28 @@ export class Hive {
       .filter((ch) => this.canSeeChannel(actor, ch));
   }
 
-  getChannel(idOrName: string): Channel {
-    const row = this.db.prepare(
-      `SELECT * FROM channels WHERE id = ? OR lower(name) = lower(?)`,
-    ).get(idOrName, idOrName) as ChannelRow | undefined;
-    if (!row) throw new HiveError(404, "Channel not found");
-    return this.mapChannel(row);
+  getChannel(idOrName: string, projectId?: string | null): Channel {
+    if (projectId) {
+      const scoped = this.db.prepare(
+        `SELECT * FROM channels WHERE project_id = ? AND (id = ? OR lower(name) = lower(?))`,
+      ).get(projectId, idOrName, idOrName) as ChannelRow | undefined;
+      if (!scoped) throw new HiveError(404, "Channel not found");
+      return this.mapChannel(scoped);
+    }
+    const byId = this.db.prepare("SELECT * FROM channels WHERE id = ?").get(idOrName) as ChannelRow | undefined;
+    if (byId) return this.mapChannel(byId);
+    const rows = this.db.prepare("SELECT * FROM channels WHERE lower(name) = lower(?)").all(idOrName) as ChannelRow[];
+    if (rows.length === 1) return this.mapChannel(rows[0]!);
+    throw new HiveError(404, "Channel not found");
   }
 
   private mapChannel(row: ChannelRow): Channel {
     const members = this.db.prepare(
       "SELECT agent_id FROM channel_members WHERE channel_id = ?",
     ).all(row.id) as { agent_id: string }[];
+    const project = this.db.prepare("SELECT * FROM projects WHERE id = ?").get(row.project_id) as
+      | ProjectRow
+      | undefined;
     return {
       id: row.id,
       name: row.name,
@@ -415,17 +798,21 @@ export class Hive {
       createdBy: row.created_by,
       createdAt: row.created_at,
       memberIds: members.map((m) => m.agent_id),
+      projectId: row.project_id,
+      project: project?.slug ?? DEFAULT_PROJECT_SLUG,
     };
   }
 
   canSeeChannel(actor: Agent, ch: Channel): boolean {
     if (actor.role === "human") return true;
+    if (actor.projectId && ch.projectId && actor.projectId !== ch.projectId) return false;
     if (ch.type === "brains" && actor.role !== "brain") return false;
     return ch.memberIds.includes(actor.id);
   }
 
   canPost(actor: Agent, ch: Channel): boolean {
     if (actor.role === "human") return true;
+    if (actor.projectId && ch.projectId && actor.projectId !== ch.projectId) return false;
     if (ch.type === "brains") return actor.role === "brain";
     if (ch.type === "dm") return ch.memberIds.includes(actor.id);
     if (ch.type === "public") return true;
@@ -434,7 +821,13 @@ export class Hive {
 
   createChannel(
     actor: Agent,
-    input: { name: string; type: "public" | "brains" | "private"; topic?: string; memberNames?: string[] },
+    input: {
+      name: string;
+      type: "public" | "brains" | "private";
+      topic?: string;
+      memberNames?: string[];
+      project?: string | null;
+    },
   ): Channel {
     if (actor.role === "worker") throw new HiveError(403, "Workers cannot create channels");
     if (input.type !== "public" && input.type !== "private" && input.type !== "brains") {
@@ -443,28 +836,32 @@ export class Hive {
     if (input.type === "brains" && actor.role !== "human") {
       throw new HiveError(403, "Only Human can create brains channels");
     }
+    const project = this.requireActorProject(actor, input.project);
     const slug = slugify(input.name);
     if (!slug) throw new HiveError(400, "Invalid channel name");
-    const exists = this.db.prepare("SELECT id FROM channels WHERE lower(name) = ?").get(slug);
+    const exists = this.db.prepare(
+      "SELECT id FROM channels WHERE project_id = ? AND lower(name) = ?",
+    ).get(project.id, slug);
     if (exists) throw new HiveError(409, `#${slug} already exists`);
     const id = crypto.randomUUID();
     this.db.prepare(
-      `INSERT INTO channels (id, name, type, topic, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
-    ).run(id, slug, input.type, input.topic ?? null, actor.id, now());
+      `INSERT INTO channels (id, name, type, topic, created_by, created_at, project_id) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(id, slug, input.type, input.topic ?? null, actor.id, now(), project.id);
     this.addMember(id, HUMAN_ID);
+    const roster = this.listAgents().filter((a) => a.role === "human" || a.projectId === project.id);
     if (input.type === "public") {
-      for (const a of this.listAgents()) {
+      for (const a of roster) {
         if (a.role !== "human") this.addMember(id, a.id);
       }
     } else if (input.type === "brains") {
-      for (const a of this.listAgents()) {
+      for (const a of roster) {
         if (a.role === "brain") this.addMember(id, a.id);
       }
     } else {
       this.addMember(id, actor.id);
       for (const name of input.memberNames ?? []) {
         const m = this.getAgentByName(name);
-        if (m) this.addMember(id, m.id);
+        if (m && (m.role === "human" || m.projectId === project.id)) this.addMember(id, m.id);
       }
     }
     const ch = this.getChannel(id);
@@ -477,6 +874,9 @@ export class Hive {
     const other = this.getAgentByName(otherName);
     if (!other) throw new HiveError(404, `No agent named ${otherName}`);
     if (other.id === actor.id) throw new HiveError(400, "Cannot DM yourself");
+    if (actor.role !== "human" && other.role !== "human" && actor.projectId !== other.projectId) {
+      throw new HiveError(403, `${other.name} is not in your project`);
+    }
     if (actor.role === "worker" && other.role === "human") {
       const existing = this.findDm(actor.id, other.id);
       if (existing) return existing;
@@ -487,11 +887,13 @@ export class Hive {
     }
     const found = this.findDm(actor.id, other.id);
     if (found) return found;
+    const projectId = actor.role === "human" ? other.projectId : actor.projectId;
+    if (!projectId) throw new HiveError(400, "DM needs a project");
     const [a, b] = [actor.id, other.id].sort();
     const id = `dm:${a}:${b}`;
     this.db.prepare(
-      `INSERT INTO channels (id, name, type, topic, created_by, created_at) VALUES (?, ?, 'dm', NULL, ?, ?)`,
-    ).run(id, dmLabel(actor, other), actor.id, now());
+      `INSERT INTO channels (id, name, type, topic, created_by, created_at, project_id) VALUES (?, ?, 'dm', NULL, ?, ?, ?)`,
+    ).run(id, dmLabel(actor, other), actor.id, now(), projectId);
     this.addMember(id, actor.id);
     this.addMember(id, other.id);
     const ch = this.getChannel(id);
@@ -519,7 +921,7 @@ export class Hive {
       attachmentIds?: string[];
     },
   ): Message {
-    const ch = this.getChannel(input.channel);
+    const ch = this.getChannel(input.channel, actor.projectId);
     if (!this.canSeeChannel(actor, ch) || !this.canPost(actor, ch)) {
       throw new HiveError(403, `You cannot post to ${channelLabel(ch)}`);
     }
@@ -538,7 +940,7 @@ export class Hive {
     if (input.kind !== "control" && body.length > BODY_MAX) {
       throw new HiveError(400, `Message too long (${body.length} > ${BODY_MAX}). Split or use a thread.`);
     }
-    const mentions = parseMentions(body, this.listAgents());
+    const mentions = parseMentions(body, this.listAgents(actor));
     if (actor.role === "worker" && mentions.some((id) => id === HUMAN_ID)) {
       throw new HiveError(403, "Workers cannot mention @Human. Ask a brain.");
     }
@@ -634,6 +1036,8 @@ export class Hive {
         online: false,
         lastSeenAt: row.created_at,
         createdAt: row.created_at,
+        projectId: null,
+        project: null,
       };
     }
     return {
@@ -657,7 +1061,7 @@ export class Hive {
     channelRef: string,
     opts: { threadId?: string | null; afterSeq?: number; beforeSeq?: number; limit?: number } = {},
   ): { messages: Message[]; hasOlder: boolean } {
-    const ch = this.getChannel(channelRef);
+    const ch = this.getChannel(channelRef, actor.projectId);
     if (!this.canSeeChannel(actor, ch)) throw new HiveError(403, "Cannot read this channel");
     const limit = Math.min(Math.max(1, Number.isFinite(opts.limit) ? Number(opts.limit) : 80), 200);
     const after = opts.afterSeq ?? 0;
@@ -764,12 +1168,17 @@ export class Hive {
     return out;
   }
 
-  markMentionsSeen(actor: Agent) {
-    const inbox = this.mentionInbox(actor, 400);
+  markMentionsSeen(actor: Agent, projectId?: string) {
+    const inbox = this.mentionInbox(actor, 400, undefined, projectId);
     for (const m of inbox.messages) this.markRead(actor, m.channelId, m.seq);
   }
 
-  mentionInbox(actor: Agent, limit = 30, beforeSeq?: number): { messages: Message[]; hasMore: boolean } {
+  mentionInbox(
+    actor: Agent,
+    limit = 30,
+    beforeSeq?: number,
+    projectId?: string,
+  ): { messages: Message[]; hasMore: boolean } {
     const reads = this.readsFor(actor);
     const rows = this.db.prepare(
       `SELECT * FROM messages WHERE mentions LIKE ? ORDER BY seq DESC LIMIT 400`,
@@ -777,7 +1186,15 @@ export class Hive {
     const unseen = rows
       .map((r) => this.mapMessage(r))
       .filter((m) => m.mentions.includes(actor.id) && m.seq > (reads[m.channelId] ?? 0))
-      .filter((m) => beforeSeq == null || m.seq < beforeSeq);
+      .filter((m) => beforeSeq == null || m.seq < beforeSeq)
+      .filter((m) => {
+        if (!projectId) return true;
+        try {
+          return this.getChannel(m.channelId).projectId === projectId;
+        } catch {
+          return false;
+        }
+      });
     return {
       messages: this.decorate(unseen.slice(0, limit), actor.id),
       hasMore: unseen.length > limit,
@@ -944,13 +1361,16 @@ export class Hive {
   invite(actor: Agent, channelRef: string, memberNames: string[]): Channel {
     if (actor.role === "worker") throw new HiveError(403, "Workers cannot invite");
     if (memberNames.length === 0) throw new HiveError(400, "No members to invite");
-    const ch = this.getChannel(channelRef);
+    const ch = this.getChannel(channelRef, actor.projectId);
     if (!this.canSeeChannel(actor, ch)) throw new HiveError(403, "Cannot access channel");
     if (ch.type === "dm") throw new HiveError(400, "Cannot invite to a DM");
     const added: string[] = [];
     for (const name of memberNames) {
       const member = this.getAgentByName(name);
       if (!member) throw new HiveError(404, `No agent named ${name}`);
+      if (member.role !== "human" && member.projectId !== ch.projectId) {
+        throw new HiveError(403, `${member.name} is not in this project`);
+      }
       if (ch.type === "brains" && member.role === "worker") {
         throw new HiveError(403, "Workers cannot join brains channels");
       }

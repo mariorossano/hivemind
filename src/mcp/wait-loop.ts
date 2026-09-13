@@ -3,6 +3,16 @@ import type { WaitResult } from "../shared/types.ts";
 const FATAL = /join first|no token|HTTP 401|HTTP 403|HTTP 404|HTTP 409|superseded/i;
 const SERVER = /HTTP 5\d\d/;
 
+export function waitHasMail(result: WaitResult): boolean {
+  if (result.idle === true) return false;
+  const n =
+    (result.mail?.length ?? 0) +
+    (result.messages?.length ?? 0) +
+    (result.mentions?.length ?? 0) +
+    (result.control?.length ?? 0);
+  return n > 0;
+}
+
 export function isTransientWaitError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   if (FATAL.test(msg)) return false;
@@ -20,8 +30,8 @@ export async function waitUntilMail(
 ): Promise<WaitResult> {
   const delay = opts.delay ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
   const retryDelayMs = opts.retryDelayMs ?? 1500;
-  const maxServerErrors = opts.maxServerErrors ?? 5;
-  const maxTransientErrors = opts.maxTransientErrors ?? 20;
+  const maxServerErrors = opts.maxServerErrors ?? Number.POSITIVE_INFINITY;
+  const maxTransientErrors = opts.maxTransientErrors ?? Number.POSITIVE_INFINITY;
   let serverErrors = 0;
   let transientErrors = 0;
   for (;;) {
@@ -29,7 +39,7 @@ export async function waitUntilMail(
       const result = await callWait();
       serverErrors = 0;
       transientErrors = 0;
-      if (!result.idle) return result;
+      if (waitHasMail(result)) return result;
     } catch (err) {
       if (!isTransientWaitError(err)) throw err;
       const msg = err instanceof Error ? err.message : String(err);

@@ -6,6 +6,13 @@ import { resolveUploadMime } from "../shared/mime.ts";
 import { standingOrders } from "../shared/standing-orders.ts";
 import { Hive, describeAgent } from "./hive.ts";
 import { safeFileName } from "./files.ts";
+import { publicTelegramView, readTelegramFile, removeTelegramProjectSlug, writeTelegramFile } from "./telegram.ts";
+import { parseProjectSlug } from "../shared/project.ts";
+
+export type AppHooks = {
+  telegramRunning?: () => boolean;
+  reloadTelegram?: () => boolean;
+};
 
 function fileDownload(hive: Hive, actor: Agent, id: string) {
   const opened = hive.openAttachment(actor, id);
@@ -18,7 +25,7 @@ function fileDownload(hive: Hive, actor: Agent, id: string) {
   });
 }
 
-export function createApp(hive: Hive) {
+export function createApp(hive: Hive, hooks: AppHooks = {}) {
   const app = new Hono();
   app.use("*", cors({ origin: ["http://127.0.0.1:7421", "http://localhost:7421", "http://127.0.0.1:7420"] }));
 
@@ -36,24 +43,96 @@ export function createApp(hive: Hive) {
     const inbox = hive.mentionInbox(human, 30);
     return c.json({
       you: human,
+      projects: hive.listProjects(),
       agents: hive.listAgents(),
       channels: hive.listChannels(human),
       unread: hive.unreadCounts(human),
       mentions: inbox.messages,
       mentionsHasMore: inbox.hasMore,
       queued: hive.queuedCounts(),
+      telegram: {
+        running: Boolean(hooks.telegramRunning?.()),
+        configured: publicTelegramView(hive.home).configured,
+      },
     });
+  });
+  ui.get("/telegram", (c) => {
+    hive.getAgent("human");
+    return c.json(publicTelegramView(hive.home, Boolean(hooks.telegramRunning?.())));
+  });
+  ui.put("/telegram", async (c) => {
+    hive.getAgent("human");
+    const body = await c.req.json();
+    const known = new Set(hive.listProjects().map((p) => p.slug));
+    const projects: Record<string, { groupChatId: number }> = {};
+    for (const [rawSlug, raw] of Object.entries(body.projects ?? {})) {
+      const slug = parseProjectSlug(rawSlug);
+      if (!known.has(slug)) throw new HiveError(404, `No project named ${slug}`);
+      const id = raw && typeof raw === "object" ? Number((raw as { groupChatId?: unknown }).groupChatId) : Number(raw);
+      if (!Number.isFinite(id)) continue;
+      projects[slug] = { groupChatId: id };
+    }
+    writeTelegramFile(
+      {
+        botToken: body.botToken,
+        allowUserIds: Array.isArray(body.allowUserIds) ? body.allowUserIds : String(body.allowUserIds ?? "").split(/[,\s]+/),
+        projects,
+      },
+      hive.home,
+    );
+    const running = Boolean(hooks.reloadTelegram?.());
+    return c.json(publicTelegramView(hive.home, running));
+  });
+  ui.post("/projects", async (c) => {
+    const human = hive.getAgent("human");
+    const body = await c.req.json();
+    const project = hive.createProject(human, {
+      name: String(body.name ?? ""),
+      slug: body.slug,
+      worktree: body.worktree ?? null,
+    });
+    return c.json({ project });
+  });
+  ui.patch("/projects/:slug", async (c) => {
+    const human = hive.getAgent("human");
+    const body = await c.req.json();
+    const project = hive.updateProject(human, c.req.param("slug"), {
+      name: body.name,
+      worktree: body.worktree,
+    });
+    return c.json({ project });
+  });
+  ui.delete("/projects/:slug", (c) => {
+    const human = hive.getAgent("human");
+    const slug = parseProjectSlug(c.req.param("slug"));
+    const chatId = readTelegramFile(hive.home)?.projects[slug];
+    hive.deleteProject(human, slug, { telegramChatId: chatId });
+    try {
+      removeTelegramProjectSlug(slug, hive.home);
+    } catch {
+      /* hive row is already gone */
+    }
+    try {
+      hooks.reloadTelegram?.();
+    } catch {
+      /* next serve still rereads telegram.json */
+    }
+    if (chatId != null) hive.forgetTelegramChat(chatId);
+    return c.json({ ok: true });
   });
   ui.get("/mentions", (c) => {
     const human = hive.getAgent("human");
     const beforeSeq = c.req.query("beforeSeq") ? Number(c.req.query("beforeSeq")) : undefined;
-    const inbox = hive.mentionInbox(human, 30, beforeSeq);
+    const project = c.req.query("project") ? hive.getProjectBySlug(String(c.req.query("project"))).id : undefined;
+    const inbox = hive.mentionInbox(human, 30, beforeSeq, project);
     return c.json(inbox);
   });
-  ui.post("/mentions/seen", (c) => {
+  ui.post("/mentions/seen", async (c) => {
     const human = hive.getAgent("human");
-    hive.markMentionsSeen(human);
-    const inbox = hive.mentionInbox(human, 30);
+    const body = await c.req.json().catch(() => ({}));
+    const project = body.project ? hive.getProjectBySlug(String(body.project)).id : undefined;
+    hive.markMentionsSeen(human, project);
+    const inbox = hive.mentionInbox(human, 30, undefined, project);
     return c.json({ ...inbox, unread: hive.unreadCounts(human) });
   });
   ui.get("/channels/:id/messages", (c) => {
@@ -87,6 +166,7 @@ export function createApp(hive: Hive) {
       type: body.type ?? "public",
       topic: body.topic,
       memberNames: body.memberNames,
+      project: body.project ?? null,
     });
     return c.json({ channel });
   });
@@ -175,6 +255,8 @@ export function createApp(hive: Hive) {
       focus: body.focus ?? null,
       token: bearer || body.token || null,
       resumeName: body.resume || body.resumeName || null,
+      project: body.project ?? null,
+      cwd: body.cwd ?? null,
     });
     return c.json({
       ...result,
@@ -190,13 +272,20 @@ export function createApp(hive: Hive) {
       return c.json({ you: me, standingOrders: standingOrders(me) });
     }
     return c.json({
-      you: { name: me.name, role: me.role, seniority: me.seniority, focus: me.focus, online: me.online },
+      you: {
+        name: me.name,
+        role: me.role,
+        seniority: me.seniority,
+        focus: me.focus,
+        online: me.online,
+        project: me.project,
+      },
       ordersRef: "unchanged",
     });
   });
   agent.get("/agents", (c) =>
     c.json({
-      agents: hive.listAgents().map(({ createdAt: _c, ...a }) => a),
+      agents: hive.listAgents(c.get("me")).map(({ createdAt: _c, ...a }) => a),
     }),
   );
   agent.get("/channels", (c) => {
@@ -213,7 +302,7 @@ export function createApp(hive: Hive) {
       beforeSeq: c.req.query("beforeSeq") ? Number(c.req.query("beforeSeq")) : undefined,
       limit,
     });
-    const ch = hive.getChannel(c.req.param("id"));
+    const ch = hive.getChannel(c.req.param("id"), me.projectId);
     const meta = c.req.query("meta") === "1";
     return c.json({
       channel: { id: ch.id, name: ch.name, type: ch.type },

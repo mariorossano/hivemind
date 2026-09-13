@@ -1,6 +1,7 @@
-import { existsSync, openAsBlob, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, openAsBlob, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { FILE_MAX_BYTES, HUMAN_ID, REACTION_EMOJIS, type Channel, type Message } from "../shared/types.ts";
+import { DEFAULT_PROJECT_SLUG, FILE_MAX_BYTES, HiveError, HUMAN_ID, REACTION_EMOJIS, type Channel, type Message } from "../shared/types.ts";
+import { parseProjectSlug } from "../shared/project.ts";
 import { resolveUploadMime } from "../shared/mime.ts";
 import { Hive, channelLabel } from "./hive.ts";
 import { hiveHome } from "./paths.ts";
@@ -8,27 +9,133 @@ import { filePathForHash, safeFileName } from "./files.ts";
 
 export type TelegramConfig = {
   botToken: string;
-  groupChatId: number;
   allowUserIds: number[];
+  groups: Record<string, number>;
 };
 
-export function loadTelegramConfig(home = hiveHome()): TelegramConfig | null {
-  const file = path.join(home, "telegram.json");
+export type TelegramFile = {
+  botToken: string;
+  allowUserIds: number[];
+  projects: Record<string, number>;
+};
+
+export function telegramConfigPath(home = hiveHome()): string {
+  return path.join(home, "telegram.json");
+}
+
+export function maskTelegramToken(token: string): string {
+  const trimmed = token.trim();
+  if (trimmed.length < 8) return "set";
+  return `…${trimmed.slice(-4)}`;
+}
+
+export function readTelegramFile(home = hiveHome()): TelegramFile | null {
+  const file = telegramConfigPath(home);
   if (!existsSync(file)) return null;
   try {
     const raw = JSON.parse(readFileSync(file, "utf8")) as {
       botToken?: string;
       groupChatId?: number;
       allowUserIds?: Array<number | string>;
+      projects?: Record<string, { groupChatId?: number } | number>;
     };
     const botToken = String(raw.botToken ?? "").trim();
-    const groupChatId = Number(raw.groupChatId);
     const allowUserIds = (raw.allowUserIds ?? []).map((n) => Number(n)).filter((n) => Number.isFinite(n));
-    if (!botToken || !Number.isFinite(groupChatId) || allowUserIds.length === 0) return null;
-    return { botToken, groupChatId, allowUserIds };
+    const projects: Record<string, number> = {};
+    if (raw.projects && typeof raw.projects === "object") {
+      for (const [slug, value] of Object.entries(raw.projects)) {
+        const id = typeof value === "number" || typeof value === "string" ? Number(value) : Number(value?.groupChatId);
+        if (slug && Number.isFinite(id)) projects[slug] = id;
+      }
+    }
+    const legacy = Number(raw.groupChatId);
+    if (Number.isFinite(legacy)) projects[DEFAULT_PROJECT_SLUG] ??= legacy;
+    if (!botToken && allowUserIds.length === 0 && Object.keys(projects).length === 0) return null;
+    return { botToken, allowUserIds, projects };
   } catch {
     return null;
   }
+}
+
+export function loadTelegramConfig(home = hiveHome()): TelegramConfig | null {
+  const file = readTelegramFile(home);
+  if (!file?.botToken || file.allowUserIds.length === 0 || Object.keys(file.projects).length === 0) return null;
+  return { botToken: file.botToken, allowUserIds: file.allowUserIds, groups: file.projects };
+}
+
+export function publicTelegramView(home = hiveHome(), running = false) {
+  const file = readTelegramFile(home);
+  return {
+    running,
+    configured: Boolean(loadTelegramConfig(home)),
+    tokenSet: Boolean(file?.botToken),
+    tokenHint: file?.botToken ? maskTelegramToken(file.botToken) : null,
+    allowUserIds: file?.allowUserIds ?? [],
+    projects: file?.projects ?? {},
+  };
+}
+
+export function writeTelegramFile(
+  input: {
+    botToken?: string | null;
+    allowUserIds?: Array<number | string>;
+    projects?: Record<string, { groupChatId?: number | string | null } | number | string | null>;
+  },
+  home = hiveHome(),
+): TelegramFile {
+  const prev = readTelegramFile(home);
+  const botToken = String(input.botToken ?? "").trim() || prev?.botToken || "";
+  if (!botToken) throw new HiveError(400, "Bot token required");
+  const allowUserIds = (input.allowUserIds ?? prev?.allowUserIds ?? [])
+    .map((n) => Number(n))
+    .filter((n) => Number.isFinite(n) && n > 0);
+  if (allowUserIds.length === 0) throw new HiveError(400, "At least one Telegram user id");
+  const projects: Record<string, number> = {};
+  for (const [slug, value] of Object.entries(input.projects ?? {})) {
+    if (!slug) continue;
+    const id = value && typeof value === "object" ? Number(value.groupChatId) : Number(value);
+    if (!Number.isFinite(id)) continue;
+    projects[slug] = id;
+  }
+  const disk = {
+    botToken,
+    allowUserIds,
+    projects: Object.fromEntries(Object.entries(projects).map(([slug, groupChatId]) => [slug, { groupChatId }])),
+  };
+  mkdirSync(home, { recursive: true });
+  writeFileSync(telegramConfigPath(home), `${JSON.stringify(disk, null, 2)}\n`, { mode: 0o600 });
+  return { botToken, allowUserIds, projects };
+}
+
+export function removeTelegramProjectSlug(slug: string, home = hiveHome()): TelegramFile | null {
+  const prev = readTelegramFile(home);
+  if (!prev) return null;
+  let parsed: string;
+  try {
+    parsed = parseProjectSlug(slug);
+  } catch {
+    return prev;
+  }
+  if (!Object.hasOwn(prev.projects, parsed)) return prev;
+  const projects = { ...prev.projects };
+  delete projects[parsed];
+  const disk = {
+    botToken: prev.botToken,
+    allowUserIds: prev.allowUserIds,
+    projects: Object.fromEntries(Object.entries(projects).map(([key, groupChatId]) => [key, { groupChatId }])),
+  };
+  mkdirSync(home, { recursive: true });
+  writeFileSync(telegramConfigPath(home), `${JSON.stringify(disk, null, 2)}\n`, { mode: 0o600 });
+  return { botToken: prev.botToken, allowUserIds: prev.allowUserIds, projects };
+}
+
+export function chatIdForProject(cfg: TelegramConfig, slug: string | null | undefined): number | undefined {
+  if (!slug) return undefined;
+  return cfg.groups[slug];
+}
+
+export function projectSlugForChat(cfg: TelegramConfig, chatId: number): string | undefined {
+  return Object.entries(cfg.groups).find(([, id]) => id === chatId)?.[0];
 }
 
 export function shouldNotify(msg: Message, ch: Channel, muted: boolean): boolean {
@@ -106,8 +213,9 @@ export function telegramMessageHasFiles(message: { photo?: unknown[]; document?:
   return Boolean((message.photo && message.photo.length > 0) || message.document);
 }
 
-export function telegramGeneralThreadId(channelId: string): number | null {
-  return channelId === "general" ? 1 : null;
+export function telegramGeneralThreadId(ch: Channel | string): number | null {
+  if (typeof ch === "string") return ch === "general" || /:general$/.test(ch) ? 1 : null;
+  return ch.name === "general" && ch.type === "public" ? 1 : null;
 }
 
 export const TELEGRAM_PENDING_CAP = 200;
@@ -128,11 +236,35 @@ export function enqueueTelegramPending(
   ).run(n - cap);
 }
 
-export function startTelegram(hive: Hive, cfg = loadTelegramConfig()): { stop: () => void } | null {
-  if (!cfg) return null;
-  const bridge = new TelegramBridge(hive, cfg);
-  bridge.start();
-  return { stop: () => bridge.stop() };
+export type TelegramHandle = {
+  stop: () => void;
+  running: () => boolean;
+  reload: () => boolean;
+};
+
+export function startTelegram(hive: Hive, enabled = true): TelegramHandle {
+  let bridge: TelegramBridge | null = null;
+  const boot = () => {
+    const cfg = loadTelegramConfig(hive.home);
+    if (!cfg) return false;
+    bridge = new TelegramBridge(hive, cfg);
+    bridge.start();
+    return true;
+  };
+  if (enabled) boot();
+  return {
+    stop() {
+      bridge?.stop();
+      bridge = null;
+    },
+    running: () => Boolean(bridge),
+    reload() {
+      bridge?.stop();
+      bridge = null;
+      if (!enabled) return false;
+      return boot();
+    },
+  };
 }
 
 class TelegramBridge {
@@ -143,11 +275,16 @@ class TelegramBridge {
   private topicLocks = new Map<string, Promise<number | null>>();
   private poll: Promise<void> | null = null;
   private ignoreReaction = new Map<string, number>();
+  private skipChatUntil = new Map<number, number>();
 
   constructor(
     private hive: Hive,
     private cfg: TelegramConfig,
   ) {}
+
+  private chatForChannel(ch: Channel): number | undefined {
+    return chatIdForProject(this.cfg, ch.project);
+  }
 
   start() {
     this.hive.bus.on("message", this.onHiveMessage);
@@ -178,17 +315,18 @@ class TelegramBridge {
   };
 
   private async ensureTopic(ch: Channel): Promise<number | null> {
+    const chatId = this.chatForChannel(ch);
+    if (chatId == null) return null;
     const row = this.hive.db.prepare("SELECT telegram_thread_id AS id FROM telegram_topics WHERE channel_id = ?").get(
       ch.id,
     ) as { id: number } | undefined;
     if (row) return row.id;
-    const generalThread = telegramGeneralThreadId(ch.id);
+    const generalThread = telegramGeneralThreadId(ch);
     if (generalThread != null) {
-      this.hive.db.prepare("INSERT OR IGNORE INTO telegram_topics (channel_id, telegram_thread_id) VALUES (?, ?)").run(
-        ch.id,
-        generalThread,
-      );
-      await this.flushHolds(generalThread);
+      this.hive.db.prepare(
+        "INSERT OR IGNORE INTO telegram_topics (channel_id, telegram_thread_id, telegram_chat_id) VALUES (?, ?, ?)",
+      ).run(ch.id, generalThread, chatId);
+      await this.flushHolds(chatId, generalThread);
       return generalThread;
     }
     const pending = this.topicLocks.get(ch.id);
@@ -215,8 +353,10 @@ class TelegramBridge {
       ch.id,
     ) as { id: number } | undefined;
     if (again) return again.id;
+    const chatId = this.chatForChannel(ch);
+    if (chatId == null) return null;
     const name = channelLabel(ch).slice(0, 128);
-    const created = await this.api("createForumTopic", { chat_id: this.cfg.groupChatId, name });
+    const created = await this.api("createForumTopic", { chat_id: chatId, name });
     const result = created.result as { message_thread_id?: number } | undefined;
     if (!created.ok || !result?.message_thread_id) {
       const description = created.description ?? "";
@@ -227,11 +367,11 @@ class TelegramBridge {
       }
       return null;
     }
-    this.hive.db.prepare("INSERT OR IGNORE INTO telegram_topics (channel_id, telegram_thread_id) VALUES (?, ?)").run(
-      ch.id,
-      result.message_thread_id,
-    );
-    await this.flushHolds(result.message_thread_id);
+    if (!this.hive.db.prepare("SELECT id FROM channels WHERE id = ?").get(ch.id)) return null;
+    this.hive.db.prepare(
+      "INSERT OR IGNORE INTO telegram_topics (channel_id, telegram_thread_id, telegram_chat_id) VALUES (?, ?, ?)",
+    ).run(ch.id, result.message_thread_id, chatId);
+    await this.flushHolds(chatId, result.message_thread_id);
     return result.message_thread_id;
   }
 
@@ -273,10 +413,11 @@ class TelegramBridge {
   }
 
   private async onTelegramMessage(message: TelegramMessage) {
-    if (Number(message.chat?.id) !== this.cfg.groupChatId) return;
-    const already = this.hive.db.prepare("SELECT seq FROM telegram_out WHERE telegram_message_id = ?").get(
-      message.message_id,
-    );
+    if (!projectSlugForChat(this.cfg, Number(message.chat?.id))) return;
+    const chatId = Number(message.chat?.id);
+    const already = this.hive.db.prepare(
+      "SELECT seq FROM telegram_out WHERE telegram_message_id = ? AND telegram_chat_id = ?",
+    ).get(message.message_id, chatId);
     if (already) return;
     const fromId = Number(message.from?.id);
     if (!Number.isFinite(fromId) || !this.cfg.allowUserIds.includes(fromId)) return;
@@ -289,6 +430,8 @@ class TelegramBridge {
     if (!text && !telegramMessageHasFiles(message)) return;
     const channelId = await this.resolveInboundChannel(message);
     if (!channelId) {
+      const slug = projectSlugForChat(this.cfg, chatId);
+      if (slug && !this.hive.findProjectBySlug(slug)) return;
       this.holdMessage(message);
       return;
     }
@@ -297,9 +440,9 @@ class TelegramBridge {
     let threadId: string | null = null;
     const replyId = message.reply_to_message?.message_id;
     if (replyId) {
-      const mapped = this.hive.db.prepare("SELECT thread_id AS id FROM telegram_out WHERE telegram_message_id = ?").get(
-        replyId,
-      ) as { id: string | null } | undefined;
+      const mapped = this.hive.db.prepare(
+        "SELECT thread_id AS id FROM telegram_out WHERE telegram_message_id = ? AND telegram_chat_id = ?",
+      ).get(replyId, chatId) as { id: string | null } | undefined;
       threadId = mapped?.id ?? null;
     }
     const posted = this.hive.postMessage(this.hive.getAgent(HUMAN_ID), {
@@ -310,18 +453,18 @@ class TelegramBridge {
       attachmentIds,
     });
     this.hive.db.prepare(
-      `INSERT OR REPLACE INTO telegram_out (telegram_message_id, seq, channel_id, thread_id) VALUES (?, ?, ?, ?)`,
-    ).run(message.message_id, posted.seq, posted.channelId, posted.threadId);
+      `INSERT OR REPLACE INTO telegram_out (telegram_chat_id, telegram_message_id, seq, channel_id, thread_id) VALUES (?, ?, ?, ?, ?)`,
+    ).run(chatId, message.message_id, posted.seq, posted.channelId, posted.threadId);
   }
 
   private async onTelegramReaction(update: TelegramReaction) {
-    if (Number(update.chat?.id) !== this.cfg.groupChatId) return;
+    if (!projectSlugForChat(this.cfg, Number(update.chat?.id))) return;
     const fromId = Number(update.user?.id);
     if (!Number.isFinite(fromId) || !this.cfg.allowUserIds.includes(fromId)) return;
     if (update.user?.is_bot) return;
-    const mapped = this.hive.db.prepare("SELECT seq FROM telegram_out WHERE telegram_message_id = ?").get(
-      update.message_id,
-    ) as { seq: number } | undefined;
+    const mapped = this.hive.db.prepare(
+      "SELECT seq FROM telegram_out WHERE telegram_message_id = ? AND telegram_chat_id = ?",
+    ).get(update.message_id, Number(update.chat?.id)) as { seq: number } | undefined;
     if (!mapped) return;
     const next = new Set(emojisOf(update.new_reaction));
     const prev = new Set(emojisOf(update.old_reaction));
@@ -343,25 +486,33 @@ class TelegramBridge {
 
   private async onCommand(text: string, message: TelegramMessage) {
     const cmd = text.split(/\s+/)[0]?.replace(/@\w+$/, "") ?? "";
+    const chatId = Number(message.chat?.id);
     if (cmd === "/mute") {
-      this.setState("mute", "1");
+      if (Number.isFinite(chatId)) this.setState(`mute:${chatId}`, "1");
       await this.reply(message, "pings muted");
       return;
     }
     if (cmd === "/unmute") {
-      this.setState("mute", "0");
+      if (Number.isFinite(chatId)) this.setState(`mute:${chatId}`, "0");
       await this.reply(message, "pings on");
       return;
     }
     if (cmd === "/who") {
-      const lines = this.hive.listAgents().map((a) => `${a.online ? "•" : "○"} ${a.name} ${a.role}`);
+      const slug = projectSlugForChat(this.cfg, Number(message.chat?.id));
+      const project = slug ? this.hive.findProjectBySlug(slug) : null;
+      const lines = this.hive.listAgents().filter((a) => {
+        if (a.role === "human") return true;
+        return project ? a.projectId === project.id : false;
+      }).map((a) => `${a.online ? "•" : "○"} ${a.name} ${a.role}`);
       await this.reply(message, lines.join("\n") || "empty");
     }
   }
 
   private async reply(message: TelegramMessage, text: string) {
+    const chatId = Number(message.chat?.id);
+    if (!Number.isFinite(chatId)) return;
     await this.api("sendMessage", {
-      chat_id: this.cfg.groupChatId,
+      chat_id: chatId,
       message_thread_id: message.message_thread_id,
       text,
       disable_notification: true,
@@ -369,49 +520,75 @@ class TelegramBridge {
   }
 
   private async resolveInboundChannel(message: TelegramMessage): Promise<string | null> {
-    const mapped = this.channelForTopic(message.message_thread_id);
+    const chatId = Number(message.chat?.id);
+    const mapped = this.channelForTopic(chatId, message.message_thread_id);
     if (mapped) return mapped;
+    const slug = projectSlugForChat(this.cfg, chatId);
+    if (!slug) return null;
+    const project = this.hive.findProjectBySlug(slug);
+    if (!project) return null;
     const name =
       message.forum_topic_created?.name ?? message.reply_to_message?.forum_topic_created?.name ?? null;
     if (!name || message.message_thread_id == null) return null;
     const human = this.hive.getAgent(HUMAN_ID);
     const ch = this.hive.listChannels(human).find(
-      (c) => channelLabel(c) === name || c.name === name || `#${c.name}` === name,
+      (c) =>
+        c.projectId === project.id &&
+        (channelLabel(c) === name || c.name === name || `#${c.name}` === name),
     );
     if (!ch) return null;
-    this.hive.db.prepare("INSERT OR IGNORE INTO telegram_topics (channel_id, telegram_thread_id) VALUES (?, ?)").run(
-      ch.id,
-      message.message_thread_id,
-    );
-    await this.flushHolds(message.message_thread_id);
+    if (!this.hive.db.prepare("SELECT id FROM channels WHERE id = ?").get(ch.id)) return null;
+    this.hive.db.prepare(
+      "INSERT OR IGNORE INTO telegram_topics (channel_id, telegram_thread_id, telegram_chat_id) VALUES (?, ?, ?)",
+    ).run(ch.id, message.message_thread_id, chatId);
+    await this.flushHolds(chatId, message.message_thread_id);
     return ch.id;
   }
 
   private holdMessage(message: TelegramMessage) {
     const thread = message.message_thread_id;
-    if (thread == null) return;
+    const chatId = Number(message.chat?.id);
+    if (thread == null || !Number.isFinite(chatId)) return;
     this.hive.db.prepare(
-      "INSERT OR REPLACE INTO telegram_hold (telegram_message_id, telegram_thread_id, payload) VALUES (?, ?, ?)",
-    ).run(message.message_id, thread, JSON.stringify(message));
+      "INSERT OR REPLACE INTO telegram_hold (telegram_chat_id, telegram_message_id, telegram_thread_id, payload) VALUES (?, ?, ?, ?)",
+    ).run(chatId, message.message_id, thread, JSON.stringify(message));
   }
 
-  private async flushHolds(telegramThreadId: number) {
+  private async flushHolds(chatId: number, telegramThreadId: number) {
     const rows = this.hive.db.prepare(
-      "SELECT payload FROM telegram_hold WHERE telegram_thread_id = ?",
-    ).all(telegramThreadId) as { payload: string }[];
+      "SELECT payload FROM telegram_hold WHERE telegram_thread_id = ? AND (telegram_chat_id = ? OR telegram_chat_id IS NULL)",
+    ).all(telegramThreadId, chatId) as { payload: string }[];
     for (const row of rows) {
       const message = JSON.parse(row.payload) as TelegramMessage;
+      if (message.chat?.id != null && Number(message.chat.id) !== chatId) continue;
       await this.onTelegramMessage(message);
     }
-    this.hive.db.prepare("DELETE FROM telegram_hold WHERE telegram_thread_id = ?").run(telegramThreadId);
+    this.hive.db.prepare(
+      "DELETE FROM telegram_hold WHERE telegram_thread_id = ? AND (telegram_chat_id = ? OR telegram_chat_id IS NULL)",
+    ).run(telegramThreadId, chatId);
   }
 
-  private channelForTopic(threadId: number | undefined): string | null {
-    if (threadId == null || threadId === 1) return "general";
-    const row = this.hive.db.prepare("SELECT channel_id AS id FROM telegram_topics WHERE telegram_thread_id = ?").get(
-      threadId,
-    ) as { id: string } | undefined;
-    return row?.id ?? null;
+  private channelForTopic(chatId: number, threadId: number | undefined): string | null {
+    const slug = projectSlugForChat(this.cfg, chatId);
+    if (!slug) return null;
+    const project = this.hive.findProjectBySlug(slug);
+    if (!project) return null;
+    if (threadId == null || threadId === 1) {
+      const general = this.hive.listChannels(this.hive.getAgent(HUMAN_ID)).find(
+        (c) => c.projectId === project.id && c.name === "general" && c.type === "public",
+      );
+      return general?.id ?? null;
+    }
+    const row = this.hive.db.prepare(
+      "SELECT channel_id AS id FROM telegram_topics WHERE telegram_thread_id = ? AND (telegram_chat_id = ? OR telegram_chat_id IS NULL)",
+    ).get(threadId, chatId) as { id: string } | undefined;
+    if (!row) return null;
+    try {
+      const ch = this.hive.getChannel(row.id);
+      return ch.projectId === project.id ? ch.id : null;
+    } catch {
+      return null;
+    }
   }
 
   private seen(updateId: number): boolean {
@@ -445,10 +622,24 @@ class TelegramBridge {
     void this.pump();
   }
 
+  private chatForSeq(seq: number): number | undefined {
+    try {
+      return this.chatForChannel(this.hive.getChannel(this.hive.getMessageBySeq(seq).channelId));
+    } catch {
+      return undefined;
+    }
+  }
+
   private nextPending(): { seq: number; kind: "message" | "reaction" } | undefined {
-    return this.hive.db.prepare(
-      "SELECT seq, kind FROM telegram_pending ORDER BY seq ASC, kind ASC LIMIT 1",
-    ).get() as { seq: number; kind: "message" | "reaction" } | undefined;
+    const jobs = this.hive.db.prepare(
+      "SELECT seq, kind FROM telegram_pending ORDER BY seq ASC, kind ASC",
+    ).all() as { seq: number; kind: "message" | "reaction" }[];
+    const now = Date.now();
+    for (const job of jobs) {
+      const chat = this.chatForSeq(job.seq);
+      if (chat != null && (this.skipChatUntil.get(chat) ?? 0) > now) continue;
+      return job;
+    }
   }
 
   private clearPending(seq: number, kind: string) {
@@ -468,9 +659,16 @@ class TelegramBridge {
         this.pumpFails = null;
       } catch (err) {
         console.error("telegram out", err instanceof Error ? err.message : err);
+        const chat = this.chatForSeq(job.seq);
         if (isTelegramTopicRightsError(err)) {
           this.hintTopicRights();
-          await sleep(15_000);
+          if (chat != null) this.skipChatUntil.set(chat, Date.now() + 15_000);
+          if (!this.nextPending()) await sleep(15_000);
+          continue;
+        }
+        if (chat != null && /429|Too Many Requests/i.test(err instanceof Error ? err.message : String(err))) {
+          this.skipChatUntil.set(chat, Date.now() + 15_000);
+          if (!this.nextPending()) await sleep(15_000);
           continue;
         }
         this.pumpFails = nextTelegramFailure(this.pumpFails, job.seq, job.kind);
@@ -489,39 +687,47 @@ class TelegramBridge {
   }
 
   private async sendPendingMessage(seq: number) {
-    const msg = this.hive.getMessageBySeq(seq);
+    let msg: Message;
+    let ch: Channel;
+    try {
+      msg = this.hive.getMessageBySeq(seq);
+      ch = this.hive.getChannel(msg.channelId);
+    } catch {
+      return;
+    }
     if (msg.kind !== "chat" || this.hive.fromTelegram(msg.id)) return;
-    const ch = this.hive.getChannel(msg.channelId);
+    const chatId = this.chatForChannel(ch);
+    if (chatId == null) return;
     const thread = await this.ensureTopic(ch);
     if (thread == null) throw new Error("telegram topic not ready");
-    const muted = this.state("mute") === "1";
+    const muted = this.state(`mute:${chatId}`) === "1" || this.state("mute") === "1";
     const silent = !shouldNotify(msg, ch, muted);
     const atts = msg.attachments ?? [];
     const text = formatOutbound(msg);
     if (atts.length === 0) {
       const sent = requireTelegramOk(
         await this.api("sendMessage", {
-          chat_id: this.cfg.groupChatId,
+          chat_id: chatId,
           message_thread_id: thread,
           text,
           disable_notification: silent,
         }),
         "sendMessage",
       );
-      this.recordOut(sent, msg);
+      this.recordOut(sent, msg, chatId);
       return;
     }
     if (text.length > 1000) {
       const sent = requireTelegramOk(
         await this.api("sendMessage", {
-          chat_id: this.cfg.groupChatId,
+          chat_id: chatId,
           message_thread_id: thread,
           text,
           disable_notification: silent,
         }),
         "sendMessage",
       );
-      this.recordOut(sent, msg);
+      this.recordOut(sent, msg, chatId);
     }
     const human = this.hive.getAgent(HUMAN_ID);
     for (let i = 0; i < atts.length; i += 1) {
@@ -530,18 +736,27 @@ class TelegramBridge {
       const disk = filePathForHash(opened.sha256, this.hive.home);
       const caption = text.length <= 1000 && i === 0 ? text : `${msg.authorName} · ${att.name}`;
       const sent = requireTelegramOk(
-        await this.sendFile(thread, att.mime, att.name, disk, caption, silent && i > 0 ? true : silent),
+        await this.sendFile(chatId, thread, att.mime, att.name, disk, caption, silent && i > 0 ? true : silent),
         "sendFile",
       );
-      this.recordOut(sent, msg);
+      this.recordOut(sent, msg, chatId);
     }
   }
 
   private async sendPendingReaction(seq: number) {
-    const msg = this.hive.getMessageBySeq(seq);
+    let msg: Message;
+    let ch: Channel;
+    try {
+      msg = this.hive.getMessageBySeq(seq);
+      ch = this.hive.getChannel(msg.channelId);
+    } catch {
+      return;
+    }
+    const chatId = this.chatForChannel(ch);
+    if (chatId == null) return;
     const rows = this.hive.db.prepare(
-      "SELECT telegram_message_id AS id FROM telegram_out WHERE seq = ?",
-    ).all(seq) as { id: number }[];
+      "SELECT telegram_message_id AS id FROM telegram_out WHERE seq = ? AND telegram_chat_id = ?",
+    ).all(seq, chatId) as { id: number }[];
     if (rows.length === 0) return;
     const reaction = (msg.reactions ?? [])
       .map((r) => r.emoji)
@@ -553,7 +768,7 @@ class TelegramBridge {
     for (const row of rows) {
       requireTelegramOk(
         await this.api("setMessageReaction", {
-          chat_id: this.cfg.groupChatId,
+          chat_id: chatId,
           message_id: row.id,
           reaction,
         }),
@@ -562,15 +777,16 @@ class TelegramBridge {
     }
   }
 
-  private recordOut(sent: ApiResult, msg: Message) {
+  private recordOut(sent: ApiResult, msg: Message, chatId: number) {
     const result = sent.result as { message_id?: number } | undefined;
     if (!sent.ok || !result?.message_id) return;
     this.hive.db.prepare(
-      `INSERT OR REPLACE INTO telegram_out (telegram_message_id, seq, channel_id, thread_id) VALUES (?, ?, ?, ?)`,
-    ).run(result.message_id, msg.seq, msg.channelId, msg.threadId);
+      `INSERT OR REPLACE INTO telegram_out (telegram_chat_id, telegram_message_id, seq, channel_id, thread_id) VALUES (?, ?, ?, ?, ?)`,
+    ).run(chatId, result.message_id, msg.seq, msg.channelId, msg.threadId);
   }
 
   private async sendFile(
+    chatId: number,
     thread: number,
     mime: string,
     name: string,
@@ -579,7 +795,7 @@ class TelegramBridge {
     silent: boolean,
   ): Promise<ApiResult> {
     const form = new FormData();
-    form.set("chat_id", String(this.cfg.groupChatId));
+    form.set("chat_id", String(chatId));
     form.set("message_thread_id", String(thread));
     form.set("caption", caption.slice(0, 1024));
     form.set("disable_notification", silent ? "true" : "false");
@@ -591,7 +807,7 @@ class TelegramBridge {
     const data = (await res.json().catch(() => ({}))) as ApiResult;
     if (res.status === 429) {
       await sleep(Number(data.parameters?.retry_after ?? 2) * 1000);
-      return this.sendFile(thread, mime, name, filePath, caption, silent);
+      return this.sendFile(chatId, thread, mime, name, filePath, caption, silent);
     }
     return data;
   }

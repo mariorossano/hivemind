@@ -15,7 +15,11 @@ const packageRoot = path.resolve(here, "../..");
 export function startServer(opts: { port?: number; hive?: Hive; telegram?: boolean } = {}) {
   const port = opts.port ?? Number(process.env.HIVEMIND_PORT ?? DEFAULT_PORT);
   const hive = opts.hive ?? new Hive();
-  const app = createApp(hive);
+  const telegram = startTelegram(hive, opts.telegram !== false);
+  const app = createApp(hive, {
+    telegramRunning: () => telegram.running(),
+    reloadTelegram: () => telegram.reload(),
+  });
 
   const listener = getRequestListener(app.fetch);
   const server = createServer((req, res) => {
@@ -48,17 +52,21 @@ export function startServer(opts: { port?: number; hive?: Hive; telegram?: boole
   const onThread = (payload: unknown) => emit("thread", payload);
   const onReaction = (payload: unknown) => emit("reaction", payload);
   const onQueued = (payload: unknown) => emit("queued", payload);
+  const onProject = (payload: unknown) => emit("project", payload);
   hive.bus.on("message", onMessage);
   hive.bus.on("agent", onAgent);
   hive.bus.on("channel", onChannel);
   hive.bus.on("thread", onThread);
   hive.bus.on("reaction", onReaction);
   hive.bus.on("queued", onQueued);
+  hive.bus.on("project", onProject);
+
+  server.requestTimeout = 0;
+  server.headersTimeout = 0;
+  server.timeout = 0;
 
   const sweep = setInterval(() => hive.sweepPresence(), 15_000);
   sweep.unref();
-  const telegram = opts.telegram === false ? null : startTelegram(hive);
-
   const ready = new Promise<number>((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, "127.0.0.1", () => {
@@ -71,13 +79,14 @@ export function startServer(opts: { port?: number; hive?: Hive; telegram?: boole
 
   const shutdown = () => {
     clearInterval(sweep);
-    telegram?.stop();
+    telegram.stop();
     hive.bus.off("message", onMessage);
     hive.bus.off("agent", onAgent);
     hive.bus.off("channel", onChannel);
     hive.bus.off("thread", onThread);
     hive.bus.off("reaction", onReaction);
     hive.bus.off("queued", onQueued);
+    hive.bus.off("project", onProject);
     wss.close();
     server.close();
   };
