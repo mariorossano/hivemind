@@ -5,6 +5,7 @@ import {
   EFFORTS,
   buildLaunchBlock,
   buildRosterPaste,
+  codexSessionTitle,
   effectiveSoftware,
   resolveLaunchTune,
   softwareFamily,
@@ -178,14 +179,6 @@ function ModelSelect({
       </select>
     </label>
   );
-}
-
-function agentLabel(agent: Agent, hiveName: string): string {
-  const seat =
-    agent.role === "worker"
-      ? `${agent.seniority ?? "worker"} worker${agent.focus ? ` · ${agent.focus}` : ""}`
-      : `brain${agent.focus ? ` · ${agent.focus}` : ""}`;
-  return hiveName ? `${agent.name} · ${seat} · ${hiveName}` : `${agent.name} · ${seat}`;
 }
 
 export function LaunchSheet({
@@ -384,7 +377,10 @@ export function LaunchSheet({
   const allText = buildRosterPaste(
     resumeBlocks
       .filter((b) => b.ok)
-      .map((b) => ({ title: agentLabel(b.agent, b.hive?.name ?? ""), text: b.text })),
+      .map((b) => ({
+        title: codexSessionTitle(b.hive?.name ?? "", b.agent.name) || b.agent.name,
+        text: b.text,
+      })),
   );
 
   const canCopyOne = built.ok && projects.length > 0;
@@ -398,6 +394,19 @@ export function LaunchSheet({
           <p className="help-p">
             One block: command plus prompt. Paste it in a terminal. One chat is one employee. Hive is the Hivemind project name.
           </p>
+          {softwareFamily(software) === "codex" && (
+            <p className="help-p">
+              Codex has no session-name flag at open. After join, type{" "}
+              <code>/rename {hiveName ? `${hiveName} - ` : ""}Name</code> in the TUI — the copied prompt includes that command
+              {resume ? " with the employee name." : " once join returns the assigned name."}
+            </p>
+          )}
+          {softwareFamily(software) === "opencode" && (
+            <p className="help-p">
+              OpenCode TUI takes <code>--prompt</code>, not a positional path. It has no{" "}
+              <code>--variant</code> flag — use the last effort you picked for that model in OpenCode.
+            </p>
+          )}
           <label>
             Software
             <input
@@ -604,6 +613,7 @@ export function LaunchSheet({
               <>
                 <p className="help-p">
                   The model at the top (with effort in the name) applies to everyone. Override it on a card if that employee should differ.
+                  Copy all pastes a zsh script that opens one macOS Terminal window per employee (title Hive - Name). macOS may ask to control Terminal the first time.
                 </p>
                 {resumeBlocks.map((block) => (
                   <article key={block.agent.id} className="launch-card">

@@ -85,10 +85,10 @@ export function sanitizeModel(raw: string): string {
   const model = raw.trim();
   if (!model) return "";
   if (model.startsWith("-")) {
-    throw new Error("Model must be one token (letters, digits, . _ : + -)");
+    throw new Error("Model must be one token (letters, digits, . _ : + - /)");
   }
-  if (!/^[A-Za-z0-9._:+-]+$/.test(model)) {
-    throw new Error("Model must be one token (letters, digits, . _ : + -)");
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:+-]*(?:\/[A-Za-z0-9][A-Za-z0-9._:+-]*)?$/.test(model)) {
+    throw new Error("Model must be one token (letters, digits, . _ : + - /)");
   }
   return model;
 }
@@ -102,10 +102,11 @@ export function sanitizeEffort(raw: string): string {
   return effort;
 }
 
-export function softwareFamily(software: string): "claude" | "codex" | "cursor" | "other" {
+export function softwareFamily(software: string): "claude" | "codex" | "cursor" | "opencode" | "other" {
   const name = effectiveSoftware(software).toLowerCase();
   if (name.includes("claude")) return "claude";
   if (name.includes("codex")) return "codex";
+  if (name.includes("opencode")) return "opencode";
   if (name === "agent" || name.includes("cursor")) return "cursor";
   return "other";
 }
@@ -124,8 +125,11 @@ export function buildModelFlags(software: string, model?: string | null, effort?
   const m = sanitizeModel(model ?? "");
   const e = family === "cursor" ? "" : sanitizeEffort(effort ?? "");
   const parts: string[] = [];
-  if (m) parts.push(family === "codex" ? `-m ${m}` : `--model ${m}`);
-  if (e) {
+  if (m) {
+    if (family === "codex" || family === "opencode") parts.push(`-m ${m}`);
+    else parts.push(`--model ${m}`);
+  }
+  if (e && family !== "opencode") {
     if (family === "codex") parts.push(`-c model_reasoning_effort=${e}`);
     else parts.push(`--effort ${e}`);
   }
@@ -188,18 +192,49 @@ function joinArgs(input: LaunchInput): string {
   return joinList(parts);
 }
 
-function heredocTag(body: string): string {
-  let tag = "HIVEMIND_PROMPT";
+function heredocTag(body: string, base = "HIVEMIND_PROMPT"): string {
+  let tag = base;
   let n = 1;
   while (new RegExp(`^${tag}$`, "m").test(body)) {
-    tag = `HIVEMIND_PROMPT_${n++}`;
+    tag = `${base}_${n++}`;
   }
   return tag;
+}
+
+function sanitizeTabTitle(raw: string): string {
+  const title = raw.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/\s+/g, " ").trim();
+  return (title || "Hivemind").slice(0, 80);
 }
 
 function hiveLine(input: LaunchInput): string {
   const hive = sanitizeHiveName(input.hiveName ?? "");
   return hive ? `You work only in hive ${hive}.` : "";
+}
+
+function sanitizeRenamePart(raw: string): string {
+  return raw.replace(/[\x00-\x1f\x7f/]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+/** Codex TUI session title: `Hive - Agent`. Empty when there is nothing to name. */
+export function codexSessionTitle(hiveName: string | null | undefined, agentName: string | null | undefined): string {
+  const hive = sanitizeRenamePart(sanitizeHiveName(hiveName ?? ""));
+  const agent = sanitizeRenamePart(agentName ?? "");
+  if (hive && agent) return `${hive} - ${agent}`;
+  return agent || hive;
+}
+
+/** Codex has no `--name` on open. `/rename` is a TUI slash command after the session is up. */
+function codexRenameInstruction(input: LaunchInput): string {
+  if (softwareFamily(input.software) !== "codex") return "";
+  const hive = sanitizeHiveName(input.hiveName ?? "");
+  if (input.resume) {
+    const title = codexSessionTitle(hive, input.resumeName);
+    return title ? `After join, run the Codex slash command /rename ${title}.` : "";
+  }
+  if (hive) {
+    return `After join returns your assigned name, run the Codex slash command /rename ${sanitizeRenamePart(hive)} - that assigned name.`;
+  }
+  return "After join returns your assigned name, run the Codex slash command /rename with that assigned name.";
 }
 
 export function buildLaunchPrompt(input: LaunchInput): string {
@@ -212,9 +247,10 @@ export function buildLaunchPrompt(input: LaunchInput): string {
   ]
     .filter(Boolean)
     .join(" ");
+  const rename = codexRenameInstruction(input);
   const intro = input.resume
-    ? `You are already a Hivemind ${input.role}. ${call} ${isolation} Orders are unchanged — call standing_orders only if you need them.`
-    : `You are a Hivemind employee. ${call} ${isolation} Call standing_orders.`;
+    ? `You are already a Hivemind ${input.role}. ${call} ${isolation} ${rename} Orders are unchanged — call standing_orders only if you need them.`
+    : `You are a Hivemind employee. ${call} ${isolation} ${rename} Call standing_orders.`;
   const after = input.role === "worker" ? WORKER_AFTER : BRAIN_AFTER;
   const body = `${intro} ${WAIT_RULES} ${after}`.replace(/\s+/g, " ").trim();
   if (!input.adoptUntrusted) return body;
@@ -231,9 +267,9 @@ export function buildLaunchBlock(input: LaunchInput): string {
     .join(" ");
   const prompt = buildLaunchPrompt(input);
   const tag = heredocTag(prompt);
-  const invoke = [software, flags, `"$(cat <<'${tag}'\n${prompt}\n${tag}\n)"`]
-    .filter(Boolean)
-    .join(" ");
+  const quoted = `"$(cat <<'${tag}'\n${prompt}\n${tag}\n)"`;
+  const promptArg = softwareFamily(software) === "opencode" ? `--prompt ${quoted}` : quoted;
+  const invoke = [software, flags, promptArg].filter(Boolean).join(" ");
   const tree = sanitizeWorkspacePath(input.workspacePath);
   const command =
     input.cdWorktree && tree ? `cd -- ${shSingleQuote(tree)} && ${invoke}` : invoke;
@@ -241,18 +277,65 @@ export function buildLaunchBlock(input: LaunchInput): string {
 }
 
 export function buildRosterPaste(blocks: Array<{ title: string; text: string }>): string {
-  const body = blocks
-    .map((b) => `## ${b.title.replace(/\n+/g, " ").trim()}\n\n${b.text.replace(/\n+$/, "")}`)
-    .join("\n\n");
-  let tag = "HIVEMIND_ROSTER";
-  let n = 1;
-  while (new RegExp(`^${tag}$`, "m").test(body)) tag = `HIVEMIND_ROSTER_${n++}`;
-  return [
-    `cat <<'${tag}'`,
-    "One chat = one employee. This paste only prints the blocks; it does not launch anyone.",
+  const seats = blocks
+    .map((b) => ({
+      title: sanitizeTabTitle(b.title),
+      command: b.text.replace(/\n+$/, ""),
+    }))
+    .filter((b) => b.command.length > 0);
+  if (seats.length === 0) {
+    return ["#!/bin/zsh", "echo 'No employees to launch.' >&2", "exit 1", ""].join("\n");
+  }
+
+  const parts: string[] = [
+    "#!/bin/zsh",
+    "set -euo pipefail",
+    "if [[ \"$(uname -s)\" != Darwin ]]; then",
+    "  echo 'This launcher opens macOS Terminal windows.' >&2",
+    "  exit 1",
+    "fi",
+    'HIVEMIND_LAUNCH_DIR=$(mktemp -d "${TMPDIR:-/tmp}/hivemind-launch.XXXXXX")',
+    "HIVEMIND_LAUNCH_ARGS=()",
     "",
-    body,
-    tag,
+  ];
+
+  seats.forEach((seat, i) => {
+    const rel = `${String(i + 1).padStart(2, "0")}.zsh`;
+    const fileBody = [`printf '\\033]0;%s\\007' ${shSingleQuote(seat.title)}`, seat.command].join("\n");
+    const tag = heredocTag(fileBody, `HIVEMIND_LAUNCH_${i + 1}`);
+    parts.push(
+      `cat > "$HIVEMIND_LAUNCH_DIR/${rel}" <<'${tag}'`,
+      fileBody,
+      tag,
+      `HIVEMIND_LAUNCH_ARGS+=(${shSingleQuote(seat.title)} "$HIVEMIND_LAUNCH_DIR/${rel}")`,
+      "",
+    );
+  });
+
+  parts.push(
+    "osascript - \"${HIVEMIND_LAUNCH_ARGS[@]}\" <<'HIVEMIND_OSA'",
+    "on run argv",
+    "  if (count of argv) < 2 then return",
+    "  tell application \"Terminal\"",
+    "    activate",
+    "    set i to 1",
+    "    repeat while i is less than or equal to (count of argv)",
+    "      set tabTitle to item i of argv",
+    "      set scriptPath to item (i + 1) of argv",
+    "      set newTab to do script (\"source \" & quoted form of scriptPath)",
+    "      try",
+    "        set title displays custom title of newTab to true",
+    "        set custom title of newTab to tabTitle",
+    "      end try",
+    "      delay 0.2",
+    "      set i to i + 2",
+    "    end repeat",
+    "  end tell",
+    "end run",
+    "HIVEMIND_OSA",
     "",
-  ].join("\n");
+    '(sleep 30 && rm -rf "$HIVEMIND_LAUNCH_DIR") &',
+    "",
+  );
+  return parts.join("\n");
 }

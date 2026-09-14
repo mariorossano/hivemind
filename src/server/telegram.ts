@@ -205,6 +205,38 @@ export function isTelegramTopicRightsError(err: unknown): boolean {
   return /not enough rights|bot needs Manage Topics/i.test(msg);
 }
 
+/** Telegram's setMessageReaction allow-list is not the hive set. These stand-ins stay 1:1. */
+export const TELEGRAM_REACTION_OUT: Record<(typeof REACTION_EMOJIS)[number], string> = {
+  "👍": "👍",
+  "👎": "👎",
+  "👀": "👀",
+  "🚩": "⚡",
+  "✅": "💯",
+  "❓": "🤔",
+};
+
+export const TELEGRAM_REACTION_IN: Record<string, string> = Object.fromEntries(
+  Object.entries(TELEGRAM_REACTION_OUT).map(([hive, tg]) => [tg, hive]),
+);
+
+export function telegramOutboundReactionPayload(
+  emojis: Iterable<string>,
+): Array<{ type: "emoji"; emoji: string }> {
+  const present = new Set(emojis);
+  const hive = REACTION_EMOJIS.find((emoji) => present.has(emoji));
+  if (!hive) return [];
+  return [{ type: "emoji", emoji: TELEGRAM_REACTION_OUT[hive] }];
+}
+
+export function hiveEmojiFromTelegram(emoji: string): string | undefined {
+  return TELEGRAM_REACTION_IN[emoji];
+}
+
+export function isTelegramPermanentOutError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /REACTION_INVALID|MESSAGE_ID_INVALID|message to react not found|chat not found/i.test(msg);
+}
+
 export function telegramFileTooLarge(fileSize: number | undefined, cap = FILE_MAX_BYTES): boolean {
   return fileSize != null && fileSize > cap;
 }
@@ -466,9 +498,9 @@ class TelegramBridge {
       "SELECT seq FROM telegram_out WHERE telegram_message_id = ? AND telegram_chat_id = ?",
     ).get(update.message_id, Number(update.chat?.id)) as { seq: number } | undefined;
     if (!mapped) return;
-    const next = new Set(emojisOf(update.new_reaction));
-    const prev = new Set(emojisOf(update.old_reaction));
-    const key = reactionIgnoreKey(update.message_id, [...next]);
+    const next = new Set(hiveEmojisOf(update.new_reaction));
+    const prev = new Set(hiveEmojisOf(update.old_reaction));
+    const key = reactionIgnoreKey(update.message_id, telegramEmojisOf(update.new_reaction));
     const ignoredAt = this.ignoreReaction.get(key);
     if (ignoredAt != null && Date.now() - ignoredAt < 120_000) return;
     this.pruneIgnoreReactions();
@@ -660,6 +692,12 @@ class TelegramBridge {
       } catch (err) {
         console.error("telegram out", err instanceof Error ? err.message : err);
         const chat = this.chatForSeq(job.seq);
+        if (isTelegramPermanentOutError(err)) {
+          console.error(`telegram out giving up seq=${job.seq} kind=${job.kind}`);
+          this.clearPending(job.seq, job.kind);
+          this.pumpFails = null;
+          continue;
+        }
         if (isTelegramTopicRightsError(err)) {
           this.hintTopicRights();
           if (chat != null) this.skipChatUntil.set(chat, Date.now() + 15_000);
@@ -758,10 +796,7 @@ class TelegramBridge {
       "SELECT telegram_message_id AS id FROM telegram_out WHERE seq = ? AND telegram_chat_id = ?",
     ).all(seq, chatId) as { id: number }[];
     if (rows.length === 0) return;
-    const reaction = (msg.reactions ?? [])
-      .map((r) => r.emoji)
-      .filter((e) => REACTION_EMOJIS.includes(e as (typeof REACTION_EMOJIS)[number]))
-      .map((emoji) => ({ type: "emoji", emoji }));
+    const reaction = telegramOutboundReactionPayload((msg.reactions ?? []).map((r) => r.emoji));
     const emojis = reaction.map((r) => r.emoji);
     const now = Date.now();
     for (const row of rows) this.ignoreReaction.set(reactionIgnoreKey(row.id, emojis), now);
@@ -888,9 +923,13 @@ type TelegramReaction = {
   old_reaction?: Array<{ type?: string; emoji?: string }>;
 };
 
-function emojisOf(list: Array<{ type?: string; emoji?: string }> | undefined): string[] {
-  return (list ?? [])
-    .map((r) => r.emoji)
+function telegramEmojisOf(list: Array<{ type?: string; emoji?: string }> | undefined): string[] {
+  return (list ?? []).map((r) => r.emoji).filter((e): e is string => Boolean(e));
+}
+
+function hiveEmojisOf(list: Array<{ type?: string; emoji?: string }> | undefined): string[] {
+  return telegramEmojisOf(list)
+    .map((emoji) => hiveEmojiFromTelegram(emoji))
     .filter((e): e is string => Boolean(e) && REACTION_EMOJIS.includes(e as (typeof REACTION_EMOJIS)[number]));
 }
 

@@ -17,8 +17,11 @@ import {
   formatOutbound,
   inboundBody,
   inboundPostBody,
+  isTelegramPermanentOutError,
   isTelegramTopicRightsError,
   nextTelegramFailure,
+  hiveEmojiFromTelegram,
+  telegramOutboundReactionPayload,
   reactionIgnoreKey,
   requireTelegramOk,
   shouldDropTelegramJob,
@@ -104,6 +107,19 @@ test("telegram outbound pending drops oldest when the hive bursts", () => {
   assert.equal(rows.at(-1)?.seq, TELEGRAM_PENDING_CAP + 50);
   assert.equal(rows.at(-1)?.kind, "reaction");
   rmSync(dir, { recursive: true, force: true });
+});
+
+test("telegram outbound reactions map hive-only emoji onto Telegram's allow-list", () => {
+  assert.deepEqual(telegramOutboundReactionPayload(["✅"]), [{ type: "emoji", emoji: "💯" }]);
+  assert.deepEqual(telegramOutboundReactionPayload(["🚩"]), [{ type: "emoji", emoji: "⚡" }]);
+  assert.deepEqual(telegramOutboundReactionPayload(["❓"]), [{ type: "emoji", emoji: "🤔" }]);
+  assert.deepEqual(telegramOutboundReactionPayload(["✅", "👍", "👀"]), [{ type: "emoji", emoji: "👍" }]);
+  assert.deepEqual(telegramOutboundReactionPayload(["👀"]), [{ type: "emoji", emoji: "👀" }]);
+  assert.equal(hiveEmojiFromTelegram("💯"), "✅");
+  assert.equal(hiveEmojiFromTelegram("⚡"), "🚩");
+  assert.equal(hiveEmojiFromTelegram("🤔"), "❓");
+  assert.equal(isTelegramPermanentOutError(new Error("Bad Request: REACTION_INVALID")), true);
+  assert.equal(isTelegramPermanentOutError(new Error("Too Many Requests: retry after 2")), false);
 });
 
 test("telegram topic permission errors are not treated as a dead job", () => {

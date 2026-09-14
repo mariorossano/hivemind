@@ -261,6 +261,13 @@ const CURSOR = [
   "glm-5.2-max",
 ];
 
+const OPENCODE = [
+  "opencode-go/muse-spark-1.3-contributor",
+  "opencode/muse-spark-1.3-contributor-free",
+  "opencode-go/muse-spark-1.2-contributor",
+  "opencode/muse-spark-1.2-contributor-free",
+];
+
 const PICK_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 
 export type ModelChoice = {
@@ -276,7 +283,7 @@ function unique(models: string[]): string[] {
   return [...new Set(models)];
 }
 
-type Family = "codex" | "claude" | "cursor";
+type Family = "codex" | "claude" | "cursor" | "opencode";
 
 export function modelChoiceId(family: Family | "other", model: string, effort: string): string {
   const slug = model.trim();
@@ -316,10 +323,12 @@ export function modelChoiceGroups(software: string): ModelChoiceGroup[] {
     { label: "Codex", choices: withEfforts("codex", CODEX) },
     { label: "Claude", choices: withEfforts("claude", CLAUDE) },
     { label: "Cursor", choices: slugsOnly("cursor", CURSOR) },
+    { label: "OpenCode", choices: withEfforts("opencode", OPENCODE) },
   ];
   if (family === "codex") return all.filter((g) => g.label === "Codex");
   if (family === "claude") return all.filter((g) => g.label === "Claude");
   if (family === "cursor") return all.filter((g) => g.label === "Cursor");
+  if (family === "opencode") return all.filter((g) => g.label === "OpenCode");
   return all;
 }
 
@@ -335,7 +344,7 @@ export function selectedChoiceId(software: string, model: string, effort: string
 export function parseChoiceId(id: string): { model: string; effort: string } {
   const trimmed = id.trim();
   if (!trimmed) return { model: "", effort: "" };
-  const prefixed = /^(codex|claude|cursor|other):(.+)$/.exec(trimmed);
+  const prefixed = /^(codex|claude|cursor|opencode|other):(.+)$/.exec(trimmed);
   const rest = prefixed ? prefixed[2] : trimmed;
   const sep = rest.indexOf("::");
   if (sep === -1) return { model: rest, effort: "" };
@@ -351,5 +360,5 @@ export function modelGroups(software: string): ModelGroup[] {
 }
 
 export function allLaunchModels(): string[] {
-  return unique([...CODEX, ...CLAUDE, ...CURSOR]);
+  return unique([...CODEX, ...CLAUDE, ...CURSOR, ...OPENCODE]);
 }

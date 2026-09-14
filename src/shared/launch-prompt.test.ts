@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 import {
   ADOPT_UNTRUSTED,
   buildLaunchBlock,
   buildLaunchPrompt,
   buildRosterPaste,
+  codexSessionTitle,
   sanitizeExtraFlags,
   sanitizeModel,
   sanitizeSoftware,
@@ -68,6 +70,44 @@ test("without project flag, join from the worktree", () => {
 test("hive name is omitted when left blank", () => {
   const text = buildLaunchPrompt({ ...base, hiveName: "", adoptUntrusted: false });
   assert.equal(text.includes("You work only in hive"), false);
+});
+
+test("Codex new join asks for /rename Hive - assigned name after join", () => {
+  const text = buildLaunchPrompt({ ...base, adoptUntrusted: false });
+  assert.match(text, /\/rename Alpha - that assigned name/);
+  assert.equal(codexSessionTitle("Alpha", "Forge"), "Alpha - Forge");
+});
+
+test("Codex resume uses the exact /rename Hive - Name", () => {
+  const text = buildLaunchPrompt({
+    ...base,
+    role: "worker",
+    seniority: "senior",
+    resume: true,
+    resumeName: "Forge",
+    adoptUntrusted: false,
+  });
+  assert.match(text, /\/rename Alpha - Forge/);
+});
+
+test("Claude and Cursor prompts do not mention /rename", () => {
+  const claude = buildLaunchPrompt({ ...base, software: "claude-tw", adoptUntrusted: false });
+  const cursor = buildLaunchPrompt({ ...base, software: "agent", adoptUntrusted: false });
+  assert.equal(claude.includes("/rename"), false);
+  assert.equal(cursor.includes("/rename"), false);
+});
+
+test("Codex rename falls back to the assigned name when the hive title is blank", () => {
+  const resume = buildLaunchPrompt({
+    ...base,
+    hiveName: "",
+    resume: true,
+    resumeName: "Forge",
+    adoptUntrusted: false,
+  });
+  assert.match(resume, /\/rename Forge/);
+  const fresh = buildLaunchPrompt({ ...base, hiveName: "", adoptUntrusted: false });
+  assert.match(fresh, /\/rename with that assigned name/);
 });
 
 test("one block cds then runs the alias with a heredoc prompt", () => {
@@ -146,6 +186,21 @@ test("resume worker without seniority omits the join field", () => {
   assert.equal(text.includes("seniority="), false);
 });
 
+test("OpenCode TUI takes --prompt and does not pass --variant", () => {
+  const block = buildLaunchBlock({
+    ...base,
+    software: "opencode",
+    model: "opencode/muse-spark-1.3-contributor-free",
+    effort: "xhigh",
+    cdWorktree: false,
+  });
+  assert.match(block, /^opencode -m opencode\/muse-spark-1\.3-contributor-free --prompt /);
+  assert.equal(block.includes("--variant"), false);
+  assert.equal(softwareFamily("opencode"), "opencode");
+  assert.equal(sanitizeModel("opencode/muse-spark-1.3-contributor-free"), "opencode/muse-spark-1.3-contributor-free");
+  assert.throws(() => sanitizeModel("../evil"), /one token/);
+});
+
 test("cursor family skips effort flags", () => {
   const block = buildLaunchBlock({
     ...base,
@@ -159,15 +214,27 @@ test("cursor family skips effort flags", () => {
   assert.equal(block.includes("model_reasoning_effort"), false);
 });
 
-test("roster paste prints blocks and does not run them", () => {
+test("roster paste is a macOS script that opens one Terminal window per employee", () => {
+  const forge = "codex \"$(cat <<'HIVEMIND_PROMPT'\nhi\nHIVEMIND_PROMPT\n)\"";
+  const ada = "claude --model opus \"$(cat <<'HIVEMIND_PROMPT'\nho\nHIVEMIND_PROMPT\n)\"";
   const text = buildRosterPaste([
-    { title: "Forge · brain", text: "codex \"$(cat <<'HIVEMIND_PROMPT'\nhi\nHIVEMIND_PROMPT\n)\"" },
-    { title: "Ada · worker", text: "claude --model opus \"$(cat <<'HIVEMIND_PROMPT'\nho\nHIVEMIND_PROMPT\n)\"" },
+    { title: "Alpha - Forge", text: forge },
+    { title: "Alpha - Ada", text: ada },
   ]);
-  assert.ok(text.startsWith("cat <<'HIVEMIND_ROSTER'"));
-  assert.match(text, /does not launch anyone/);
-  assert.match(text, /## Forge · brain/);
-  assert.match(text, /HIVEMIND_ROSTER\n$/);
+  assert.ok(text.startsWith("#!/bin/zsh"));
+  assert.match(text, /osascript/);
+  assert.match(text, /do script/);
+  assert.match(text, /HIVEMIND_LAUNCH_1/);
+  assert.match(text, /HIVEMIND_LAUNCH_2/);
+  assert.ok(text.includes(forge));
+  assert.ok(text.includes(ada));
+  assert.match(text, /'Alpha - Forge'/);
+  assert.match(text, /'Alpha - Ada'/);
+  assert.equal(text.includes("does not launch anyone"), false);
+  const chk = spawnSync("zsh", ["-n"], { input: text, encoding: "utf8" });
+  assert.equal(chk.status, 0, chk.stderr);
+  const empty = buildRosterPaste([]);
+  assert.match(empty, /No employees to launch/);
 });
 
 test("resume without a name does not emit a placeholder", () => {

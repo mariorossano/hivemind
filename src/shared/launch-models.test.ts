@@ -54,6 +54,19 @@ test("selectedChoiceId follows the software family", () => {
   assert.equal(selectedChoiceId("codex", "composer-2.5", ""), "other:composer-2.5");
   assert.equal(selectedChoiceId("agent", "gpt-5.3-codex", "high"), "cursor:gpt-5.3-codex");
   assert.equal(selectedChoiceId("", "gpt-6-astra", "high"), "codex:gpt-6-astra::high");
+  assert.equal(
+    selectedChoiceId("opencode", "opencode/muse-spark-1.3-contributor-free", "xhigh"),
+    "opencode:opencode/muse-spark-1.3-contributor-free::xhigh",
+  );
   assert.deepEqual(parseChoiceId("codex:gpt-6-astra::high"), { model: "gpt-6-astra", effort: "high" });
   assert.deepEqual(parseChoiceId("other:composer-2.5"), { model: "composer-2.5", effort: "" });
+  assert.deepEqual(parseChoiceId("opencode:opencode/muse-spark-1.3-contributor-free::xhigh"), {
+    model: "opencode/muse-spark-1.3-contributor-free",
+    effort: "xhigh",
+  });
+  assert.ok(
+    modelChoiceGroups("opencode")[0]?.choices.some(
+      (c) => c.model === "opencode-go/muse-spark-1.3-contributor" && c.effort === "",
+    ),
+  );
 });
