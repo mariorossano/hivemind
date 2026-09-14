@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent } from "react";
 import type { Agent, Channel, Message, SearchHit, Thread, ThreadStatus } from "../src/shared/types.ts";
 import { REACTION_EMOJIS } from "../src/shared/types.ts";
-import { isLiveSearchQuery } from "../src/shared/search-query.ts";
+import { isLiveSearchQuery, parseSearchQuery } from "../src/shared/search-query.ts";
 import { api, connectWs, type ChannelPayload, type Snapshot, type TelegramSettings } from "./api.ts";
 import { LaunchSheet } from "./LaunchSheet.tsx";
 import { loadMailLog, mergeMailLog, saveMailLog } from "./mail-log.ts";
@@ -1292,6 +1292,72 @@ function ChannelItem({
   );
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function renderSearchBody(body: string, q: string) {
+  const tokens = parseSearchQuery(q).filter((token) => token.length > 0);
+  if (tokens.length === 0) return renderBody(body);
+  const re = new RegExp(tokens.map(escapeRegExp).join("|"), "gi");
+  const parts: ReturnType<typeof renderBody> = [];
+  let last = 0;
+  let key = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(body))) {
+    if (m.index === last && m[0] === "") {
+      re.lastIndex += 1;
+      continue;
+    }
+    if (m.index > last) parts.push(...renderBody(body.slice(last, m.index)));
+    parts.push(
+      <mark className="hit" key={`hit-${key++}`}>
+        {m[0]}
+      </mark>,
+    );
+    last = m.index + m[0].length;
+  }
+  if (last < body.length) parts.push(...renderBody(body.slice(last)));
+  return parts;
+}
+
+function SearchHitMsg({ hit, q }: { hit: SearchHit; q: string }) {
+  const time = new Date(hit.createdAt).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  return (
+    <article className={`msg role-${hit.authorRole} kind-${hit.kind}`}>
+      <Avatar name={hit.authorName} role={hit.authorRole} />
+      <div>
+        <div className="msg-h">
+          <strong>{hit.authorName}</strong>
+          <span className="role">{hit.authorRole}</span>
+          <time dateTime={new Date(hit.createdAt).toISOString()}>{time}</time>
+          <span className="seq">#{hit.seq}</span>
+        </div>
+        {hit.body ? <div className="msg-b">{renderSearchBody(hit.body, q)}</div> : null}
+        {hit.attachments.length > 0 && (
+          <div className="atts">
+            {hit.attachments.map((name) => (
+              <span key={name} className="att-chip">
+                {name}
+              </span>
+            ))}
+          </div>
+        )}
+        {hit.reactions.length > 0 && (
+          <div className="reacts">
+            {hit.reactions.map((emoji) => (
+              <span key={emoji} className="react">
+                {emoji}
+              </span>
+            ))}
+          </div>
+        )}
+        {!hit.body && hit.attachments.length === 0 && <div className="msg-b muted">(empty)</div>}
+      </div>
+    </article>
+  );
+}
+
 function SearchDesk({
   hiveName,
   q,
@@ -1317,8 +1383,8 @@ function SearchDesk({
         <div>
           <h1>Search</h1>
           <p>
-            Messages in {hiveName} matching {q}. Body, seq, author, channel, mentions, files, and reactions. Other
-            hives stay hidden.
+            {hiveName}
+            {q ? ` · “${q}”` : ""}
           </p>
         </div>
         <button type="button" className="text-btn" onClick={onClear}>
@@ -1331,16 +1397,11 @@ function SearchDesk({
         {hits.map((hit) => {
           const where = hit.channelType === "dm" ? hit.channelName : `#${hit.channelName}`;
           return (
-            <button key={hit.seq} className="inbox-item" onClick={() => onOpen(hit)}>
-              <strong>
-                {hit.authorName}
-                <span className="seq"> #{hit.seq}</span>
-              </strong>
-              <p>{hit.body || (hit.attachments[0] ? hit.attachments.join(", ") : "(empty)")}</p>
+            <button key={hit.seq} type="button" className="inbox-item" onClick={() => onOpen(hit)}>
+              <SearchHitMsg hit={hit} q={q} />
               <span className="open-link">
                 {where}
-                {hit.threadId ? " · thread" : ""}
-                {hit.reactions.length ? ` · ${hit.reactions.join("")}` : ""}
+                {hit.threadId ? " · open thread" : " · open conversation"}
               </span>
             </button>
           );

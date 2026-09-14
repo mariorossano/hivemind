@@ -310,7 +310,14 @@ html.dark .msg:hover { background: rgba(255, 255, 255, 0.03); }
   align-items: baseline;
 }
 .msg-h strong { font-size: 0.92rem; font-weight: 700; }
-.role, time, .st { color: var(--mute); font-size: 0.78rem; }
+.role, time, .st, .msg-h .seq { color: var(--mute); font-size: 0.78rem; }
+.hit {
+  background: rgba(184, 146, 42, 0.28);
+  color: inherit;
+  padding: 0 0.12rem;
+  border-radius: 3px;
+}
+html.dark .hit { background: rgba(224, 195, 106, 0.28); }
 .st-blocked { color: var(--ember); }
 .st-done { color: var(--moss); }
 .msg-b {
@@ -319,6 +326,7 @@ html.dark .msg:hover { background: rgba(255, 255, 255, 0.03); }
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+.msg-b.muted { color: var(--mute); }
 .mention {
   color: #6b4f10;
   background: rgba(184, 146, 42, 0.16);
@@ -597,6 +605,9 @@ html.dark .queue-badge { color: #1b2017; }
   text-align: left;
 }
 .inbox-item:hover { background: rgba(27, 32, 23, 0.03); }
+html.dark .inbox-item:hover { background: rgba(255, 255, 255, 0.03); }
+.inbox-item .msg { padding-bottom: 0.2rem; }
+.inbox-item .msg:hover { background: transparent; }
 .inbox-item .seq { color: var(--rail-mute); font-weight: 500; }
 .open-link {
   display: block;
