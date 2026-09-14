@@ -31,6 +31,7 @@ function help() {
   hivemind react --seq N --emoji 👍
   hivemind gc
   hivemind history --channel NAME [--thread ID]
+  hivemind search --q TEXT [--channel NAME] [--before N]
   hivemind agents
   hivemind channels
   hivemind whoami
@@ -254,6 +255,32 @@ async function main() {
     const result = hive.gcFiles();
     hive.db.close();
     console.log(`gc attachments=${result.attachments} blobs=${result.blobs}`);
+    return;
+  }
+
+  if (cmd === "search") {
+    const q = arg(argv, "--q") ?? arg(argv, "--query");
+    if (!q) throw new Error("search --q TEXT");
+    const channel = arg(argv, "--channel");
+    const before = arg(argv, "--before");
+    const limit = arg(argv, "--limit");
+    const params = new URLSearchParams({ q });
+    if (channel) params.set("channel", channel);
+    if (before) params.set("beforeSeq", before);
+    if (limit) params.set("limit", limit);
+    const result = await agentRequest<{
+      hits: Array<{ seq: number; channelName: string; channelType: string; authorName: string; body: string }>;
+      hasMore: boolean;
+    }>("GET", `/api/agent/search?${params}`, undefined, token);
+    if (result.hits.length === 0) {
+      console.log("no hits");
+      return;
+    }
+    for (const hit of result.hits) {
+      const room = hit.channelType === "dm" ? hit.channelName : `#${hit.channelName}`;
+      console.log(`${hit.seq} ${room} ${hit.authorName}: ${hit.body}`);
+    }
+    if (result.hasMore) console.log("more: search --q … --before " + result.hits[result.hits.length - 1]!.seq);
     return;
   }
 

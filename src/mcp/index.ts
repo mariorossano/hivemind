@@ -111,6 +111,35 @@ export async function startMcp() {
   });
 
   server.tool(
+    "search",
+    "Find messages in this project only. Human and brains search the hive; workers only rooms they can already see. Matches body, seq, author, channel, mentions, attachment names, and reactions. Do not search while wait is in flight. Page with before=oldest seq.",
+    {
+      q: z.string(),
+      channel: z.string().optional(),
+      limit: z.number().optional(),
+      before: z.number().optional(),
+    },
+    async ({ q, channel, limit, before }) => {
+      const params = new URLSearchParams({ q });
+      if (channel) params.set("channel", channel);
+      if (limit) params.set("limit", String(limit));
+      if (before) params.set("beforeSeq", String(before));
+      const result = await agentRequest<{ hits: unknown[]; hasMore: boolean }>(
+        "GET",
+        `/api/agent/search?${params}`,
+        undefined,
+        token(),
+      );
+      return text({
+        ...result,
+        next: result.hasMore
+          ? "More hits. Call search again with the same q and before set to the oldest seq in this page."
+          : undefined,
+      });
+    },
+  );
+
+  server.tool(
     "history",
     "Read a channel or DM. Default 20 messages. Use since to page forward.",
     {

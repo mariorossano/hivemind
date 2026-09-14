@@ -597,6 +597,7 @@ html.dark .queue-badge { color: #1b2017; }
   text-align: left;
 }
 .inbox-item:hover { background: rgba(27, 32, 23, 0.03); }
+.inbox-item .seq { color: var(--rail-mute); font-weight: 500; }
 .open-link {
   display: block;
   padding: 0 1.2rem 0.7rem 3.7rem;
@@ -775,7 +776,14 @@ html.dark .primary { background: var(--wax); color: #1b2017; }
     background: linear-gradient(90deg, var(--pollen), var(--dusk));
   }
   .group { display: flex; gap: 0.2rem; margin: 0; }
-  .search, .brand-tools { display: none; }
+  .brand-tools { display: none; }
+  .search {
+    display: block;
+    flex: 0 0 11rem;
+    width: 11rem;
+    margin: 0.35rem 0.25rem;
+    padding: 0.35rem 0.55rem;
+  }
 }
 
 ::view-transition-old(root),

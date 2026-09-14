@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent } from "react";
-import type { Agent, Channel, Message, Thread, ThreadStatus } from "../src/shared/types.ts";
+import type { Agent, Channel, Message, SearchHit, Thread, ThreadStatus } from "../src/shared/types.ts";
 import { REACTION_EMOJIS } from "../src/shared/types.ts";
+import { isLiveSearchQuery } from "../src/shared/search-query.ts";
 import { api, connectWs, type ChannelPayload, type Snapshot, type TelegramSettings } from "./api.ts";
 import { LaunchSheet } from "./LaunchSheet.tsx";
 import { loadMailLog, mergeMailLog, saveMailLog } from "./mail-log.ts";
@@ -146,6 +147,13 @@ export function App() {
   const [tgUsers, setTgUsers] = useState("");
   const [tgGroups, setTgGroups] = useState<Record<string, string>>({});
   const [query, setQuery] = useState("");
+  const [hits, setHits] = useState<SearchHit[]>([]);
+  const [hitsMore, setHitsMore] = useState(false);
+  const [hitsBusy, setHitsBusy] = useState(false);
+  const [searchTick, setSearchTick] = useState(0);
+  const searchDelayRef = useRef(280);
+  const hitsNeedleRef = useRef("");
+  const hitsProjectRef = useRef("");
   const [theme, setTheme] = useState<"light" | "dark">(() => {
     const saved = localStorage.getItem("hivemind-theme");
     return saved === "dark" ? "dark" : "light";
@@ -377,6 +385,49 @@ export function App() {
   const inboxProject = sel.kind === "inbox" ? sel.project : selectedProject;
   const allForYou = mailLog.filter((m) => channels.find((c) => c.id === m.channelId)?.project === inboxProject);
   const inboxBox: InboxBox = sel.kind === "inbox" && sel.box === "all" ? "all" : "unread";
+  const searching = isLiveSearchQuery(query);
+  const searchProjectOk = projects.some((p) => p.slug === selectedProject);
+
+  useEffect(() => {
+    if (!searching || !searchProjectOk) {
+      hitsNeedleRef.current = "";
+      hitsProjectRef.current = "";
+      setHits([]);
+      setHitsMore(false);
+      setHitsBusy(false);
+      return;
+    }
+    const needle = query.trim();
+    const project = selectedProject;
+    const ac = new AbortController();
+    setHits([]);
+    setHitsMore(false);
+    setHitsBusy(true);
+    const delay = searchDelayRef.current;
+    searchDelayRef.current = 280;
+    const timer = window.setTimeout(() => {
+      api
+        .search(needle, project, undefined, undefined, ac.signal)
+        .then((page) => {
+          if (ac.signal.aborted) return;
+          hitsNeedleRef.current = needle;
+          hitsProjectRef.current = project;
+          setHits(page.hits);
+          setHitsMore(page.hasMore);
+        })
+        .catch((e) => {
+          if (ac.signal.aborted || e.name === "AbortError") return;
+          setErr(String(e.message || e));
+        })
+        .finally(() => {
+          if (!ac.signal.aborted) setHitsBusy(false);
+        });
+    }, delay);
+    return () => {
+      window.clearTimeout(timer);
+      ac.abort();
+    };
+  }, [searching, query, selectedProject, searchProjectOk, searchTick]);
 
   const send = async (body: string, tid?: string | null, files?: File[]) => {
     if (sel.kind !== "channel") return;
@@ -498,7 +549,15 @@ export function App() {
           className="search"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search the hive"
+          onKeyDown={(e) => {
+            if (e.key === "Escape") setQuery("");
+            if (e.key === "Enter" && isLiveSearchQuery(query)) {
+              e.preventDefault();
+              searchDelayRef.current = 0;
+              setSearchTick((n) => n + 1);
+            }
+          }}
+          placeholder="Search this hive"
         />
 
         <div className="group-h">
@@ -647,6 +706,33 @@ export function App() {
               <p>Create one from the sidebar. The worktree on disk is never deleted.</p>
             </div>
           </header>
+        ) : searching ? (
+          <SearchDesk
+            hiveName={projects.find((p) => p.slug === selectedProject)?.name ?? selectedProject}
+            q={query.trim()}
+            hits={hits}
+            hasMore={hitsMore}
+            busy={hitsBusy}
+            onOpen={(hit) => {
+              setQuery("");
+              go({ kind: "channel", id: hit.channelId, thread: hit.threadId ?? undefined });
+            }}
+            onOlder={() => {
+              const needle = hitsNeedleRef.current;
+              const project = hitsProjectRef.current;
+              const oldest = hits[hits.length - 1]?.seq;
+              if (!needle || !project || !oldest) return;
+              api
+                .search(needle, project, oldest)
+                .then((page) => {
+                  if (hitsNeedleRef.current !== needle || hitsProjectRef.current !== project) return;
+                  setHits((cur) => [...cur, ...page.hits.filter((h) => !cur.some((x) => x.seq === h.seq))]);
+                  setHitsMore(page.hasMore);
+                })
+                .catch((e) => setErr(String(e.message || e)));
+            }}
+            onClear={() => setQuery("")}
+          />
         ) : sel.kind === "inbox" ? (
           <Inbox
             box={inboxBox}
@@ -1203,6 +1289,69 @@ function ChannelItem({
       <span>{ch.type === "dm" ? ch.name : `# ${ch.name}`}</span>
       {unread > 0 && <em>{unread}</em>}
     </button>
+  );
+}
+
+function SearchDesk({
+  hiveName,
+  q,
+  hits,
+  hasMore,
+  busy,
+  onOpen,
+  onOlder,
+  onClear,
+}: {
+  hiveName: string;
+  q: string;
+  hits: SearchHit[];
+  hasMore: boolean;
+  busy: boolean;
+  onOpen: (hit: SearchHit) => void;
+  onOlder: () => void;
+  onClear: () => void;
+}) {
+  return (
+    <>
+      <header className="desk-h">
+        <div>
+          <h1>Search</h1>
+          <p>
+            Messages in {hiveName} matching {q}. Body, seq, author, channel, mentions, files, and reactions. Other
+            hives stay hidden.
+          </p>
+        </div>
+        <button type="button" className="text-btn" onClick={onClear}>
+          Clear
+        </button>
+      </header>
+      <div className="stream">
+        {hits.length === 0 && !busy && <div className="empty">No messages match in this hive.</div>}
+        {busy && hits.length === 0 && <div className="empty">Searching…</div>}
+        {hits.map((hit) => {
+          const where = hit.channelType === "dm" ? hit.channelName : `#${hit.channelName}`;
+          return (
+            <button key={hit.seq} className="inbox-item" onClick={() => onOpen(hit)}>
+              <strong>
+                {hit.authorName}
+                <span className="seq"> #{hit.seq}</span>
+              </strong>
+              <p>{hit.body || (hit.attachments[0] ? hit.attachments.join(", ") : "(empty)")}</p>
+              <span className="open-link">
+                {where}
+                {hit.threadId ? " · thread" : ""}
+                {hit.reactions.length ? ` · ${hit.reactions.join("")}` : ""}
+              </span>
+            </button>
+          );
+        })}
+        {hasMore && (
+          <button type="button" className="older" onClick={onOlder}>
+            Older matches
+          </button>
+        )}
+      </div>
+    </>
   );
 }
 

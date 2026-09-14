@@ -432,6 +432,84 @@ test("Human can see brain-worker DMs and invite to private rooms", () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+test("search stays in one project and only rooms the actor can see", async () => {
+  const { hive, dir } = tempHive();
+  const human = hive.getAgent("human");
+  const chapter = hive.listProjects()[0]!;
+  const solace = hive.join({ role: "brain" });
+  const dowel = hive.join({ role: "worker", seniority: "senior" });
+  hive.createProject(human, { name: "Altro", slug: "altro" });
+  const atlas = hive.join({ role: "brain", project: "altro" });
+  const rivet = hive.join({ role: "worker", seniority: "mid", project: "altro" });
+  const secret = hive.createChannel(solace.agent, { name: "secret", type: "private", memberNames: [] });
+  hive.postMessage(solace.agent, { channel: "general", body: "oauth login on feat/login" });
+  hive.postMessage(solace.agent, { channel: "brains", body: "brain-only oauth note @Human" });
+  hive.postMessage(solace.agent, { channel: secret.id, body: "private oauth stash" });
+  const dm = hive.openDm(solace.agent, dowel.agent.name);
+  hive.postMessage(solace.agent, { channel: dm.id, body: "worker may see this oauth dm" });
+  const file = await hive.createFileFromBytes(human, {
+    name: "oauth-plan.txt",
+    mime: "text/plain",
+    bytes: new TextEncoder().encode("plan"),
+  });
+  const attached = hive.postMessage(human, { channel: "general", body: "file follows", attachmentIds: [file.id] });
+  hive.toggleReaction(solace.agent, attached.seq, "✅");
+  hive.postMessage(atlas.agent, { channel: "general", body: "altro oauth must not leak" });
+
+  const humanHits = hive.searchMessages(human, { q: "oauth", project: "chapter" });
+  assert.ok(humanHits.hits.some((h) => /feat\/login/.test(h.body)));
+  assert.ok(humanHits.hits.some((h) => h.channelName === "brains"));
+  assert.ok(humanHits.hits.some((h) => h.channelName === "secret"));
+  assert.equal(humanHits.hits.some((h) => /must not leak/.test(h.body)), false);
+
+  const brainHits = hive.searchMessages(solace.agent, { q: "oauth" });
+  assert.ok(brainHits.hits.some((h) => h.channelName === "brains"));
+  assert.equal(brainHits.hits.some((h) => /must not leak/.test(h.body)), false);
+  assert.throws(() => hive.searchMessages(solace.agent, { q: "oauth", project: "altro" }), /other projects/);
+
+  const workerHits = hive.searchMessages(dowel.agent, { q: "oauth" });
+  assert.ok(workerHits.hits.some((h) => /feat\/login/.test(h.body)));
+  assert.ok(workerHits.hits.some((h) => /oauth dm/.test(h.body)));
+  assert.equal(workerHits.hits.some((h) => h.channelName === "brains"), false);
+  assert.equal(workerHits.hits.some((h) => h.channelName === "secret"), false);
+  assert.throws(() => hive.searchMessages(dowel.agent, { q: "oauth", channel: "brains" }), /Cannot search/);
+
+  const fileHits = hive.searchMessages(dowel.agent, { q: "oauth-plan.txt" });
+  assert.ok(fileHits.hits.some((h) => h.seq === attached.seq));
+  const reactHits = hive.searchMessages(human, { q: "✅", project: "chapter" });
+  assert.ok(reactHits.hits.some((h) => h.seq === attached.seq));
+  const mentionHits = hive.searchMessages(solace.agent, { q: "Human" });
+  assert.ok(mentionHits.hits.some((h) => h.channelName === "brains"));
+  const seqHits = hive.searchMessages(human, { q: String(attached.seq), project: "chapter" });
+  assert.ok(seqHits.hits.some((h) => h.seq === attached.seq));
+  let lonely = hive.postMessage(human, { channel: "general", body: "no digits in this line" });
+  while (lonely.seq < 10) {
+    lonely = hive.postMessage(human, { channel: "general", body: "no digits in this line" });
+  }
+  const digit = String(lonely.seq)[0]!;
+  assert.equal(
+    hive.searchMessages(human, { q: digit, project: "chapter" }).hits.some((h) => h.seq === lonely.seq),
+    false,
+  );
+  const quoted = hive.searchMessages(human, { q: `"feat/login`, project: "chapter" });
+  assert.ok(quoted.hits.some((h) => /feat\/login/.test(h.body)));
+  const paged = hive.searchMessages(human, { q: "oauth", project: "chapter", limit: 1 });
+  assert.equal(paged.hits.length, 1);
+  assert.equal(paged.hasMore, true);
+  const next = hive.searchMessages(human, {
+    q: "oauth",
+    project: "chapter",
+    limit: 20,
+    beforeSeq: paged.hits[0]!.seq,
+  });
+  assert.ok(next.hits.every((h) => h.seq < paged.hits[0]!.seq));
+  const fromStart = hive.searchMessages(human, { q: "oauth", project: "chapter", beforeSeq: 0 });
+  assert.equal(fromStart.hits.length, hive.searchMessages(human, { q: "oauth", project: "chapter" }).hits.length);
+  assert.throws(() => hive.searchMessages(human, { q: "oauth" }), /Project required/);
+  assert.equal(hive.searchMessages(rivet.agent, { q: "oauth" }).hits.some((h) => /feat\/login/.test(h.body)), false);
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test("projects are isolated: roster, DM, mentions, wait, join cwd", async () => {
   const { hive, dir } = tempHive();
   const human = hive.getAgent("human");
@@ -493,7 +571,7 @@ test("Human can delete an idle project but not one with online or waiting agents
   ).run(-1003, 7, 2, "{}");
   hive.db.prepare("INSERT INTO telegram_state (key, value) VALUES (?, ?)").run("mute:-1003", "1");
   hive.db.prepare("INSERT INTO telegram_state (key, value) VALUES (?, ?)").run("offset", "9");
-  const chapterGeneral = hive.getChannel("general", hive.listProjects()[0]!.id);
+  const chapterGeneral = hive.getChannel("general", hive.getProjectBySlug("chapter").id);
   hive.postMessage(human, { channel: chapterGeneral.id, body: "chapter stays" });
   hive.deleteProject(human, "altro", { telegramChatId: -1003 });
   assert.equal(hive.listProjects().some((p) => p.slug === "altro"), false);

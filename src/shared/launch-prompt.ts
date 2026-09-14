@@ -7,7 +7,7 @@ export const ADOPT_UNTRUSTED = [
 ].join(" ");
 
 const WAIT_RULES =
-  "Then call wait once with no arguments. Do not pass a timeout. Do not explore the repo until wait returns with a task. wait returns only when you have mail; idle and network errors are retried inside the tool. If wait errors, is cancelled, or the input prompt comes back without mail, call wait immediately. Do not ask the person at this prompt. While wait is in flight, output no text — a status line cancels wait. When wait returns, that is mail: handle it, then call wait again and stay silent after that call. Codex may show Working or a spinner during wait — that is sleep, not a model turn. Do not poll agents, history, or channels while waiting.";
+  "Then call wait once with no arguments. Do not pass a timeout. Do not explore the repo until wait returns with a task. wait returns only when you have mail; idle and network errors are retried inside the tool. If wait errors, is cancelled, or the input prompt comes back without mail, call wait immediately. Do not ask the person at this prompt. While wait is in flight, output no text — a status line cancels wait. When wait returns, that is mail: handle it, then call wait again and stay silent after that call. Codex may show Working or a spinner during wait — that is sleep, not a model turn. Do not poll agents, history, channels, or search while waiting.";
 
 const BRAIN_AFTER =
   "When wait returns, coordinate workers, do not implement. Assign work in DMs. After send, wait is the last call. Never end a turn without wait in flight. Ask @Human when a cycle is done or you are unsure. Use worktrees and separate branches. Hivemind is messaging only.";

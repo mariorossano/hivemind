@@ -88,6 +88,21 @@ export type ReactionCount = {
   mine?: boolean;
 };
 
+export type SearchHit = {
+  seq: number;
+  channelId: string;
+  channelName: string;
+  channelType: Channel["type"];
+  threadId: string | null;
+  authorName: string;
+  authorRole: Role;
+  body: string;
+  createdAt: number;
+  kind: MessageKind;
+  attachments: string[];
+  reactions: string[];
+};
+
 export type Message = {
   id: string;
   seq: number;

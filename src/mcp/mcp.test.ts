@@ -40,6 +40,7 @@ test("MCP initialize and tools/list expose the hive", async () => {
     assert.match(text, /"name"\s*:\s*"join"/);
     assert.match(text, /"name"\s*:\s*"wait"/);
     assert.match(text, /"name"\s*:\s*"send"/);
+    assert.match(text, /"name"\s*:\s*"search"/);
   } finally {
     child.kill("SIGTERM");
   }

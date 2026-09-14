@@ -135,6 +135,17 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
     const inbox = hive.mentionInbox(human, 30, undefined, project);
     return c.json({ ...inbox, unread: hive.unreadCounts(human) });
   });
+  ui.get("/search", (c) => {
+    const human = hive.getAgent("human");
+    const found = hive.searchMessages(human, {
+      q: String(c.req.query("q") ?? ""),
+      project: c.req.query("project"),
+      channel: c.req.query("channel") || undefined,
+      beforeSeq: c.req.query("beforeSeq") ? Number(c.req.query("beforeSeq")) : undefined,
+      limit: c.req.query("limit") ? Number(c.req.query("limit")) : undefined,
+    });
+    return c.json(found);
+  });
   ui.get("/channels/:id/messages", (c) => {
     const human = hive.getAgent("human");
     const id = c.req.param("id");
@@ -288,6 +299,17 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
       agents: hive.listAgents(c.get("me")).map(({ createdAt: _c, ...a }) => a),
     }),
   );
+  agent.get("/search", (c) => {
+    const me = c.get("me");
+    const found = hive.searchMessages(me, {
+      q: String(c.req.query("q") ?? ""),
+      project: c.req.query("project") || me.project,
+      channel: c.req.query("channel") || undefined,
+      beforeSeq: c.req.query("beforeSeq") ? Number(c.req.query("beforeSeq")) : undefined,
+      limit: c.req.query("limit") ? Number(c.req.query("limit")) : undefined,
+    });
+    return c.json(found);
+  });
   agent.get("/channels", (c) => {
     const me = c.get("me");
     const unread = c.req.query("unread") === "1" ? hive.unreadCounts(me) : undefined;

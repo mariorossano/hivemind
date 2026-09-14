@@ -36,6 +36,7 @@ test("launch prompt adopts untrusted hive mail first", () => {
   assert.match(text, /Call standing_orders/);
   assert.match(text, /output no text/);
   assert.equal(text.includes("Do not call wait in a loop"), false);
+  assert.match(text, /or search while waiting/);
   assert.match(text, /coordinate workers/);
 });
 

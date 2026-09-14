@@ -22,6 +22,7 @@ import {
   type ControlAction,
   type Message,
   type Project,
+  type SearchHit,
   type ReactionCount,
   type Role,
   type Seniority,
@@ -30,6 +31,7 @@ import {
   type WaitResult,
 } from "../shared/types.ts";
 import { canonicalWorktree, parseProjectSlug, resolveJoinProject } from "../shared/project.ts";
+import { clampSearchLimit, likeNeedle, parseSearchQuery, snippetAround } from "../shared/search-query.ts";
 import { pickName } from "./names.ts";
 import { hiveHome } from "./paths.ts";
 import { packWait } from "./wait-format.ts";
@@ -1099,6 +1101,118 @@ export class Hive {
         ).get(ch.id) as { n: number };
     const oldest = messages[0]?.seq ?? 0;
     return { messages, hasOlder: Boolean(oldest && scope.n && scope.n < oldest) };
+  }
+
+  searchMessages(
+    actor: Agent,
+    input: { q: string; project?: string | null; channel?: string | null; beforeSeq?: number; limit?: number },
+  ): { hits: SearchHit[]; hasMore: boolean } {
+    const tokens = parseSearchQuery(input.q ?? "");
+    if (tokens.length === 0) throw new HiveError(400, "Search needs a query");
+    const project = this.searchProject(actor, input.project);
+    let rooms = this.listChannels(actor).filter((ch) => ch.projectId === project.id);
+    if (input.channel) {
+      const ch = this.getChannel(input.channel, project.id);
+      if (!this.canSeeChannel(actor, ch) || ch.projectId !== project.id) {
+        throw new HiveError(403, "Cannot search this channel");
+      }
+      rooms = [ch];
+    }
+    if (rooms.length === 0) return { hits: [], hasMore: false };
+    const limit = clampSearchLimit(input.limit);
+    const before =
+      Number.isFinite(input.beforeSeq) && Number(input.beforeSeq) > 0
+        ? Number(input.beforeSeq)
+        : Number.MAX_SAFE_INTEGER;
+    const roomIds = rooms.map((ch) => ch.id);
+    const roomPh = roomIds.map(() => "?").join(",");
+    const params: Array<string | number> = [project.id, ...roomIds, before];
+    const tokenSql = tokens.map((token) => {
+      const like = likeNeedle(token);
+      params.push(like, like, like, like, like, like);
+      let extra = "";
+      if (/^\d+$/.test(token)) {
+        extra = " OR m.seq = ?";
+        params.push(Number(token));
+      }
+      return `(
+        m.body LIKE ? ESCAPE '\\'
+        OR a.name LIKE ? ESCAPE '\\'
+        OR c.name LIKE ? ESCAPE '\\'
+        OR EXISTS (SELECT 1 FROM attachments att WHERE att.message_id = m.id AND att.name LIKE ? ESCAPE '\\')
+        OR EXISTS (SELECT 1 FROM reactions r WHERE r.message_id = m.id AND r.emoji LIKE ? ESCAPE '\\')
+        OR EXISTS (
+          SELECT 1 FROM agents ma
+          WHERE instr(m.mentions, ma.id) > 0 AND ma.name LIKE ? ESCAPE '\\'
+        )
+        ${extra}
+      )`;
+    });
+    params.push(limit + 1);
+    const rows = this.db.prepare(
+      `SELECT m.id
+       FROM messages m
+       JOIN channels c ON c.id = m.channel_id
+       JOIN agents a ON a.id = m.author_id
+       WHERE c.project_id = ?
+         AND c.id IN (${roomPh})
+         AND m.seq < ?
+         AND ${tokenSql.join(" AND ")}
+       ORDER BY m.seq DESC
+       LIMIT ?`,
+    ).all(...params) as { id: string }[];
+    const hasMore = rows.length > limit;
+    const page = rows.slice(0, limit);
+    const messages = this.loadMessagesByIds(
+      page.map((row) => row.id),
+      actor.id,
+    );
+    const byId = new Map(rooms.map((ch) => [ch.id, ch]));
+    return {
+      hasMore,
+      hits: messages.map((msg) => {
+        const ch = byId.get(msg.channelId) ?? this.getChannel(msg.channelId);
+        return {
+          seq: msg.seq,
+          channelId: msg.channelId,
+          channelName: ch.name,
+          channelType: ch.type,
+          threadId: msg.threadId,
+          authorName: msg.authorName,
+          authorRole: msg.authorRole,
+          body: snippetAround(msg.body, tokens),
+          createdAt: msg.createdAt,
+          kind: msg.kind,
+          attachments: (msg.attachments ?? []).map((a) => a.name),
+          reactions: [...new Set((msg.reactions ?? []).map((r) => r.emoji))],
+        };
+      }),
+    };
+  }
+
+  private searchProject(actor: Agent, slug?: string | null): Project {
+    if (actor.role === "human") {
+      if (!slug) throw new HiveError(400, "Project required");
+      return this.getProjectBySlug(slug);
+    }
+    if (slug) {
+      const wanted = this.getProjectBySlug(slug);
+      if (wanted.id !== actor.projectId) throw new HiveError(403, "You cannot see other projects");
+      return wanted;
+    }
+    if (actor.projectId) return this.getProject(actor.projectId);
+    throw new HiveError(400, "Join a project first");
+  }
+
+  private loadMessagesByIds(ids: string[], actorId: string): Message[] {
+    if (ids.length === 0) return [];
+    const ph = ids.map(() => "?").join(",");
+    const rows = this.db.prepare(`SELECT * FROM messages WHERE id IN (${ph})`).all(...ids) as MessageRow[];
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    return this.decorate(
+      ids.map((id) => byId.get(id)).filter((row): row is MessageRow => Boolean(row)).map((row) => this.mapMessage(row)),
+      actorId,
+    );
   }
 
   threadsInChannel(channelId: string): Thread[] {

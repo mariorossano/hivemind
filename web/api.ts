@@ -1,4 +1,4 @@
-import type { Agent, AttachmentMeta, Channel, Message, Project, Thread, ThreadStatus } from "../src/shared/types.ts";
+import type { Agent, AttachmentMeta, Channel, Message, Project, SearchHit, Thread, ThreadStatus } from "../src/shared/types.ts";
 import { resolveUploadMime } from "../src/shared/mime.ts";
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
@@ -76,6 +76,12 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(body),
     }),
+  search: (q: string, project: string, beforeSeq?: number, limit?: number, signal?: AbortSignal) => {
+    const params = new URLSearchParams({ q, project });
+    if (beforeSeq) params.set("beforeSeq", String(beforeSeq));
+    if (limit) params.set("limit", String(limit));
+    return req<{ hits: SearchHit[]; hasMore: boolean }>(`/api/ui/search?${params}`, { signal });
+  },
   messages: (id: string, threadId?: string | null, beforeSeq?: number) => {
     const q = new URLSearchParams();
     if (threadId) q.set("threadId", threadId);

@@ -134,6 +134,18 @@ test("HTTP protocol: join, isolate, wait, Human admin", async () => {
     );
     assert.ok(withMeta.data.threads);
 
+    await json(base, "POST", "/api/agent/channels/brains/messages", { body: "oauth secret for brains" }, brainTok);
+    const uiSearch = await json(base, "GET", "/api/ui/search?q=oauth&project=chapter");
+    assert.equal(uiSearch.status, 200);
+    assert.ok(uiSearch.data.hits.some((h: { body: string }) => /oauth secret/.test(h.body)));
+    const workerSearch = await json(base, "GET", "/api/agent/search?q=oauth", undefined, workerTok);
+    assert.equal(workerSearch.status, 200);
+    assert.equal(workerSearch.data.hits.some((h: { body: string }) => /oauth secret/.test(h.body)), false);
+    const workerBrains = await json(base, "GET", "/api/agent/search?q=oauth&channel=brains", undefined, workerTok);
+    assert.equal(workerBrains.status, 403);
+    const noProject = await json(base, "GET", "/api/ui/search?q=oauth");
+    assert.equal(noProject.status, 400);
+
     const humanDm = await json(base, "POST", "/api/ui/dms", { name: workerName });
     await json(base, "POST", `/api/ui/channels/${humanDm.data.channel.id}/messages`, {
       body: "Human override: use the existing settings component",
