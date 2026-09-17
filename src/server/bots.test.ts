@@ -70,6 +70,123 @@ test("bots cannot assume agent roles, receive assignments or perform agent opera
   await assert.rejects(hive.wait(bot.bot, 1), /Bots/);
 });
 
+test('lost bot creation response is recoverable without replacing its identity or dedup history', async t => {
+  const ctx = setup(t), { hive, human, channel } = ctx, app = createApp(hive);
+  const created = await app.request(`/api/ui/projects/${channel.projectId}/bots`, { method: 'POST',
+    headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: 'LostResponseBot' }) });
+  assert.equal(created.status, 201); // Simulate a client never receiving this body.
+  const lostToken = (await created.json() as { token: string }).token;
+  const found = hive.listAgents(human).find(a => a.name === 'LostResponseBot')!;
+  hive.invite(human, channel.id, [found.name]);
+  const file = await upload(hive, found);
+  const input = { eventId: 'preserve-history', body: 'Synthetic observation', attachmentIds: [file.id] };
+  const message = hive.postBotMessage(found, channel.id, input).message;
+  const beforeMembership = hive.getChannel(channel.id).memberIds;
+  const endpoint = `/api/ui/projects/${channel.projectId}/bots/${found.id}/credential`;
+  const status = await app.request(endpoint);
+  assert.equal(status.status, 200);
+  assert.deepEqual((await status.json() as { credential: unknown }).credential, { revision: 1, revoked: false });
+  const response = await app.request(endpoint, { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ action: 'rotate', expectedRevision: 1 }) });
+  assert.equal(response.status, 200); assert.equal(response.headers.get('cache-control'), 'no-store');
+  const rotated = await response.json() as { token: string; bot: Agent; credential: { revision: number } };
+  assert.equal(rotated.bot.id, found.id); assert.notEqual(rotated.token, lostToken);
+  assert.equal(rotated.credential.revision, 2);
+  assert.throws(() => hive.agentByToken(lostToken), /Invalid token/);
+  assert.deepEqual(hive.getChannel(channel.id).memberIds, beforeMembership);
+  ctx.reopen(); const after = ctx.hive;
+  assert.equal(after.agentByToken(rotated.token).id, found.id);
+  const retry = after.postBotMessage(after.agentByToken(rotated.token), channel.id, input);
+  assert.equal(retry.duplicate, true); assert.equal(retry.message.id, message.id);
+  assert.equal(retry.message.attachments![0]!.id, file.id);
+  const snapshot = await createApp(after).request('/api/ui/snapshot');
+  const text = await snapshot.text(); assert.ok(!text.includes(rotated.token)); assert.ok(!text.includes(lostToken));
+  const publicStatus = await createApp(after).request(endpoint);
+  assert.ok(!(await publicStatus.text()).includes(rotated.token));
+});
+
+test('bot credential rotation/revocation is Human-only, bot-specific and revision fenced', t => {
+  const ctx = setup(t), { hive, human, bot, brain, channel } = ctx;
+  const action = { action: 'rotate', expectedRevision: 1 };
+  for (const actor of [brain.agent, bot.bot, hive.join({ role: 'worker', seniority: 'mid' }).agent]) {
+    assert.throws(() => hive.changeBotCredential(actor, channel.projectId, bot.bot.id, action), /Only Human/);
+    assert.throws(() => hive.botCredential(actor, channel.projectId, bot.bot.id), /Only Human/);
+  }
+  for (const target of [human.id, brain.agent.id])
+    assert.throws(() => hive.changeBotCredential(human, channel.projectId, target, action), /Bot not found/);
+  const other = hive.createProject(human, { name: 'Other fixture', slug: 'other-fixture' });
+  assert.throws(() => hive.changeBotCredential(human, other.id, bot.bot.id, action), /Bot not found/);
+  for (const raw of [null, {}, { action: 'delete', expectedRevision: 1 }, { ...action, expectedRevision: 0 }, { ...action, token: 'forged' }])
+    assert.throws(() => hive.changeBotCredential(human, channel.projectId, bot.bot.id, raw), /Invalid credential/);
+  const rotated = hive.changeBotCredential(human, channel.projectId, bot.bot.id, action);
+  assert.throws(() => hive.changeBotCredential(human, channel.projectId, bot.bot.id, action), /changed/);
+  assert.equal(hive.agentByToken(rotated.token!).id, bot.bot.id);
+  const revoked = hive.changeBotCredential(human, channel.projectId, bot.bot.id, { action: 'revoke', expectedRevision: 2 });
+  assert.equal(revoked.token, undefined); assert.deepEqual(revoked.credential, { revision: 3, revoked: true });
+  assert.throws(() => hive.agentByToken(rotated.token!), /Invalid token/);
+  assert.throws(() => hive.agentByToken(bot.token), /Invalid token/);
+  assert.equal(hive.agentByToken(brain.token).id, brain.agent.id);
+  ctx.reopen();
+  assert.deepEqual(ctx.hive.botCredential(human, channel.projectId, bot.bot.id).credential, { revision: 3, revoked: true });
+  const restored = ctx.hive.changeBotCredential(human, channel.projectId, bot.bot.id, { action: 'rotate', expectedRevision: 3 });
+  assert.equal(ctx.hive.agentByToken(restored.token!).id, bot.bot.id);
+  assert.equal(restored.credential.revoked, false);
+});
+
+test('lost rotation response requires an explicit fresh revision, and old tokens cannot post or upload', async t => {
+  const { hive, human, bot, channel } = setup(t), app = createApp(hive);
+  const endpoint = `/api/ui/projects/${channel.projectId}/bots/${bot.bot.id}/credential`;
+  const rotate = (revision: number) => app.request(endpoint, { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ action: 'rotate', expectedRevision: revision }) });
+  const lost = await rotate(1), unknown = await lost.json() as { token: string };
+  assert.equal((await rotate(1)).status, 409);
+  const revision = hive.botCredential(human, channel.projectId, bot.bot.id).credential.revision;
+  const recovered = await (await rotate(revision)).json() as { token: string };
+  for (const token of [bot.token, unknown.token]) {
+    for (const route of [`/api/bot/channels/${channel.id}/messages`, '/api/bot/files']) {
+      const response = await app.request(route, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ eventId: 'stale', body: 'Must not publish' }) });
+      assert.equal(response.status, 401);
+    }
+  }
+  assert.equal(hive.agentByToken(recovered.token).id, bot.bot.id);
+});
+
+test('credential update is atomic and migration preserves legacy bot tokens', t => {
+  const ctx = setup(t), { hive, human, bot, channel } = ctx;
+  hive.db.exec('DROP TABLE bot_credentials'); ctx.reopen();
+  assert.equal(ctx.hive.agentByToken(bot.token).id, bot.bot.id);
+  assert.deepEqual(ctx.hive.botCredential(human, channel.projectId, bot.bot.id).credential, { revision: 1, revoked: false });
+  ctx.hive.db.exec("CREATE TRIGGER fail_credential BEFORE INSERT ON bot_credentials BEGIN SELECT RAISE(ABORT, 'fixture storage failure'); END");
+  assert.throws(() => ctx.hive.changeBotCredential(human, channel.projectId, bot.bot.id, { action: 'rotate', expectedRevision: 1 }), /fixture storage failure/);
+  assert.equal(ctx.hive.agentByToken(bot.token).id, bot.bot.id);
+  assert.equal(ctx.hive.botCredential(human, channel.projectId, bot.bot.id).credential.revision, 1);
+  ctx.hive.db.exec('DROP TRIGGER fail_credential');
+  const rotated = ctx.hive.changeBotCredential(human, channel.projectId, bot.bot.id, { action: 'rotate', expectedRevision: 1 });
+  ctx.hive.db.exec("CREATE TRIGGER fail_credential_update BEFORE UPDATE ON bot_credentials BEGIN SELECT RAISE(ABORT, 'fixture update failure'); END");
+  assert.throws(() => ctx.hive.changeBotCredential(human, channel.projectId, bot.bot.id, { action: 'revoke', expectedRevision: 2 }), /fixture update failure/);
+  assert.equal(ctx.hive.agentByToken(rotated.token!).id, bot.bot.id);
+  assert.deepEqual(ctx.hive.botCredential(human, channel.projectId, bot.bot.id).credential, { revision: 2, revoked: false });
+});
+
+test('concurrent credential operations have one winner and leave other bots untouched', async t => {
+  const { hive, human, bot, channel } = setup(t), app = createApp(hive);
+  const other = hive.createBot(human, channel.projectId, { name: 'OtherFeed' });
+  const endpoint = `/api/ui/projects/${channel.projectId}/bots/${bot.bot.id}/credential`;
+  const responses = await Promise.all(['rotate', 'rotate'].map(action => app.request(endpoint, { method: 'POST',
+    headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action, expectedRevision: 1 }) })));
+  assert.deepEqual(responses.map(r => r.status).sort(), [200, 409]);
+  const success = await responses.find(r => r.status === 200)!.json() as { token: string };
+  assert.equal(hive.agentByToken(success.token).id, bot.bot.id);
+  assert.equal(hive.agentByToken(other.token).id, other.bot.id);
+  const status = await app.request(endpoint); assert.equal(status.headers.get('cache-control'), 'no-store');
+  assert.equal((await status.json() as { credential: { revision: number } }).credential.revision, 2);
+  assert.equal((await app.request(endpoint, { method: 'POST', body: 'invalid json' })).status, 400);
+  assert.equal(hive.agentByToken(success.token).id, bot.bot.id);
+  assert.match(String(hive.db.prepare('SELECT token_hash FROM agents WHERE id=?').get(bot.bot.id)!.token_hash), /^[a-f0-9]{64}$/);
+  assert.deepEqual(hive.db.prepare('PRAGMA foreign_key_check').all(), []);
+});
+
 test("bot destinations require an explicit invite and stay within one project", (t) => {
   const { hive, human, bot, brain, channel } = setup(t);
   const publicRoom = hive.createChannel(human, { name: "public-room", type: "public", project: "chapter" });
@@ -308,8 +425,12 @@ test("bot context instructions do not switch the brain to direct implementation"
 test("project deletion cleans bot events and the bot identity", (t) => {
   const { hive, human, channel, bot, brain } = setup(t);
   hive.postBotMessage(bot.bot, channel.id, { eventId: "1", body: "fixture" });
+  const rotated = hive.changeBotCredential(human, channel.projectId, bot.bot.id, { action: 'rotate', expectedRevision: 1 });
+  assert.equal(hive.db.prepare('SELECT COUNT(*) AS n FROM bot_credentials').get()!.n, 1);
   hive.setOffline(brain.agent.id);
   hive.deleteProject(human, channel.project);
   assert.equal(hive.db.prepare("SELECT COUNT(*) AS n FROM bot_events").get()!.n, 0);
   assert.throws(() => hive.agentByToken(bot.token), /Invalid token/);
+  assert.throws(() => hive.agentByToken(rotated.token!), /Invalid token/);
+  assert.equal(hive.db.prepare('SELECT COUNT(*) AS n FROM bot_credentials').get()!.n, 0);
 });

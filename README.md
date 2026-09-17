@@ -9,7 +9,7 @@ The process binds `127.0.0.1` only. There is no account auth on the HTTP API.
 - **Human** — you, in the web UI (and optionally Telegram). You set goals, resolve doubts, and see every conversation (admin).
 - **brain** — coordinate, dispatch, prepare prompts, ask Human. Multiple brains talk on `#brains`.
 - **worker** — execute. Seniority is `junior` | `mid` | `senior` (set at join; it cannot change). Workers talk to brains, can read public channels, and cannot open a DM with Human or mention `@Human`. If Human writes to them, they may reply.
-- **bot** — a non-model integration that publishes observations to explicitly invited channels within its project. No tasks, DMs or `@mentions` to bots. Create one with **+** in the sidebar's **bot** section, then **Invite** it to a channel. See [Bot protocol](BOT-PROTOCOL.md).
+- **bot** — a non-model integration that publishes observations to explicitly invited channels within its project. No tasks, DMs or `@mentions` to bots. Create one with **+** in the sidebar's **bot** section, then **Invite** it to a channel. Human can use **Credentials** beside the bot to rotate a lost token or revoke access without deleting its identity or history. See [Bot protocol](BOT-PROTOCOL.md).
 
 Optional `--focus frontend` (or review, mobile, …) is a label, not a rank for brains and workers.
 

@@ -35,6 +35,7 @@ test("direct bot HTTP → real stdio MCP delivers deduplicated context/files, th
   try {
     await client.connect(transport);
     const tools = await client.listTools();
+    assert.ok(!tools.tools.some(t => /credential|rotate_bot|revoke_bot/.test(t.name)), 'Credential management belongs to the Human UI, not MCP agents');
     await call("join", { role: "brain", project: "chapter" });
     const brain = hive.listAgents().find((agent) => agent.role === "brain") as Agent;
     assert.ok(brain);
@@ -52,14 +53,27 @@ test("direct bot HTTP → real stdio MCP delivers deduplicated context/files, th
     const attachment = await uploaded.json() as { file: { id: string } };
     const event = { eventId: 'one', body: 'An invented update', threadId: thread.id,
       origin: { label: 'Generic source', author: 'Fixture author' }, attachmentIds: [attachment.file.id] };
-    const send = () => fetch(url + '/api/bot/channels/' + channel.id + '/messages', {
-      method: 'POST', headers: { Authorization: 'Bearer ' + bot.token, 'Content-Type': 'application/json' }, body: JSON.stringify(event),
+    const send = (token = bot.token) => fetch(url + '/api/bot/channels/' + channel.id + '/messages', {
+      method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify(event),
     });
     const sent = await send(); assert.equal(sent.status, 201);
     const first = await sent.json() as { message: Message };
     const retry = await send(); assert.equal(retry.status, 200);
     const repeated = await retry.json() as { message: Message; duplicate: boolean };
     assert.equal(repeated.duplicate, true); assert.equal(repeated.message.id, first.message.id);
+    const credentialUrl = `${url}/api/ui/projects/${channel.projectId}/bots/${bot.bot.id}/credential`;
+    const change = (action: 'rotate' | 'revoke', expectedRevision: number) => fetch(credentialUrl, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action, expectedRevision }),
+    });
+    const rotatedResponse = await change('rotate', 1); assert.equal(rotatedResponse.status, 200);
+    const rotated = await rotatedResponse.json() as { token: string };
+    assert.equal((await send()).status, 401);
+    assert.equal((await send(rotated.token)).status, 200);
+    assert.equal((await change('revoke', 2)).status, 200);
+    assert.equal((await send(rotated.token)).status, 401);
+    const restored = await (await change('rotate', 3)).json() as { token: string };
+    const same = await (await send(restored.token)).json() as { message: Message; duplicate: boolean };
+    assert.equal(same.duplicate, true); assert.equal(same.message.id, first.message.id);
     const mail = await call<WaitResult>("wait");
     assert.equal(mail.mail!.filter(entry => entry.botEvent?.eventId === 'one').length, 1);
     const observation = mail.mail!.find((entry) => entry.botEvent?.eventId === "one")!;
@@ -67,6 +81,7 @@ test("direct bot HTTP → real stdio MCP delivers deduplicated context/files, th
     const file = observation.attachments![0]!;
     assert.equal(file.name, "notes.txt");
     assert.equal(JSON.stringify(mail).includes("invented attachment contents"), false);
+    for (const token of [bot.token, rotated.token, restored.token]) assert.ok(!JSON.stringify(mail).includes(token));
     const history = await call<{ messages: Message[] }>("history", { channel: channel.id, threadId: thread.id });
     assert.equal(history.messages.find((m) => m.authorRole === "bot")?.botEvent?.origin?.label, "Generic source");
     const fetched = await call<{ path: string; mime: string }>("fetch_file", { id: file.id });

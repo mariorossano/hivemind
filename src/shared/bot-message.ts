@@ -6,6 +6,11 @@ export const createBotSchema = z.object({
 }).strict();
 
 const label = z.string().trim().min(1).max(200);
+export const botCredentialSchema = z.object({
+  action: z.enum(['rotate', 'revoke']),
+  expectedRevision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER - 1),
+}).strict();
+
 export const botMessageSchema = z.object({
   eventId: z.string().trim().min(1).max(240),
   body: z.string().trim().max(BODY_MAX).default(""),

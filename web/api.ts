@@ -1,4 +1,4 @@
-import type { Agent, AttachmentMeta, Channel, Message, Project, SearchHit, Thread, ThreadStatus } from "../src/shared/types.ts";
+import type { Agent, BotCredentialView, AttachmentMeta, Channel, Message, Project, SearchHit, Thread, ThreadStatus } from "../src/shared/types.ts";
 import { resolveUploadMime } from "../src/shared/mime.ts";
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
@@ -41,6 +41,11 @@ export type ChannelPayload = {
 };
 
 export const api = {
+  botCredential: (project: string, bot: string) => req<BotCredentialView>(
+    `/api/ui/projects/${encodeURIComponent(project)}/bots/${encodeURIComponent(bot)}/credential`),
+  changeBotCredential: (project: string, bot: string, action: 'rotate' | 'revoke', expectedRevision: number) =>
+    req<BotCredentialView & { token?: string }>(`/api/ui/projects/${encodeURIComponent(project)}/bots/${encodeURIComponent(bot)}/credential`,
+      { method: 'POST', body: JSON.stringify({ action, expectedRevision }) }),
   createBot: (projectId: string, name: string) => req<{ bot: Agent; token: string }>(
     `/api/ui/projects/${encodeURIComponent(projectId)}/bots`, { method: "POST", body: JSON.stringify({ name }) },
   ),

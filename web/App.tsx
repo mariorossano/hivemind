@@ -4,7 +4,7 @@ import { REACTION_EMOJIS } from "../src/shared/types.ts";
 import { isLiveSearchQuery, parseSearchQuery } from "../src/shared/search-query.ts";
 import { api, connectWs, type ChannelPayload, type Snapshot, type TelegramSettings } from "./api.ts";
 import { LaunchSheet } from "./LaunchSheet.tsx";
-import { BotOrigin, BotSetup } from "./Bots.tsx";
+import { BotOrigin, BotSetup, BotCredentials } from "./Bots.tsx";
 import { loadMailLog, mergeMailLog, saveMailLog } from "./mail-log.ts";
 import { renderBody } from "./markdown.tsx";
 
@@ -141,6 +141,8 @@ export function App() {
   const [inviteNames, setInviteNames] = useState<string[]>([]);
   const [botProject, setBotProject] = useState<string | null>(null);
   const [botBusy, setBotBusy] = useState(false);
+  const [credentialBot, setCredentialBot] = useState<Agent | null>(null);
+  const [credentialBusy, setCredentialBusy] = useState(false);
   const [confirmClear, setConfirmClear] = useState<string | null>(null);
   const [helpOpen, setHelpOpen] = useState(false);
   const [launchOpen, setLaunchOpen] = useState(false);
@@ -689,6 +691,7 @@ export function App() {
                       agents={hiveAgents}
                       projectName={project.name}
                       onCreateBot={() => setBotProject(project.id)}
+                      onManageBot={setCredentialBot}
                       queued={snap.queued ?? {}}
                       onOpen={onAgent}
                       confirmClear={confirmClear}
@@ -983,6 +986,14 @@ export function App() {
           </div>
         </div>
       )}
+
+      {credentialBot && snap.agents.some(a => a.id === credentialBot.id) && <div className="modal">
+        <div className="sheet" role="dialog" aria-modal="true" aria-label="Manage bot credentials">
+          <h2>Bot credentials</h2>
+          <BotCredentials key={credentialBot.id} bot={credentialBot} onBusy={setCredentialBusy} />
+          <div className="row"><button type="button" disabled={credentialBusy} onClick={() => setCredentialBot(null)}>Close</button></div>
+        </div>
+      </div>}
 
       {inviteOpen && activeChannel && (
         <div className="modal" onClick={() => setInviteOpen(false)}>
@@ -1748,6 +1759,7 @@ export function AgentList({
   agents,
   projectName,
   onCreateBot,
+  onManageBot,
   queued,
   onOpen,
   confirmClear,
@@ -1757,6 +1769,7 @@ export function AgentList({
   agents: Agent[];
   projectName: string;
   onCreateBot: () => void;
+  onManageBot?: (a: Agent) => void;
   queued: Record<string, number>;
   onOpen: (a: Agent) => void;
   confirmClear: string | null;
@@ -1794,7 +1807,10 @@ export function AgentList({
         <button type="button" className="plus" title={`Create bot in ${projectName}`}
           aria-label={`Create bot in ${projectName}`} onClick={onCreateBot}>+</button>
       </div>
-      {bots.map((a) => <PersonRow key={a.id} agent={a} onOpen={() => undefined} self />)}
+      {bots.map((a) => <div key={a.id}>
+        <PersonRow agent={a} onOpen={() => undefined} self />
+        {onManageBot && <button type="button" aria-label={`Manage credentials for ${a.name}`} onClick={() => onManageBot(a)}>Credentials</button>}
+      </div>)}
       {brains.length + workers.length === 0 && (
         <p className="empty-mini">
           Open Codex, Claude, or Cursor, then <code>hivemind join --as brain</code> or{" "}

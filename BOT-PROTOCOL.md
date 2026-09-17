@@ -9,7 +9,7 @@ There are no provider-specific SDKs or commands in this protocol.
 
 Human selects **+** in the project's **bot · context only** sidebar section, chooses
 a unique name and saves the returned token privately. New bots have no channel memberships.
-The token is returned only on creation; the database stores its hash, not the token.
+The token is returned only on creation or rotation; the database stores its hash, not the token.
 Closing the creation panel clears its displayed credential. It is not saved in browser storage.
 
 Equivalent local Human API:
@@ -31,6 +31,52 @@ Creating a public channel does not automatically enroll existing bots.
 Bots remain visible and invitable but do not appear in `@` suggestions. A manually typed
 `@BotName` remains text, not a registered recipient. Bots cannot join agent sessions,
 receive tasks, open DMs, invite others, create channels or change thread status.
+
+## Recover, rotate or revoke a credential
+
+Human opens **Credentials** beside a bot in the sidebar. **Rotate token** and
+**Revoke token** require confirmation. Rotation returns a fresh secret once and
+invalidates the old one; revocation leaves no usable credential. The bot identity,
+name, channel invitations, attachment ownership and event deduplication history
+are retained. Another rotation can reactivate a revoked bot. Other bots and agent
+credentials are unaffected. These actions do not delete observations, stop the
+external integration process, or update its configuration: store the replacement
+token privately there. Requests already authenticated/in flight may still finish;
+revocation does not undo previously accepted work.
+
+Read state (never a token), then submit an explicit versioned operation:
+
+```http
+GET /api/ui/projects/:projectIdOrSlug/bots/:botId/credential
+```
+
+Returns `{ "bot": { ... }, "credential": { "revision": 1, "revoked": false } }`.
+
+```http
+POST /api/ui/projects/:projectIdOrSlug/bots/:botId/credential
+Content-Type: application/json
+
+{"action":"rotate","expectedRevision":1}
+```
+
+Use `"revoke"` to invalidate without replacement. Success returns HTTP 200 with
+the bot and new credential revision/state; **only rotation** includes `token`.
+Responses use `Cache-Control: no-store`. Revision mismatch is 409; invalid input
+400; a missing/non-bot/out-of-project target is 404. State defaults to revision 1
+for existing bots without changing their tokens on migration.
+
+If creation's response is lost, reload the roster, locate the existing name and
+rotate that bot. Do not delete/recreate it or rename it just to obtain a token.
+If a rotation response is lost, **do not blindly retry**: the old expectedRevision
+cannot rotate again. Reload state; the raw replacement cannot be retrieved. Confirm
+a new rotation using the latest revision to invalidate that unknown secret and get
+a new one. After an uncertain revocation, reload state to see whether it is revoked.
+The UI disables further mutations until it reloads after an error. Concurrent/stale
+panels cannot revoke or replace a newer credential without reconciling first.
+
+These operations are on the existing local Human UI API, not bot/agent ingress or
+MCP tools. They inherit the local-trust boundary below; they do not add account
+authentication or isolate an untrusted process that can reach the Human API.
 
 ## Post an observation
 
@@ -112,5 +158,6 @@ processing it can still consume tokens. Bot messages do not change brain/worker 
 
 Run `npm run typecheck`, `npm test`, `npm run test:ui` and `npm run build`.
 Tests use isolated temporary databases and invented inputs, including real local HTTP →
-stdio MCP delivery and explicit attachment retrieval. UI tests check React static rendering;
-they do not replace a browser interaction test. No external source or model is required.
+stdio MCP delivery across rotation/revocation and explicit attachment retrieval.
+UI tests include mounted React/API recovery and confirmation flows as well as static
+rendering; they do not replace a native-browser test. No external source or model is required.

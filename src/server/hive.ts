@@ -17,6 +17,7 @@ import {
   WAIT_MAIL_CAP,
   type Agent,
   type BotEvent,
+  type BotCredentialView,
   type AttachmentMeta,
   type Channel,
   type ChannelType,
@@ -36,7 +37,7 @@ import { clampSearchLimit, likeNeedle, parseSearchQuery, snippetAround } from ".
 import { pickName } from "./names.ts";
 import { hiveHome } from "./paths.ts";
 import { packWait } from "./wait-format.ts";
-import { botMessageSchema, createBotSchema } from "../shared/bot-message.ts";
+import { botMessageSchema, createBotSchema, botCredentialSchema } from "../shared/bot-message.ts";
 import { assertAllowedMime, commitUpload, openBlob, removeOrphanBlobs, streamUpload } from "./files.ts";
 
 export { hiveHome } from "./paths.ts";
@@ -232,6 +233,12 @@ export class Hive {
         payload TEXT NOT NULL
       );
     `);
+    // Legacy bots have revision 1 and keep their existing token hash. A row is
+    // needed only after the first credential change; no raw token is stored.
+    this.db.exec(`CREATE TABLE IF NOT EXISTS bot_credentials (
+      bot_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+      revision INTEGER NOT NULL, revoked INTEGER NOT NULL
+    )`);
   }
 
   private tableSql(name: string): string {
@@ -943,6 +950,34 @@ export class Hive {
     const bot = this.getAgent(id);
     this.bus.emit("agent", bot);
     return { bot, token };
+  }
+
+  botCredential(actor: Agent, projectRef: string, botId: string): BotCredentialView {
+    if (actor.role !== 'human') throw new HiveError(403, 'Only Human can manage bot credentials');
+    const project = this.requireActorProject(actor, projectRef), bot = this.getAgent(botId);
+    if (bot.role !== 'bot' || bot.projectId !== project.id) throw new HiveError(404, 'Bot not found in this project');
+    const row = this.db.prepare('SELECT revision, revoked FROM bot_credentials WHERE bot_id=?').get(bot.id);
+    return { bot, credential: { revision: row ? Number(row.revision) : 1, revoked: Boolean(row?.revoked) } };
+  }
+
+  changeBotCredential(actor: Agent, projectRef: string, botId: string, raw: unknown): BotCredentialView & { token?: string } {
+    if (actor.role !== 'human') throw new HiveError(403, 'Only Human can manage bot credentials');
+    const parsed = botCredentialSchema.safeParse(raw);
+    if (!parsed.success) throw new HiveError(400, 'Invalid credential operation: choose rotate/revoke and a positive expectedRevision');
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const current = this.botCredential(actor, projectRef, botId);
+      if (current.credential.revision !== parsed.data.expectedRevision)
+        throw new HiveError(409, 'Bot credential changed; reload its state before a new operation');
+      const revoked = parsed.data.action === 'revoke', revision = current.credential.revision + 1;
+      const token = revoked ? undefined : newToken();
+      // No possible SHA-256 token hash equals the empty revocation sentinel.
+      this.db.prepare('UPDATE agents SET token_hash=? WHERE id=?').run(token ? hashToken(token) : '', botId);
+      this.db.prepare(`INSERT INTO bot_credentials(bot_id,revision,revoked) VALUES(?,?,?)
+        ON CONFLICT(bot_id) DO UPDATE SET revision=excluded.revision, revoked=excluded.revoked`).run(botId, revision, Number(revoked));
+      this.db.exec('COMMIT');
+      return { bot: current.bot, credential: { revision, revoked }, ...(token ? { token } : {}) };
+    } catch (error) { if (this.db.isTransaction) this.db.exec('ROLLBACK'); throw error; }
   }
 
   postBotMessage(actor: Agent, channel: string, raw: unknown): { message: Message; duplicate: boolean } {

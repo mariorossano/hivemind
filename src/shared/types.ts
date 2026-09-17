@@ -69,6 +69,11 @@ export type Agent = {
   project: string | null;
 };
 
+export type BotCredentialView = {
+  bot: Agent;
+  credential: { revision: number; revoked: boolean };
+};
+
 export type Channel = {
   id: string;
   name: string;

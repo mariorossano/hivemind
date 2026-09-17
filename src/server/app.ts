@@ -182,8 +182,18 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
     return c.json({ channel });
   });
   ui.post("/projects/:id/bots", async (c) => {
+    c.header('Cache-Control', 'no-store');
     const body = await c.req.json().catch(() => { throw new HiveError(400, "Expected JSON"); });
     return c.json(hive.createBot(hive.getAgent("human"), c.req.param("id"), body), 201);
+  });
+  ui.get('/projects/:id/bots/:botId/credential', c => {
+    c.header('Cache-Control', 'no-store');
+    return c.json(hive.botCredential(hive.getAgent('human'), c.req.param('id'), c.req.param('botId')));
+  });
+  ui.post('/projects/:id/bots/:botId/credential', async c => {
+    c.header('Cache-Control', 'no-store');
+    const body = await c.req.json().catch(() => { throw new HiveError(400, 'Expected JSON'); });
+    return c.json(hive.changeBotCredential(hive.getAgent('human'), c.req.param('id'), c.req.param('botId'), body));
   });
   ui.post("/channels/:id/messages", async (c) => {
     const human = hive.getAgent("human");
