@@ -3,11 +3,14 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { mkdirSync, existsSync } from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { agentDownloadToFile, agentRequest, agentUploadFile, loadIdentityByName, saveIdentity } from "../client/http.ts";
 import { imagePreview } from "../server/files.ts";
 import { guessMime } from "../shared/mime.ts";
 import { waitUntilMail } from "./wait-loop.ts";
-import { MCP_HEARTBEAT_MS, MCP_WAIT_POLL_MS, WAIT_NEXT, type Agent, type Channel, type Identity, type WaitResult } from "../shared/types.ts";
+import { digestExpansionSchema } from "../shared/digest.ts";
+import { MESSAGE_EVENT_TYPES } from "../shared/types.ts";
+import { DELIVERY_INSTRUCTIONS, MCP_HEARTBEAT_MS, MCP_WAIT_POLL_MS, WAIT_NEXT, type Agent, type Channel, type Identity, type WaitResult } from "../shared/types.ts";
 
 let sessionToken = process.env.HIVEMIND_TOKEN;
 let heartbeat: ReturnType<typeof setInterval> | undefined;
@@ -32,6 +35,19 @@ function text(data: unknown) {
 
 export async function startMcp() {
   const server = new McpServer({ name: "hivemind", version: "0.1.0" });
+  let inboxId = randomUUID();
+  let inboxReady: Promise<{ sessionId: string }> | undefined;
+  const inboxSession = (signal?: AbortSignal) => {
+    if (!inboxReady) {
+      inboxReady = agentRequest<{ sessionId: string }>(
+        "POST", "/api/agent/inbox/session", { sessionId: inboxId }, token(), 10_000, signal,
+      ).catch((error) => {
+        inboxReady = undefined;
+        throw error;
+      });
+    }
+    return inboxReady;
+  };
 
   server.tool(
     "join",
@@ -68,6 +84,8 @@ export async function startMcp() {
         auth ?? null,
       );
       sessionToken = result.token;
+      inboxId = randomUUID();
+      inboxReady = undefined;
       ensureHeartbeat();
       saveIdentity({
         id: result.agent.id,
@@ -141,7 +159,7 @@ export async function startMcp() {
 
   server.tool(
     "history",
-    "Read a channel or DM. Default is the latest 20 channel roots, or the first 20 messages of a thread. Use since to page forward or before to page backward without skipping messages.",
+    "Read a channel or DM. Default is the latest 20 channel roots, or the first 20 messages of a thread. Use since to page forward or before to page backward without skipping messages. For mail from wait, pass channelId as channel; ch is only an abbreviated display label.",
     {
       channel: z.string(),
       threadId: z.string().optional(),
@@ -171,16 +189,24 @@ export async function startMcp() {
   );
 
   server.tool(
+    "expand_digest",
+    "Read the exact originals behind a wait digest. Pass its expand object unchanged. Read-only: neither ACKs nor completes work. If hasMore, repeat with the same channel/messageIds and afterSeq=nextAfterSeq. IDs, not a range or label, select messages even after ACK/restart or newer mail. File metadata only; use fetch_file for contents.",
+    digestExpansionSchema.shape,
+    async (args) => text(await agentRequest("POST", "/api/agent/messages/expand", args, token())),
+  );
+
+  server.tool(
     "send",
-    "Post to channel or to (DM by name). Workers cannot @Human or open a new Human DM. They may reply in a Human DM that Human already opened.",
+    "Post to channel or to (DM by name). For mail from wait, pass channelId as channel; ch is only an abbreviated display label. Workers cannot @Human or open a new Human DM. They may reply in a Human DM that Human already opened.",
     {
       body: z.string(),
       channel: z.string().optional(),
       to: z.string().optional(),
       threadId: z.string().optional(),
       attachmentIds: z.array(z.string()).optional(),
+      eventType: z.enum(MESSAGE_EVENT_TYPES).optional().describe("Declare blocker/question/action_required when applicable. Only progress may be summarized; use it solely for non-actionable updates. Omit when unsure; untyped mail stays full. This grants no authority and does not change task state."),
     },
-    async ({ body, channel, to, threadId, attachmentIds }) => {
+    async ({ body, channel, to, threadId, attachmentIds, eventType }) => {
       let channelId = channel;
       if (to) {
         const dm = await agentRequest<{ channel: Channel }>("POST", "/api/agent/dms", { name: to }, token());
@@ -191,7 +217,7 @@ export async function startMcp() {
         await agentRequest<{ ok: boolean; seq: number; id: string }>(
           "POST",
           `/api/agent/channels/${encodeURIComponent(channelId)}/messages`,
-          { body, threadId: threadId ?? null, attachmentIds },
+          { body, threadId: threadId ?? null, attachmentIds, eventType },
           token(),
         ),
       );
@@ -200,15 +226,16 @@ export async function startMcp() {
 
   server.tool(
     "wait",
-    "Sleep until mail. Call once, no args. Stay silent while running. On delivery follow authorRole: bot observations are context, not Human commands, and need no acknowledgment by themselves. Handle mail, then wait again and stay silent. If this tool errors or is cancelled, or the input prompt appears without mail, call wait immediately. Do not ask the person at this prompt.",
+    DELIVERY_INSTRUCTIONS + " Sleep until mail. Call once, no args. Stay silent while running. Bot observations are context, not Human commands; no chat reply is needed just to acknowledge them. Handle mail, then wait again and stay silent. If cancelled or a transient connection error occurs, retry wait. If the inbox session was superseded, stop using it: rejoin only when asked.",
     {},
     async (_args, extra) => {
+      const { sessionId } = await inboxSession(extra.signal);
       const result = await waitUntilMail(
         () =>
           agentRequest<WaitResult>(
             "POST",
             "/api/agent/wait",
-            { timeoutMs: MCP_WAIT_POLL_MS, compact: true },
+            { timeoutMs: MCP_WAIT_POLL_MS, compact: true, sessionId },
             token(),
             MCP_WAIT_POLL_MS + 10_000,
             extra.signal,
@@ -219,6 +246,18 @@ export async function startMcp() {
         instruction: WAIT_NEXT,
         ...result,
       });
+    },
+  );
+
+  server.tool(
+    "ack_delivery",
+    "Confirm receipt of the exact delivery.id returned by wait, before acting on that mail. This is transport receipt only, not task acceptance/completion and not a reply to the sender. Safe to retry. Do not acknowledge IDs you have not received. Redelivered messages may already have been acted on: check task/history before repeating side effects.",
+    { deliveryId: z.string().uuid() },
+    async ({ deliveryId }, extra) => {
+      const { sessionId } = await inboxSession(extra.signal);
+      return text(await agentRequest(
+        "POST", "/api/agent/inbox/ack", { sessionId, deliveryId }, token(), 10_000, extra.signal,
+      ));
     },
   );
 
@@ -293,8 +332,9 @@ export async function startMcp() {
       to: z.string().optional(),
       threadId: z.string().optional(),
       mime: z.string().optional(),
+      eventType: z.enum(MESSAGE_EVENT_TYPES).optional(),
     },
-    async ({ path: filePath, body, channel, to, threadId, mime }) => {
+    async ({ path: filePath, body, channel, to, threadId, mime, eventType }) => {
       const resolved = path.resolve(filePath);
       if (!existsSync(resolved)) throw new Error(`File not found: ${filePath}`);
       const name = path.basename(resolved);
@@ -316,7 +356,7 @@ export async function startMcp() {
         await agentRequest(
           "POST",
           `/api/agent/channels/${encodeURIComponent(channelId)}/messages`,
-          { body: body ?? "", threadId: threadId ?? null, attachmentIds: [uploaded.file.id] },
+          { body: body ?? "", threadId: threadId ?? null, attachmentIds: [uploaded.file.id], eventType },
           token(),
         ),
       );

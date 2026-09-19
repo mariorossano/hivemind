@@ -85,6 +85,7 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
       channels: hive.listChannels(human),
       ...hive.readSnapshot(human),
       queued: hive.queuedCounts(),
+      inbox: hive.inboxStatuses(),
       telegram: {
         running: Boolean(hooks.telegramRunning?.()),
         configured: publicTelegramView(hive.home).configured,
@@ -278,6 +279,7 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
       channel: c.req.param("id"),
       body: String(body.body ?? ""),
       threadId: body.threadId ?? null,
+      eventType: body.eventType,
       attachmentIds: Array.isArray(body.attachmentIds) ? body.attachmentIds.map(String) : undefined,
     });
     return c.json({ message });
@@ -455,6 +457,7 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
       channel: c.req.param("id"),
       body: String(body.body ?? ""),
       threadId: body.threadId ?? null,
+      eventType: body.eventType,
       attachmentIds: Array.isArray(body.attachmentIds) ? body.attachmentIds.map(String) : undefined,
     });
     return c.json({ ok: true, seq: message.seq, id: message.id });
@@ -462,6 +465,10 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
   agent.get("/messages/:seq", (c) => {
     const me = c.get("me");
     return c.json({ message: hive.getVisibleMessage(me, Number(c.req.param("seq"))) });
+  });
+  agent.post("/messages/expand", async (c) => {
+    const body = await c.req.json().catch(() => { throw new HiveError(400, "Expected JSON"); });
+    return c.json(hive.expandDigest(c.get("me"), body));
   });
   agent.post("/files", async (c) => {
     const me = c.get("me");
@@ -508,9 +515,27 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
   agent.post("/wait", async (c) => {
     const me = c.get("me");
     const body = await c.req.json().catch(() => ({}));
+    if (body?.sessionId == null) throw new HiveError(409,
+      "HTTP 409: Inbox delivery protocol changed. Restart the Hivemind MCP client and rejoin. HTTP/CLI clients must open an inbox session and include sessionId in wait. Do not retry this wait unchanged.");
+    if (typeof body.sessionId !== "string") throw new HiveError(400, "Expected sessionId");
     const timeoutMs = Number(body.timeoutMs ?? DEFAULT_WAIT_MS);
-    const result = await hive.wait(me, timeoutMs, c.req.raw.signal, { compact: Boolean(body.compact) });
+    const result = await hive.wait(me, timeoutMs, c.req.raw.signal, {
+      compact: Boolean(body.compact),
+      sessionId: body.sessionId,
+    });
     return c.json(result);
+  });
+  agent.post("/inbox/session", async (c) => {
+    const body = await c.req.json().catch(() => null);
+    if (typeof body?.sessionId !== "string") throw new HiveError(400, "Expected sessionId");
+    return c.json({ sessionId: hive.openInboxSession(c.get("me"), body.sessionId) });
+  });
+  agent.post("/inbox/ack", async (c) => {
+    const body = await c.req.json().catch(() => null);
+    if (typeof body?.sessionId !== "string" || typeof body?.deliveryId !== "string") {
+      throw new HiveError(400, "Expected sessionId and deliveryId");
+    }
+    return c.json(hive.acknowledgeInbox(c.get("me"), body.sessionId, body.deliveryId));
   });
   agent.post("/ping", (c) => {
     const me = c.get("me");
