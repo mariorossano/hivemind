@@ -1,5 +1,9 @@
 # Contributing
 
+For this fork's stable/trial branch and runtime policy, see
+[FORK-WORKFLOW.md](FORK-WORKFLOW.md). The upstream contribution and licensing
+requirements below remain unchanged.
+
 Hivemind is currently source-available, but it is not an open-source project and is not currently accepting unsolicited code, documentation, design, or asset contributions.
 
 Bug reports, feature requests, and technical discussion are welcome through GitHub Issues.
