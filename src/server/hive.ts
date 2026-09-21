@@ -63,6 +63,7 @@ import { TaskStore } from './tasks.ts';
 import { NotificationStore } from './notifications.ts';
 import { RoomStore } from './rooms.ts';
 import { ROUTINE_BATCH_MS } from '../shared/notifications.ts';
+import { AdaptiveTopologyRuntime } from './adaptive-topology.ts';
 import type { TaskEnvelope } from '../shared/tasks.ts';
 
 export { hiveHome } from "./paths.ts";
@@ -152,6 +153,7 @@ export class Hive {
   readonly notifications!: NotificationStore;
   readonly decisions!: DecisionStore;
   readonly timeline!: TimelineStore;
+  readonly adaptiveTopology!: AdaptiveTopologyRuntime;
   private waiters = new Map<string, Waiter>();
   private telegramOrigin = new Set<string>();
   readonly uploads!: UploadBudget;
@@ -201,6 +203,7 @@ export class Hive {
       this.routing = new RoutingStore(this);
       this.timeline = new TimelineStore(this);
       this.decisions = new DecisionStore(this, work => this.transaction(work));
+      this.adaptiveTopology = new AdaptiveTopologyRuntime(this);
       this.inbox = new InboxDeliveryStore(this.db);
       this.inboxReader = new InboxReader(this.db, this.inbox, this.notifications, options.routineBatchMs ?? ROUTINE_BATCH_MS);
     } catch (error) {
@@ -1360,6 +1363,7 @@ export class Hive {
       const decision = actor.role === 'human' ? this.decisions?.captureHumanReply(actor, msg, input.source ?? 'hive') ?? null : null;
       this.afterCommit(() => {
         if (input.source === "telegram") this.telegramOrigin.add(msg.id);
+        this.adaptiveTopology?.humanMessageCommitted(msg);
         this.bus.emit("message", msg);
         this.wakeMembers(ch, msg);
         if (decision) this.bus.emit('decision', decision);
@@ -1394,6 +1398,7 @@ export class Hive {
     directive: string,
     directiveRequestId: string,
     persistReceipt?: (message: Message) => void,
+    persistRouting?: (message: Message, routingMessage: Message) => void,
   ): { message: Message; routingMessage: Message } {
     return this.transaction(() => {
       const routingMessage = this.postMessage(actor, {
@@ -1403,6 +1408,7 @@ export class Hive {
         eventType: "assignment",
       });
       const message = this.postMessage(actor, input, persistReceipt);
+      persistRouting?.(message, routingMessage);
       return { message, routingMessage };
     });
   }
@@ -1769,15 +1775,21 @@ export class Hive {
     }
     const ch = this.getChannel(row.channel_id);
     if (!this.canSeeChannel(actor, ch)) throw new HiveError(403, "Cannot access thread");
-    this.db.prepare(
-      `INSERT INTO threads (id, channel_id, status) VALUES (?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET status = excluded.status`,
-    ).run(threadId, row.channel_id, status);
-    const thread = this.db
-      .prepare("SELECT id, channel_id AS channelId, status FROM threads WHERE id = ?")
-      .get(threadId) as Thread;
-    this.bus.emit("thread", thread);
-    return thread;
+    const commitments = this.db.prepare('SELECT execution_id FROM adaptive_topology_messages WHERE root_id=?').all(threadId);
+    if (commitments.length) {
+      if (actor.role !== 'human' && actor.id !== this.getMessageById(threadId).authorId)
+        throw new HiveError(403, 'Only Human or the delegating brain can close adaptive delegated work');
+      if (this.db.prepare('SELECT status FROM threads WHERE id=?').get(threadId)?.status === 'done' && status !== 'done')
+        throw new HiveError(409, 'Start a new guarded assignment instead of reopening completed adaptive work');
+    }
+    return this.transaction(() => {
+      const routingChanged = this.adaptiveTopology?.threadStatusChange(actor, threadId, status);
+      this.db.prepare(`INSERT INTO threads (id, channel_id, status) VALUES (?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET status = excluded.status`).run(threadId, row.channel_id, status);
+      const thread = this.db.prepare('SELECT id, channel_id AS channelId, status FROM threads WHERE id=?').get(threadId) as Thread;
+      this.afterCommit(() => { this.bus.emit('thread', thread); routingChanged?.(); });
+      return thread;
+    });
   }
 
   markRead(actor: Agent, channelId: string, seq: number) {
