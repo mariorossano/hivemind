@@ -1,7 +1,8 @@
 # Reproducible checks
 
-Supported CI runs on macOS with Node 22.13.0 and Node 24. Install the Node version
-under test, npm, zsh (required by the existing shell contracts), then:
+Primary PR CI runs on Ubuntu with Node 22.13.0 and Node 24, plus one focused
+macOS compatibility job for the native zsh/Terminal-launch shell contracts. For a
+full local check, install the Node version under test, npm, zsh and Chromium, then:
 
 ```sh
 npm ci
@@ -12,11 +13,35 @@ npm run check:all
 `check:all` fails fast and runs lint, all three strict typechecks, separately
 reported unit/integration suites, production build, unchanged coverage thresholds,
 Chromium contracts, installed-package smoke and production dependency audit.
-CI runs the same commands in parallel jobs; the existing Tests / Node gate names
-remain unchanged. PR title/dependency review and hosted CodeQL are additional CI
-checks, not local test results. An audit failure needs review, not an automatic
-claim that the app is exploitable. `npm run check` remains the lighter release
-command for backwards compatibility; use `check:all` for complete acceptance.
+`npm run check` remains the lighter release command for backwards compatibility;
+use `check:all` for complete local acceptance.
+
+PR CI deliberately uses a lower-latency topology than `check:all` while preserving
+its effective scope:
+
+- CPU-heavy quality, test and browser jobs run on Ubuntu rather than competing for
+  the much smaller hosted macOS concurrency pool.
+- Node 24 unit and four historically timing-balanced integration shards run independently.
+- Node 22.13.0 runs the same full unit/integration scope with four timing-balanced integration shards; Ubuntu concurrency now makes the full 4-way split useful without the former macOS queue penalty.
+- The existing required gate names `Tests / Node 24` and `Tests / Node 22.13.0`
+  are aggregation jobs over all corresponding shards.
+- Node 24 test jobs collect LCOV during their normal execution. `Coverage` merges
+  those artifacts and enforces the unchanged 80% line / 75% branch / 75% function
+  thresholds, so CI no longer executes the complete suite a third time.
+- Playwright browser downloads use a version-sensitive Linux cache; required
+  Chromium system packages are installed explicitly. Browser contracts stay isolated
+  from server integration shards.
+- Cross-platform shell argument contracts run with bash on Linux; zsh-only syntax
+  validation remains in the focused native macOS job, avoiding repeated package-manager setup on ephemeral Linux runners.
+- One focused native macOS job runs the launch/plugin shell contracts with the real
+  macOS zsh environment. `Tests / Node 24` requires that job as well as every Node 24 shard.
+- npm's download cache is used; `node_modules` is not cached.
+
+See [ci-performance.md](docs/ci-performance.md) for the measured baseline, shard
+weight methodology, runner-cost trade-off and after-measurement protocol.
+PR title/dependency review also run on Ubuntu. Hosted CodeQL is an additional CI
+check, not a local test result. An audit failure needs review, not an automatic
+claim that the app is exploitable.
 
 ## Discovery and classifications
 
@@ -25,6 +50,11 @@ under src, web and scripts. `test:unit` selects explicitly named `.unit.test.*` 
 pure legacy files in scripts/test-suites.mjs. Everything else, including
 mixed tests, defaults to integration. New tests cannot disappear for lacking a
 manifest entry. Browser `.spec.ts` files are discovered separately by Playwright.
+
+CI integration shards are assigned by deterministic largest-processing-time
+balancing using `scripts/ci-test-timings.json`. The checked-in historical weights retain the coverage-stable assignment already validated across normal Node 24 coverage producers; every unmeasured/new integration file gets a fallback weight
+and is still assigned to exactly one shard. Sharding therefore cannot silently
+drop an unlisted test.
 
 The current fault matrix includes message atomicity (#1), real HTTP error status
 and stdio invalid authentication (#2), stdio/HTTP cancellation (#4), storage/CLI/
@@ -44,10 +74,12 @@ are capped at 4 MiB. No generic detector guarantees removal of arbitrary secrets
 in free prose: keep credentials out of test output and fixtures.
 
 CI uploads only sanitized text logs, with separate unit/integration/browser
-artifacts and seven-day retention. Raw Playwright trace/video/screenshot archives
-are deliberately **not uploaded**: binary visual data cannot be reliably redacted
-by a text filter. Developers may inspect the failure-only local synthetic trace
-under artifacts/playwright after reviewing its contents. No raw environments,
+artifacts and seven-day retention. LCOV artifacts contain source paths and numeric
+coverage data only; the intermediate shard artifacts are short-lived and the
+merged report is retained for seven days. Raw Playwright trace/video/screenshot
+archives are deliberately **not uploaded**: binary visual data cannot be reliably
+redacted by a text filter. Developers may inspect the failure-only local synthetic
+trace under artifacts/playwright after reviewing its contents. No raw environments,
 credentials, provider reasoning or user workspace files are fixture inputs.
 
 ## Synthetic storage performance evidence
