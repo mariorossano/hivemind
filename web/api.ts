@@ -10,6 +10,14 @@ import type { TaskSnapshot } from '../src/shared/tasks.ts';
 import type { RoomView, Room } from '../src/shared/rooms.ts';
 import type { DecisionPage, DecisionView } from '../src/shared/decisions.ts';
 import type { TimelineExport, TimelineView } from '../src/shared/timeline.ts';
+import type {
+  AdaptiveExecutionState,
+  AdaptiveLockScope,
+  AdaptiveRoutingMode,
+  AdaptiveRoutingView,
+  AdaptiveTopology,
+  AdaptiveTopologyDecision,
+} from '../src/shared/adaptive-topology.ts';
 
 export class ApiError extends Error {
   constructor(readonly status: number, message: string) { super(message); }
@@ -25,6 +33,9 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   return data as T;
 }
 
+export type SendRoutingMode = AdaptiveRoutingMode;
+export type SendLockScope = AdaptiveLockScope;
+
 export type Snapshot = ReadSnapshot & {
   you: Agent;
   projects: Project[];
@@ -35,22 +46,13 @@ export type Snapshot = ReadSnapshot & {
   telegram?: { running: boolean; configured: boolean } & TelegramHealth;
 };
 
-export type SendRoutingMode = "auto" | "single" | "orchestrated";
-
-export type AdaptiveRoutingDecisionView = {
-  routeId: string;
-  strategy: "single" | "orchestrated";
-  reason: string;
-  fallbackUsed: boolean;
-  providerStatus: "ok" | "unavailable" | "bypassed";
-};
-
 export type AdaptiveRoutingSettings = {
   enabled: boolean;
   apiKeySet: boolean;
   apiKeyHint: string | null;
   model: string;
   fallback: "single" | "orchestrated";
+  topologyFallback: Exclude<AdaptiveTopology, "single">;
 };
 
 export type TelegramSettings = TelegramHealth & {
@@ -86,8 +88,20 @@ export type ChannelPayload = {
 
 export const api = {
   adaptiveRouting: () => req<AdaptiveRoutingSettings>("/api/ui/adaptive-routing"),
-  saveAdaptiveRouting: (body: { enabled: boolean; apiKey?: string | null; fallback: "single" | "orchestrated" }) =>
+  saveAdaptiveRouting: (body: {
+    enabled: boolean;
+    apiKey?: string | null;
+    fallback: "single" | "orchestrated";
+    topologyFallback: Exclude<AdaptiveTopology, "single">;
+  }) =>
     req<AdaptiveRoutingSettings>("/api/ui/adaptive-routing", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  adaptiveRoutingView: (channelId: string, signal?: AbortSignal) =>
+    req<AdaptiveRoutingView>(`/api/ui/channels/${encodeURIComponent(channelId)}/adaptive-routing`, { signal }),
+  setAdaptiveRoutingLock: (channelId: string, body: { scope: AdaptiveLockScope; topology?: AdaptiveTopology | null; expectedExecutionId?: string; expectedRevision?: number }) =>
+    req<AdaptiveRoutingView>(`/api/ui/channels/${encodeURIComponent(channelId)}/adaptive-routing/lock`, {
       method: "PUT",
       body: JSON.stringify(body),
     }),
@@ -184,12 +198,16 @@ export const api = {
     return req<ChannelPayload>(`/api/ui/channels/${encodeURIComponent(id)}/messages${suffix}`, { signal });
   },
   send: (id: string, body: string, threadId?: string | null, attachmentIds?: string[], requestId?: string,
-    routing: SendRoutingMode = "auto") =>
-    req<{ message: Message; routing: AdaptiveRoutingDecisionView | null; routingMessage?: Message }>(
-      `/api/ui/channels/${encodeURIComponent(id)}/messages`, {
-        method: "POST",
-        body: JSON.stringify({ body, threadId: threadId ?? null, attachmentIds, requestId, routing }),
-      }),
+    routing: AdaptiveRoutingMode = "auto", lockScope: AdaptiveLockScope = "none") =>
+    req<{
+      message: Message;
+      routing: AdaptiveTopologyDecision | null;
+      routingMessage?: Message;
+      adaptiveState?: AdaptiveExecutionState | null;
+    }>(`/api/ui/channels/${encodeURIComponent(id)}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ body, threadId: threadId ?? null, attachmentIds, requestId, routing, lockScope }),
+    }),
   upload: async (file: File): Promise<AttachmentMeta> => {
     const res = await humanSession.request("/api/ui/files", {
       method: "POST",
