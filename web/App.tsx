@@ -5,10 +5,11 @@ import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, 
 import type { Agent, Channel, Message, SearchHit, Thread, ThreadStatus, InboxStatus } from "../src/shared/types.ts";
 import { REACTION_EMOJIS } from "../src/shared/types.ts";
 import { isLiveSearchQuery, parseSearchQuery } from "../src/shared/search-query.ts";
-import { api, connectWs, type ChannelPayload, type Snapshot, type TelegramSettings } from "./api.ts";
+import { api, connectWs, type ChannelPayload, type Snapshot, type TelegramSettings, type SendRoutingMode } from "./api.ts";
 import { LaunchSheet } from "./LaunchSheet.tsx";
 import { BotOrigin, BotSetup, BotCredentials } from "./Bots.tsx";
 import { ProjectPlugins } from "./ProjectPlugins.tsx";
+import { AdaptiveRoutingSettings } from "./AdaptiveRoutingSettings.tsx";
 import { InboxReceipt, QueueBadge } from "./InboxReceipt.tsx";
 import { loadMailLog, mergeMailLog, saveMailLog } from "./mail-log.ts";
 import type { MentionPage, ReadSnapshot } from "../src/shared/read-state.ts";
@@ -114,6 +115,7 @@ export function App() {
     });
   }, []);
   const [draft, setDraft] = useState("");
+  const [routingMode, setRoutingMode] = useState<SendRoutingMode>("auto");
   const [threadDraft, setThreadDraft] = useState("");
   const [err, setErr] = useState<string | null>(null);
   const [live, setLive] = useState(false);
@@ -135,6 +137,7 @@ export function App() {
   const [helpOpen, setHelpOpen] = useState(false);
   const [launchOpen, setLaunchOpen] = useState(false);
   const [telegramOpen, setTelegramOpen] = useState(false);
+  const [adaptiveRoutingOpen, setAdaptiveRoutingOpen] = useState(false);
   const [telegram, setTelegram] = useState<TelegramSettings | null>(null);
   const [tgToken, setTgToken] = useState("");
   const [tgUsers, setTgUsers] = useState("");
@@ -562,6 +565,9 @@ export function App() {
   const q = query.trim().toLowerCase();
   const match = (name: string) => !q || name.toLowerCase().includes(q);
   const activeChannel = sel.kind === "channel" ? channels.find((c) => c.id === sel.id) : undefined;
+  const activeBrainDm = Boolean(activeChannel?.type === "dm" && activeChannel.memberIds.some(
+    id => snap?.agents.some(agent => agent.id === id && agent.role === "brain"),
+  ));
   const selectedProject =
     sel.kind === "inbox" || sel.kind === "decisions" ? sel.project : (activeChannel?.project ?? projects[0]?.slug ?? "chapter");
   const editingBusy = editingProject
@@ -643,18 +649,25 @@ export function App() {
   }, [inboxSelected, readTick, reconnectTick]);
 
   const sendOperations = useRef(createSendOperations(api.upload, api.send));
-  const send = async (body: string, tid?: string | null, files?: File[]) => {
+  const send = async (body: string, tid?: string | null, files?: File[], routing: SendRoutingMode = "auto") => {
     if (sel.kind !== "channel") return;
     const channelId = sel.id;
     const root = tid ?? null;
     if (!body.trim() && !files?.length) return;
-    const { message } = await sendOperations.current(channelId, body.trim(), root, files);
+    const result = await sendOperations.current(channelId, body.trim(), root, files, routing);
     if (selRef.current.kind !== "channel" || selRef.current.id !== channelId || (root && threadIdRef.current !== root)) return;
     if (root) setThreadDraft((current) => current === body ? "" : current);
-    else setDraft((current) => current === body ? "" : current);
-    recordChannelMessage(channelJournal.current, message);
-    setPane((current) => applyChannelMessage(current, message));
-    if (root) onThreadMessage(message);
+    else {
+      setDraft((current) => current === body ? "" : current);
+      setRoutingMode("auto");
+    }
+    if (result.routingMessage) {
+      recordChannelMessage(channelJournal.current, result.routingMessage);
+      setPane((current) => applyChannelMessage(current, result.routingMessage!));
+    }
+    recordChannelMessage(channelJournal.current, result.message);
+    setPane((current) => applyChannelMessage(current, result.message));
+    if (root) onThreadMessage(result.message);
   };
 
   const onCreate = async () => {
@@ -750,6 +763,14 @@ export function App() {
               }}
             >
               {telegramDegraded(snap.telegram) ? "⚠" : snap.telegram?.running ? "✈" : "⌬"}
+            </button>
+            <button
+              type="button"
+              className="icon-btn"
+              title="Adaptive routing"
+              onClick={() => setAdaptiveRoutingOpen(true)}
+            >
+              ⇄
             </button>
             <button type="button" className="icon-btn" title="Launch agent" onClick={() => setLaunchOpen(true)}>
               ▶
@@ -1073,7 +1094,8 @@ export function App() {
                   ? `Message ${channelTitle(activeChannel)}`
                   : "Write…"
               }
-              onSend={(files) => send(draft, undefined, files)}
+              routing={activeBrainDm ? { value: routingMode, onChange: setRoutingMode } : undefined}
+              onSend={(files) => send(draft, undefined, files, activeBrainDm ? routingMode : "auto")}
             />
           </>
         )}
@@ -1483,6 +1505,10 @@ export function App() {
             </div>
           </form>
         </div>
+      )}
+
+      {adaptiveRoutingOpen && (
+        <AdaptiveRoutingSettings onClose={() => setAdaptiveRoutingOpen(false)} />
       )}
 
       {telegramOpen && telegram && (
@@ -1916,12 +1942,14 @@ function Composer({
   onChange,
   onSend,
   placeholder,
+  routing,
 }: {
   agents: Agent[];
   value: string;
   onChange: (v: string) => void;
   onSend: (files?: File[]) => void;
   placeholder: string;
+  routing?: { value: SendRoutingMode; onChange: (mode: SendRoutingMode) => void };
 }) {
   const [hint, setHint] = useState<Agent[]>([]);
   const [files, setFiles] = useState<File[]>([]);
@@ -2008,6 +2036,19 @@ function Composer({
         <button type="button" className="clip" title="Attach" onClick={() => pick.current?.click()}>
           📎
         </button>
+        {routing && (
+          <select
+            className="routing-mode"
+            aria-label="Execution mode"
+            title="Execution mode for this request"
+            value={routing.value}
+            onChange={(e) => routing.onChange(e.target.value as SendRoutingMode)}
+          >
+            <option value="auto">Auto · Jev</option>
+            <option value="single">Single</option>
+            <option value="orchestrated">Orchestrated</option>
+          </select>
+        )}
         <textarea
           rows={2}
           value={value}

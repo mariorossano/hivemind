@@ -33,6 +33,9 @@ export const sendInputSchema = z.object({
   traceId: z.string().uuid().optional(), causeMessageId: z.string().uuid().optional(),
   recipients: memberNamesSchema.min(1).optional(), attachmentIds: attachmentIdsSchema.optional(),
 }).strict();
+export const humanSendInputSchema = sendInputSchema.extend({
+  routing: z.enum(["auto", "single", "orchestrated"]).optional(),
+}).strict();
 export const channelInputSchema = z.object({ name: nameSchema,
   type: z.enum(["public", "private", "brains"]).optional(), topic: z.string().max(4000).nullish(),
   memberNames: memberNamesSchema.optional(), project: z.string().min(1).max(32).nullish(),
