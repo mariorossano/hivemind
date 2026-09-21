@@ -226,15 +226,17 @@ export async function startMcp() {
       attachmentIds: attachmentIdsSchema.optional(),
       recipients: memberNamesSchema.min(1).optional().describe('Intended recipient names already able to access the channel. Other peers only wake if explicitly subscribed or mentioned. This does not invite or grant access.'),
       eventType: z.enum(MESSAGE_EVENT_TYPES).optional().describe("Declare assignment/decision/blocker/question/action_required when applicable. Non-actionable progress is batched/summarized. acknowledgement is history-only for agents unless it carries task evidence/files. Omit when unsure. No type grants authority or changes task state."),
+      traceId: z.string().uuid().optional().describe('Optional observability trace UUID. Task messages already use their task/root ID. This does not grant authority.'),
+      causeMessageId: z.string().uuid().optional().describe('Optional explicit causal message reference visible in the same project. The timeline labels this explicit; thread parentage remains inferred.'),
     },
-    async ({ body, channel, to, threadId, attachmentIds, eventType, recipients, requestId }) => {
+    async ({ body, channel, to, threadId, attachmentIds, eventType, recipients, traceId, causeMessageId, requestId }) => {
       let channelId = channel;
       if (to) {
         const dm = await agentRequest<{ channel: Channel }>("POST", "/api/agent/dms", { name: to }, token());
         channelId = dm.channel.id;
       }
       if (!channelId) throw new Error("Provide channel or to");
-      return text(await sendOperation({ channel: channelId, body, threadId, attachmentIds, eventType, recipients }, token(), requestId));
+      return text(await sendOperation({ channel: channelId, body, threadId, attachmentIds, eventType, recipients, traceId, causeMessageId }, token(), requestId));
     },
   );
 
@@ -300,6 +302,14 @@ export async function startMcp() {
     'Read the current task contract, revision, assignee, confirmed receipt, state, reported result and review. Receipt is not acceptance; result submission is not reviewed completion. Use history with channelId and threadId=task.id for versioned events.',
     { taskId: z.string().uuid() },
     async ({ taskId }) => text(await agentRequest('GET', `/api/agent/tasks/${taskId}`, undefined, token())));
+  server.tool('get_task_timeline',
+    'Read bounded protocol observability for one visible structured task: messages/task actions, durable transport source, delivery offer/ACK timestamps and wake reasons. Explicit causeMessageId references are labelled explicit; thread-parent relationships are labelled inferred. No hidden reasoning, tokens, local environment or file contents are recorded. Timeline metadata is not task authority.',
+    { taskId: z.string().uuid() },
+    async ({ taskId }) => text(await agentRequest('GET', `/api/agent/tasks/${taskId}/timeline`, undefined, token())));
+  server.tool('export_task_timeline',
+    'Export the same visible task timeline as a redacted deterministic fake-only replay fixture. Bodies become SHA-256+byte length, names become stable role aliases, artifacts become counts/evidence seqs. The fixture never resends Telegram messages or executes code.',
+    { taskId: z.string().uuid() },
+    async ({ taskId }) => text(await agentRequest('GET', `/api/agent/tasks/${taskId}/timeline/export`, undefined, token())));
   server.tool('preview_task_claim',
     'Brain-only read-only preview of visible declared intent overlaps. Return current task revision and exact claimVersion pairs for intentional collaboration acknowledgements. Does not reserve work; private or undeclared intent is not a guarantee of exclusivity. Mutation rechecks versions.',
     { taskId: z.string().uuid(), ...claimPreviewSchema.shape },
@@ -420,8 +430,10 @@ export async function startMcp() {
       mime: z.string().optional(),
       eventType: z.enum(MESSAGE_EVENT_TYPES).optional(),
       recipients: memberNamesSchema.min(1).optional(),
+      traceId: z.string().uuid().optional(),
+      causeMessageId: z.string().uuid().optional(),
     },
-    async ({ path: filePath, body, channel, to, threadId, mime, eventType, recipients, requestId }) => {
+    async ({ path: filePath, body, channel, to, threadId, mime, eventType, recipients, traceId, causeMessageId, requestId }) => {
       const resolved = path.resolve(filePath);
       if (!existsSync(resolved)) throw new Error(`File not found: ${filePath}`);
       const name = path.basename(resolved);
@@ -432,7 +444,7 @@ export async function startMcp() {
         channelId = dm.channel.id;
       }
       if (!channelId) throw new Error("Provide channel or to");
-      return text(await sendOperation({ channel: channelId, body: body ?? "", threadId, eventType, recipients,
+      return text(await sendOperation({ channel: channelId, body: body ?? "", threadId, eventType, recipients, traceId, causeMessageId,
         file: { path: resolved, name, mime: guessed } }, token(), requestId));
     },
   );
