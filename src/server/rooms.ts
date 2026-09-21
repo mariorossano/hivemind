@@ -95,7 +95,17 @@ export class RoomStore {
       }
       let room = this.peek(ch.id);
       const previousCoordinator = room?.coordinatorId;
-      if ((room?.revision ?? 0) !== input.expectedRevision) throw new HiveError(409, 'Room changed; get_room and reconcile the current revision');
+      if ((room?.revision ?? 0) !== input.expectedRevision) {
+        let concurrentContractAck = false;
+        if (action.type === 'acknowledge' && room && input.expectedRevision > 0 && input.expectedRevision < room.revision &&
+          action.contractVersion === room.contractVersion) {
+          const previous = this.db.prepare(
+            "SELECT json_extract(snapshot,'$.contractVersion') AS contract_version FROM room_events WHERE channel_id=? AND revision=?",
+          ).get(ch.id, input.expectedRevision) as { contract_version: number } | undefined;
+          concurrentContractAck = previous?.contract_version === room.contractVersion;
+        }
+        if (!concurrentContractAck) throw new HiveError(409, 'Room changed; get_room and reconcile the current revision');
+      }
       if (action.type === 'acknowledge' || action.type === 'stopped') {
         if (!room || !room.participantIds.includes(actor.id) || actor.role !== 'worker') throw new HiveError(403, 'Only a participating worker can acknowledge');
       } else if (actor.role !== 'human' && (actor.role !== 'brain' || (room && room.coordinatorId !== actor.id)))
@@ -221,7 +231,10 @@ export class RoomStore {
   }
   assignment(actor: Agent, channel: Channel, worker: Agent, input: { room?: { contractVersion: number; actionKey: string }; contract: unknown }) {
     const room = this.peek(channel.id);
-    if (!room) { if (input.room) throw new HiveError(400, 'No room contract in this channel'); return; }
+    if (!room) {
+      if (input.room) throw new HiveError(400, 'No room contract in this channel; omit room or configure/read get_room before assigning');
+      return;
+    }
     if (actor.id !== room.coordinatorId || !room.participantIds.includes(worker.id)) throw new HiveError(403, 'Room tasks belong to its coordinator and declared workers');
     if (!input.room) throw new HiveError(409, 'Room assignment requires current contractVersion and a stable actionKey');
     const payloadHash = this.hash({ worker: worker.id, contract: input.contract });
