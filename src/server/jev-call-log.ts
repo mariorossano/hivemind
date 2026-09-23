@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import type { AdaptiveRoutingEvent, AdaptiveTopologyDecision } from '../shared/adaptive-topology.ts';
+import type { AdaptiveTopologyDecision } from '../shared/adaptive-topology.ts';
 import { encodeJevCallCursor, type JevCallCursor } from '../shared/jev-calls.ts';
 import type { JevCall, JevCallLogView, JevCallOutcome, JevCallSummary, JevCallTrigger, JevRequestGroup } from '../shared/jev-calls.ts';
 import { HiveError } from '../shared/types.ts';
@@ -34,6 +34,7 @@ export class JevCallLog {
       targetTopology: decision.targetTopology, targetWorkers: decision.targetWorkers, confidence: decision.confidence,
       reason: decision.reason, error: exchange.error, requestedModel: decision.requestedModel ?? null, model: decision.model, latencyMs: decision.latencyMs,
       inputTokens: decision.inputTokens, outputTokens: decision.outputTokens, outcome: null,
+      ...(decision.incoherent ? { incoherent: decision.incoherent } : {}),
     };
     this.db.prepare(`INSERT INTO jev_calls(id,route_id,project_id,channel_id,execution_id,created_at,summary,sent,received)
       VALUES(?,?,?,?,?,?,?,?,?)`).run(summary.id, summary.routeId, summary.projectId, summary.channelId, summary.executionId,
@@ -43,17 +44,6 @@ export class JevCallLog {
       (SELECT id FROM jev_calls WHERE project_id=? ORDER BY created_at DESC, rowid DESC LIMIT ?)`)
       .run(summary.projectId, summary.projectId, JEV_CALLS_PER_PROJECT);
     return summary;
-  }
-
-  /** Called with the routing audit event that consumed a Jev answer. */
-  settle(event: AdaptiveRoutingEvent): JevCallSummary | null {
-    if (!event.routeId) return null;
-    const outcome: JevCallOutcome = { kind: event.kind, applied: event.applied, appliedTopology: event.appliedTopology,
-      appliedWorkers: event.appliedWorkers, warning: event.warning };
-    const changed = this.db.prepare('UPDATE jev_calls SET outcome=? WHERE route_id=?').run(JSON.stringify(outcome), event.routeId).changes;
-    if (!changed) return null;
-    const row = this.db.prepare('SELECT summary,outcome FROM jev_calls WHERE route_id=?').get(event.routeId);
-    return row ? this.summaryOf(row) : null;
   }
 
   private summaryOf(row: Record<string, unknown>): JevCallSummary {
