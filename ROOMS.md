@@ -21,6 +21,9 @@ Channels without a room and direct-message navigation are unchanged.
 The UI uses `archivedChannelIds` from `/api/ui/snapshot`, while `channels` continues
 to include archived channels. Deploy the server and web bundle together; an older
 server without this metadata leaves all channels in the main list.
+Room events refresh only the archive projection in the client, preserving newer
+live channels, agent presence and read/queue counters. Overlapping room refreshes
+and full reconnect snapshots are ordered so a late response cannot undo a reopen.
 
 ## Two modes
 

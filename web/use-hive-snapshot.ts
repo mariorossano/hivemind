@@ -13,6 +13,10 @@ export function useHiveSnapshot(setErr: (error: string) => void) {
   const latestTelegramHealth = useRef<TelegramHealth | null>(null);
   const readFence = useRef(createReadFence());
   const snapshotLoad = useRef(createRequestGate());
+  // Full and room-only loads share ordering for this projection, not for the
+  // roster/read state. A late room response must never replace the whole hive.
+  const archivedLoad = useRef(createRequestGate());
+  const latestArchivedChannelIds = useRef<Snapshot['archivedChannelIds']>(undefined);
   const readRefresh = useRef<ReturnType<typeof createReadRefresh> | null>(null);
   const channelReads = useRef<ReturnType<typeof createReceiptQueue> | null>(null);
   const threadReads = useRef<ReturnType<typeof createReceiptQueue> | null>(null);
@@ -51,6 +55,7 @@ export function useHiveSnapshot(setErr: (error: string) => void) {
     channelReads.current = makeQueue();
     threadReads.current = makeQueue();
     return () => {
+      archivedLoad.current.cancel();
       readFence.current.reset();
       refresh.dispose();
       channelReads.current?.dispose();
@@ -61,22 +66,34 @@ export function useHiveSnapshot(setErr: (error: string) => void) {
     };
   }, [acceptRead]);
 
+  const refreshArchivedChannels = useCallback(async () => {
+    const load = archivedLoad.current.begin();
+    const ticket = readFence.current.ticket();
+    const next = await api.snapshot(load.signal);
+    if (!load.valid() || !readFence.current.current(ticket)) return;
+    latestArchivedChannelIds.current = next.archivedChannelIds;
+    setSnap(previous => previous ? { ...previous, archivedChannelIds: next.archivedChannelIds } : previous);
+  }, []);
+
   const refreshSnap = useCallback(async () => {
     const load = snapshotLoad.current.begin();
+    const archived = archivedLoad.current.begin();
     const ticket = readFence.current.ticket();
     const raw = await api.snapshot(load.signal);
     latestTelegramHealth.current = newerTelegramHealth(latestTelegramHealth.current, raw.telegram);
     const next = { ...raw, telegram: { running: false, configured: false, ...raw.telegram, ...latestTelegramHealth.current } };
     if (!load.valid() || !readFence.current.current(ticket)) return next;
+    if (archived.valid()) latestArchivedChannelIds.current = next.archivedChannelIds;
     const accepted = acceptRead(next, ticket);
-    setSnap((previous) => ({ ...next, ...(!accepted && previous ? readFields(previous) : {}) }));
+    setSnap((previous) => ({ ...next, archivedChannelIds: latestArchivedChannelIds.current,
+      ...(!accepted && previous ? readFields(previous) : {}) }));
     if (!accepted) readRefresh.current?.request();
     return next;
   }, [acceptRead]);
 
   return {
-    snap, setSnap, latestTelegramHealth, readFence, snapshotLoad, readRefresh, channelReads, threadReads,
-    readTick, reconnectTick, setReconnectTick, acceptRead, refreshSnap,
+    snap, setSnap, latestTelegramHealth, readFence, snapshotLoad, archivedLoad, readRefresh, channelReads, threadReads,
+    readTick, reconnectTick, setReconnectTick, acceptRead, refreshSnap, refreshArchivedChannels,
   };
 }
 
