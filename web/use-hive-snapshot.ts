@@ -16,6 +16,8 @@ export function useHiveSnapshot(setErr: (error: string) => void) {
   // Full and room-only loads share ordering for this projection, not for the
   // roster/read state. A late room response must never replace the whole hive.
   const archivedLoad = useRef(createRequestGate());
+  const archivedRequest = useRef(0);
+  const archivedAccepted = useRef(0);
   const latestArchivedChannelIds = useRef<Snapshot['archivedChannelIds']>(undefined);
   const readRefresh = useRef<ReturnType<typeof createReadRefresh> | null>(null);
   const channelReads = useRef<ReturnType<typeof createReceiptQueue> | null>(null);
@@ -68,22 +70,30 @@ export function useHiveSnapshot(setErr: (error: string) => void) {
 
   const refreshArchivedChannels = useCallback(async () => {
     const load = archivedLoad.current.begin();
+    const request = ++archivedRequest.current;
     const ticket = readFence.current.ticket();
     const next = await api.snapshot(load.signal);
     if (!load.valid() || !readFence.current.current(ticket)) return;
+    archivedAccepted.current = request;
     latestArchivedChannelIds.current = next.archivedChannelIds;
     setSnap(previous => previous ? { ...previous, archivedChannelIds: next.archivedChannelIds } : previous);
   }, []);
 
   const refreshSnap = useCallback(async () => {
     const load = snapshotLoad.current.begin();
-    const archived = archivedLoad.current.begin();
+    archivedLoad.current.cancel();
+    const request = ++archivedRequest.current;
     const ticket = readFence.current.ticket();
     const raw = await api.snapshot(load.signal);
     latestTelegramHealth.current = newerTelegramHealth(latestTelegramHealth.current, raw.telegram);
     const next = { ...raw, telegram: { running: false, configured: false, ...raw.telegram, ...latestTelegramHealth.current } };
     if (!load.valid() || !readFence.current.current(ticket)) return next;
-    if (archived.valid()) latestArchivedChannelIds.current = next.archivedChannelIds;
+    // A pending/failed room request cannot invalidate usable archive metadata.
+    // Only a newer successfully accepted result supersedes this response.
+    if (request > archivedAccepted.current) {
+      archivedAccepted.current = request;
+      latestArchivedChannelIds.current = next.archivedChannelIds;
+    }
     const accepted = acceptRead(next, ticket);
     setSnap((previous) => ({ ...next, archivedChannelIds: latestArchivedChannelIds.current,
       ...(!accepted && previous ? readFields(previous) : {}) }));

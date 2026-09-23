@@ -273,6 +273,43 @@ test("archived channels are consultable, searchable and project-scoped without m
   expect(harnesses.get(page)!.receipts).toEqual([]);
 });
 
+for (const scenario of ["selected-search", "new-search", "direct-link", "remount"] as const) {
+  test(`archived navigation reveals a new target after manual collapse (${scenario})`, async ({ page }) => {
+    const alpha = project("alpha", "Alpha Hive"), a = channel("a", "General", alpha);
+    const first = channel("first", "review-one", alpha), second = channel("second", "review-two", alpha);
+    const channels = [a, first, second];
+    const snap = { ...snapshot([alpha], channels), archivedChannelIds: [first.id, second.id], unread: { first: 7, second: 9 } };
+    await installSnapshot(page, () => snap);
+    const sockets = await installSocketHarness(page);
+    await installMessages(page, (route, id) => fulfillJson(route, payload(channels.find(ch => ch.id === id)!, [])));
+    await page.route("**/api/ui/search?*", route => fulfillJson(route, { hits: [], hasMore: false }));
+    await page.goto(scenario === "new-search" ? "/#/c/a" : "/#/c/first");
+    const archived = page.locator(".archived-channels");
+    const search = page.getByRole("textbox", { name: "Search projects and messages" });
+    if (scenario === "new-search") await search.fill("review");
+    await expect(archived).toHaveAttribute("open", "");
+    const summary = archived.locator("summary");
+    await summary.focus();
+    await page.keyboard.press(scenario === "new-search" ? "Space" : "Enter");
+    await expect(archived).not.toHaveAttribute("open", "");
+    // Roster traffic must not override a deliberate collapse of this target.
+    await expect.poll(() => sockets.length).toBe(1);
+    sockets[0]!.send(JSON.stringify({ type: "agent", payload: { ...human, lastSeenAt: 2 } }));
+    await expect(archived).not.toHaveAttribute("open", "");
+    if (scenario === "direct-link") await page.evaluate(() => { location.hash = "#/c/second"; });
+    else if (scenario === "remount") {
+      const projectToggle = page.locator(".project-sec .twist");
+      await projectToggle.click();
+      await expect(archived).toHaveCount(0);
+      await projectToggle.click();
+    } else await search.fill(scenario === "selected-search" ? "review-one" : "review-two");
+    const target = scenario === "selected-search" || scenario === "remount" ? "# review-one 7" : "# review-two 9";
+    await expect(archived.getByRole("button", { name: target, exact: true })).toBeVisible();
+    if (scenario === "direct-link") await expect(archived.getByRole("button", { name: target, exact: true })).toHaveClass(/active/);
+    expect(harnesses.get(page)!.receipts).toEqual([]);
+  });
+}
+
 test("archive and reopen update other channels live and preserve a selected channel thread", async ({ page }) => {
   const alpha = project("alpha", "Alpha Hive"), a = channel("a", "General", alpha), b = channel("b", "Review", alpha);
   let snap: Snapshot = { ...snapshot([alpha], [a, b]), archivedChannelIds: [] };

@@ -11,6 +11,8 @@ Channels with an archived room move out of the main channel list into a collapse
 channel or following a link to it reveals the archived entry automatically.
 Archiving or reopening a room updates the sidebar live, without navigating away
 from an open channel or thread. Reopening restores the entry to the main list.
+Manual collapse is preserved through ordinary live updates; a new search or
+archived-channel selection reveals the relevant entry again.
 
 This is navigation only: history, access, unread counts, delivery receipts and
 source lifecycle rules are unchanged. Expanding the section does not mark messages
@@ -24,6 +26,8 @@ server without this metadata leaves all channels in the main list.
 Room events refresh only the archive projection in the client, preserving newer
 live channels, agent presence and read/queue counters. Overlapping room refreshes
 and full reconnect snapshots are ordered so a late response cannot undo a reopen.
+A failed refresh does not discard archive metadata from a successful overlapping
+snapshot, nor roll back a newer successful result.
 
 ## Two modes
 

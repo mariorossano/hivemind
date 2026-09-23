@@ -120,3 +120,29 @@ test('failed and aborted room loads preserve state; a later refresh and old serv
   await pending.finish(snapshot(['room']));
   assert.deepEqual(f.hive.snap, final);
 });
+
+for (const initialized of [false, true]) {
+  for (const failureFirst of [false, true]) {
+    test(`failed room refresh retains successful ${initialized ? 'replacement' : 'initial'} archive metadata (failure first: ${failureFirst})`, async t => {
+      const f = await fixture(t);
+      if (initialized) await f.load('refreshSnap').finish(snapshot(['old-archive']));
+      const full = f.load('refreshSnap');
+      const room = f.load('refreshArchivedChannels');
+      if (failureFirst) await room.fail(new Error('Fixture offline'));
+      await full.finish(snapshot(['current-archive']));
+      if (!failureFirst) await room.fail(new Error('Fixture offline'));
+      assert.deepEqual(f.hive.snap?.archivedChannelIds, ['current-archive']);
+    });
+  }
+}
+
+for (const ids of [[], undefined]) {
+  test(`a failed later request cannot roll back successfully received ${ids ? 'empty' : 'missing'} archive metadata`, async t => {
+    const f = await fixture(t);
+    const full = f.load('refreshSnap');
+    await f.load('refreshArchivedChannels').finish(snapshot(ids));
+    await f.load('refreshArchivedChannels').fail(new Error('Fixture offline'));
+    await full.finish(snapshot(['stale-archive']));
+    assert.equal(f.hive.snap?.archivedChannelIds, ids);
+  });
+}

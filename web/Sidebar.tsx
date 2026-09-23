@@ -1,3 +1,4 @@
+import { useLayoutEffect, useRef } from "react";
 import { isLiveSearchQuery } from "../src/shared/search-query.ts";
 import type { Agent, Channel, Project } from "../src/shared/types.ts";
 import { AgentList } from "./AgentList.tsx";
@@ -171,6 +172,14 @@ function ProjectSection({ project, snap, sel, go, query, open, onToggle, onSetti
   const archivedIds = new Set(snap.archivedChannelIds ?? []);
   const activeChannels = publics.filter(ch => !archivedIds.has(ch.id));
   const archivedChannels = publics.filter(ch => archivedIds.has(ch.id));
+  const selectedArchived = sel.kind === "channel" && archivedChannels.some(ch => ch.id === sel.id) ? sel.id : null;
+  const archivedSection = useRef<HTMLDetailsElement>(null);
+  const hasArchived = archivedChannels.length > 0;
+  // Keep native disclosure state (including manual toggles) in the DOM. Reveal
+  // a new search/selection or remounted section, not ordinary roster/read updates.
+  useLayoutEffect(() => {
+    if (archivedSection.current) archivedSection.current.open = Boolean(q || selectedArchived);
+  }, [q, selectedArchived, open, hasArchived]);
   const projectDms = channels.filter((c) => c.project === project.slug && c.type === "dm" && match(c.name));
   const openDms = projectDms
     .filter((c) => !closedDms.includes(c.id))
@@ -268,7 +277,7 @@ function ProjectSection({ project, snap, sel, go, query, open, onToggle, onSetti
             </div>
             {activeChannels.map(channelRow)}
             {archivedChannels.length > 0 && (
-              <details className="archived-channels" open={q || (sel.kind === "channel" && archivedChannels.some(ch => ch.id === sel.id)) ? true : undefined}>
+              <details className="archived-channels" ref={archivedSection}>
                 <summary>Archived <span>{archivedChannels.length}</span></summary>
                 {archivedChannels.map(channelRow)}
               </details>
