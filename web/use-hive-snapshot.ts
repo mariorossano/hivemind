@@ -73,7 +73,7 @@ export function useHiveSnapshot(setErr: (error: string) => void) {
     const request = ++archivedRequest.current;
     const ticket = readFence.current.ticket();
     const next = await api.snapshot(load.signal);
-    if (!load.valid() || !readFence.current.current(ticket)) return;
+    if (!load.valid() || !readFence.current.current(ticket) || request < archivedAccepted.current) return;
     archivedAccepted.current = request;
     latestArchivedChannelIds.current = next.archivedChannelIds;
     setSnap(previous => previous ? { ...previous, archivedChannelIds: next.archivedChannelIds } : previous);
@@ -81,7 +81,6 @@ export function useHiveSnapshot(setErr: (error: string) => void) {
 
   const refreshSnap = useCallback(async () => {
     const load = snapshotLoad.current.begin();
-    archivedLoad.current.cancel();
     const request = ++archivedRequest.current;
     const ticket = readFence.current.ticket();
     const raw = await api.snapshot(load.signal);
@@ -94,6 +93,9 @@ export function useHiveSnapshot(setErr: (error: string) => void) {
       archivedAccepted.current = request;
       latestArchivedChannelIds.current = next.archivedChannelIds;
     }
+    // Abort an older room-only request only once this snapshot has been
+    // accepted; if this refresh fails, the pending room request still lands.
+    if (archivedRequest.current === request) archivedLoad.current.cancel();
     const accepted = acceptRead(next, ticket);
     setSnap((previous) => ({ ...next, archivedChannelIds: latestArchivedChannelIds.current,
       ...(!accepted && previous ? readFields(previous) : {}) }));

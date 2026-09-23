@@ -176,9 +176,9 @@ function ProjectSection({ project, snap, sel, go, query, open, onToggle, onSetti
   const archivedSection = useRef<HTMLDetailsElement>(null);
   const hasArchived = archivedChannels.length > 0;
   // Keep native disclosure state (including manual toggles) in the DOM. Reveal
-  // a new search/selection or remounted section, not ordinary roster/read updates.
+  // a new search/selection or remounted section, but never collapse it for the Human.
   useLayoutEffect(() => {
-    if (archivedSection.current) archivedSection.current.open = Boolean(q || selectedArchived);
+    if (archivedSection.current && (q || selectedArchived)) archivedSection.current.open = true;
   }, [q, selectedArchived, open, hasArchived]);
   const projectDms = channels.filter((c) => c.project === project.slug && c.type === "dm" && match(c.name));
   const openDms = projectDms

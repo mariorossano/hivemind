@@ -95,9 +95,9 @@ for (const roomFirst of [true, false]) {
     const room = f.load('refreshArchivedChannels');
     f.hive.readFence.current.reset();
     const reconnect = f.load('refreshSnap');
-    assert.equal(room.signal?.aborted, true);
     if (roomFirst) await room.finish(snapshot(['room']));
     await reconnect.finish(snapshot([]));
+    assert.equal(room.signal?.aborted, true);
     if (!roomFirst) await room.finish(snapshot(['room']));
     assert.deepEqual(f.hive.snap?.archivedChannelIds, []);
   });
@@ -146,3 +146,25 @@ for (const ids of [[], undefined]) {
     assert.equal(f.hive.snap?.archivedChannelIds, ids);
   });
 }
+
+test('a failed full refresh does not abort a pending room refresh', async t => {
+  const f = await fixture(t);
+  await f.load('refreshSnap').finish(snapshot([]));
+  const room = f.load('refreshArchivedChannels');
+  await f.load('refreshSnap').fail(new Error('Fixture offline'));
+  assert.equal(room.signal?.aborted, false);
+  await room.finish(snapshot(['room']));
+  assert.deepEqual(f.hive.snap?.archivedChannelIds, ['room']);
+});
+
+test('an accepted full refresh aborts and supersedes an older pending room refresh', async t => {
+  const f = await fixture(t);
+  await f.load('refreshSnap').finish(snapshot([]));
+  const room = f.load('refreshArchivedChannels');
+  const full = f.load('refreshSnap');
+  assert.equal(room.signal?.aborted, false);
+  await full.finish(snapshot(['current']));
+  assert.equal(room.signal?.aborted, true);
+  await room.finish(snapshot(['stale']));
+  assert.deepEqual(f.hive.snap?.archivedChannelIds, ['current']);
+});

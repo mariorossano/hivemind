@@ -85,6 +85,13 @@ test('a delayed room refresh preserves a newer live channel and its selection', 
   assert.ok(find(), 'the late room response must not erase the newer live channel');
   assert.equal(window.location.hash, `#/c/${newer.id}`, 'the late room response must not navigate away');
   assert.ok(host.querySelector('.archived-channels'), 'archive metadata still updates');
+  const archived = () => host.querySelector<HTMLDetailsElement>('.archived-channels')!;
+  const archivedButton = [...archived().querySelectorAll('button')].find(button => button.textContent?.includes('# existing-room'))!;
+  await act(async () => archivedButton.click());
+  assert.equal(archived().open, true, 'selecting an archived room reveals the section');
+  await act(async () => find()!.click());
+  assert.equal(window.location.hash, `#/c/${newer.id}`);
+  assert.equal(archived().open, true, 'leaving an archived room must not collapse the section');
 });
 
 test('mounted Human App follows task review and contract history without offering generic task status edits', async t => {
