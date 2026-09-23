@@ -16,6 +16,14 @@ const pane = (messages = [message(1)], snapshotSeq = 1): ChannelPayload => ({
 });
 const thread = (id: string, status: Thread["status"] = "blocked"): Thread => ({ id, channelId: "c", status });
 
+test('an unread jump retains its target before trimming a full live arrival window', () => {
+  const journal = beginChannelJournal('c');
+  for (let seq = 2; seq <= LIVE_MESSAGE_WINDOW + 1; seq++) recordChannelMessage(journal, message(seq));
+  const next = reconcileChannelSnapshot(null, pane([message(1)]), journal, false, true, 1)!;
+  assert.deepEqual(next.messages.map(m => m.seq), [1]);
+  assert.equal(next.historyThrough, 1); assert.equal(next.deferredLive, true);
+});
+
 test("late channel snapshots preserve pending roots, reactions, status and exactly counted replies", () => {
   const snapshot = { ...pane([message(1)], 2), replyCounts: { m1: 1 }, threads: [thread("m1", "open")] };
   const journal = beginChannelJournal("c");

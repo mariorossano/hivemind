@@ -199,6 +199,9 @@ export const api = {
     if (limit) params.set("limit", String(limit));
     return req<{ hits: SearchHit[]; hasMore: boolean }>(`/api/ui/search?${params}`, { signal });
   },
+  lastUnread: (id: string, signal?: AbortSignal) =>
+    req<{ target: { channelId: string; seq: number; threadId: string | null } | null }>(
+      `/api/ui/channels/${encodeURIComponent(id)}/last-unread`, { signal }),
   messages: (id: string, threadId?: string | null, beforeSeq?: number, signal?: AbortSignal, afterSeq?: number) => {
     const q = new URLSearchParams();
     if (threadId) q.set("threadId", threadId);

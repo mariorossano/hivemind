@@ -185,6 +185,89 @@ async function installSocketHarness(page: Page) {
   return sockets;
 }
 
+for (const inThread of [false, true]) for (const alreadyOpen of [false, true]) {
+  test(`unread badge jumps to the exact latest unread page (thread=${inThread}, open=${alreadyOpen})`, async ({ page }, testInfo) => {
+    const p = project('alpha', 'Alpha Hive');
+    const a = { ...channel('a', 'Anvil · Human', p), type: 'dm' as const }, b = channel('b', 'Beta', p);
+    const snap = { ...snapshot([p], [a, b]), unread: { a: 3 } };
+    const root = message('root', 1, a.id, 'An old thread root');
+    const thread = inThread ? root.id : null;
+    const target = message('target', 240, a.id, 'The latest unread message', thread,
+      { authorId: 'anvil', authorName: 'Anvil', authorRole: 'worker' });
+    const context = Array.from({ length: 20 }, (_, i) => message(`context-${i}`, 220 + i, a.id, `Context ${i}. ${'Older content. '.repeat(80)}`, thread));
+    const requests: string[] = [];
+    await installSnapshot(page, () => snap); await installSocketHarness(page);
+    await page.route('**/api/ui/channels/a/last-unread', route => fulfillJson(route, { target: { channelId: a.id, threadId: thread, seq: target.seq } }));
+    await installMessages(page, async (route, id, threadId) => {
+      const url = new URL(route.request().url()); requests.push(url.search);
+      if (id === b.id) return fulfillJson(route, payload(b, []));
+      if (url.searchParams.get('beforeSeq') === '241') {
+        expect(threadId).toBe(thread);
+        return fulfillJson(route, { ...payload(a, [...context, target]), threadId: thread, hasOlder: true, hasNewer: true });
+      }
+      return fulfillJson(route, { ...payload(a, [message('latest', 1000, a.id, 'Ordinary channel view', threadId)]), threadId });
+    });
+    await page.goto(`/#/c/${alreadyOpen ? a.id : b.id}`);
+    if (alreadyOpen) await expect(page.getByText('Ordinary channel view', { exact: true })).toBeVisible();
+    const badge = page.getByRole('button', { name: 'Jump to last unread message in Anvil · Human (3 unread)', exact: true });
+    await expect(badge).toBeVisible();
+    expect(await page.locator('button button').count()).toBe(0);
+    if (inThread) { await badge.focus(); await page.keyboard.press(alreadyOpen ? 'Space' : 'Enter'); } else await badge.click();
+    const scope = page.locator(inThread ? 'aside.thread' : 'main.desk');
+    const row = scope.locator('[data-message-seq="240"]');
+    await expect(row).toHaveClass(/unread-target/); await expect(row).toBeInViewport(); await expect(row).toBeFocused();
+    expect(requests.some(q => q.includes('beforeSeq=241'))).toBe(true);
+    await expect.poll(() => harnesses.get(page)!.receipts.flat().includes(240)).toBe(true);
+    expect(harnesses.get(page)!.receipts.flat().includes(219)).toBe(false);
+    if (inThread) await expect(page).toHaveURL(/\/t\/root$/);
+    await page.screenshot({ path: testInfo.outputPath('unread-target.png') });
+    // Repeated activation works even when the channel/thread selection is identical.
+    await scope.locator('.stream').evaluate(el => { el.scrollTop = 0; });
+    await badge.click(); await expect(row).toBeInViewport();
+  });
+}
+
+for (const delayed of ['lookup', 'page'] as const) {
+  test(`unread badge discards delayed ${delayed} after navigation, including a later return`, async ({ page }) => {
+    const p = project('alpha', 'Alpha Hive'), a = channel('a', 'Alpha', p), b = channel('b', 'Beta', p);
+    const snap = { ...snapshot([p], [a, b]), unread: { a: 1 } }, started = deferred(), release = deferred();
+    let targeted = 0;
+    await installSnapshot(page, () => snap); await installSocketHarness(page);
+    await page.route('**/api/ui/channels/a/last-unread', async route => {
+      if (delayed === 'lookup') { started.resolve(); await release.promise; }
+      try { await fulfillJson(route, { target: { channelId: a.id, threadId: null, seq: 5 } }); } catch { /* request aborted */ }
+    });
+    await installMessages(page, async (route, id) => {
+      if (new URL(route.request().url()).searchParams.has('beforeSeq')) {
+        targeted++; started.resolve(); await release.promise;
+        try { await fulfillJson(route, payload(a, [message('target', 5, a.id, 'stale unread target')])); } catch { /* request aborted */ }
+      } else await fulfillJson(route, payload(id === a.id ? a : b, [message('current-' + id, 50, id, 'current ' + id)]));
+    });
+    await page.goto('/#/c/b');
+    await page.getByRole('button', { name: 'Jump to last unread message in Alpha (1 unread)', exact: true }).click();
+    await started.promise; await page.getByRole('button', { name: '# Beta', exact: true }).click();
+    release.resolve(); await expect(page.getByText('current b', { exact: true })).toBeVisible();
+    await expect(page.getByText('stale unread target', { exact: true })).toHaveCount(0);
+    await page.getByRole('button', { name: '# Alpha', exact: true }).click();
+    await expect(page.getByText('current a', { exact: true })).toBeVisible();
+    expect(targeted).toBe(delayed === 'page' ? 1 : 0);
+    expect(harnesses.get(page)!.receipts.flat()).not.toContain(5);
+  });
+}
+
+for (const outcome of ['empty', 'failure'] as const) {
+  test(`unread badge ${outcome} leaves the current conversation intact`, async ({ page }) => {
+    const p = project('alpha', 'Alpha Hive'), a = channel('a', 'Alpha', p), b = channel('b', 'Beta', p);
+    await installSnapshot(page, () => ({ ...snapshot([p], [a, b]), unread: { a: 1 } })); await installSocketHarness(page);
+    await installMessages(page, (route, id) => fulfillJson(route, payload(b, [message('b', 3, id, 'Keep my place')])));
+    await page.route('**/api/ui/channels/a/last-unread', route => fulfillJson(route,
+      outcome === 'empty' ? { target: null } : { error: 'fixture unavailable' }, outcome === 'empty' ? 200 : 503));
+    await page.goto('/#/c/b'); await page.getByRole('button', { name: 'Jump to last unread message in Alpha (1 unread)', exact: true }).click();
+    await expect(page.locator('.err')).toContainText(outcome === 'empty' ? 'No unread messages remain' : 'fixture unavailable');
+    await expect(page).toHaveURL(/\/c\/b$/); await expect(page.getByText('Keep my place', { exact: true })).toBeVisible();
+  });
+}
+
 test("slow channel A cannot overwrite channel B after navigation", async ({ page }) => {
   const alpha = project("alpha", "Alpha Hive");
   const a = channel("a", "Alpha", alpha);
@@ -223,7 +306,7 @@ test("slow channel A cannot overwrite channel B after navigation", async ({ page
   releaseA.resolve();
   await expect(page.getByRole("heading", { name: "#Beta" })).toBeVisible();
   await expect(page.getByText("stale alpha body", { exact: true })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "# Beta" })).toHaveClass(/active/);
+  await expect(page.getByRole("button", { name: "# Beta" }).locator('..')).toHaveClass(/active/);
 });
 
 test("archived channels are consultable, searchable and project-scoped without marking them read on expansion", async ({ page }, testInfo) => {
@@ -238,10 +321,10 @@ test("archived channels are consultable, searchable and project-scoped without m
   await page.goto("/#/c/a");
   const section = page.locator(".project-sec").filter({ hasText: "Alpha Hive" });
   const archived = section.locator(".archived-channels");
-  const oldRow = archived.getByRole("button", { name: "# review-closed 7", exact: true });
+  const oldRow = archived.getByRole("button", { name: "# review-closed", exact: true });
   await expect(archived).not.toHaveAttribute("open", "");
   await expect(oldRow).toBeHidden();
-  await expect(section.locator(".group > button.nav")).toHaveText(["# General"]);
+  await expect(section.locator(".group > .nav .nav-open")).toHaveText(["# General"]);
   const summary = archived.locator("summary");
   await expect(summary).toHaveText("Archived 1");
   await summary.focus();
@@ -269,7 +352,7 @@ test("archived channels are consultable, searchable and project-scoped without m
   await expect(page).toHaveURL(/#\/c\/old$/);
   await page.reload();
   await expect(oldRow).toBeVisible();
-  await expect(oldRow).toHaveClass(/active/);
+  await expect(oldRow.locator('..')).toHaveClass(/active/);
   expect(harnesses.get(page)!.receipts).toEqual([]);
 });
 
@@ -303,9 +386,9 @@ for (const scenario of ["selected-search", "new-search", "direct-link", "remount
       await expect(archived).toHaveCount(0);
       await projectToggle.click();
     } else await search.fill(scenario === "selected-search" ? "review-one" : "review-two");
-    const target = scenario === "selected-search" || scenario === "remount" ? "# review-one 7" : "# review-two 9";
+    const target = scenario === "selected-search" || scenario === "remount" ? "# review-one" : "# review-two";
     await expect(archived.getByRole("button", { name: target, exact: true })).toBeVisible();
-    if (scenario === "direct-link") await expect(archived.getByRole("button", { name: target, exact: true })).toHaveClass(/active/);
+    if (scenario === "direct-link") await expect(archived.getByRole("button", { name: target, exact: true }).locator('..')).toHaveClass(/active/);
     expect(harnesses.get(page)!.receipts).toEqual([]);
   });
 }

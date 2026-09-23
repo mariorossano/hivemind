@@ -63,6 +63,14 @@ export class ReadState {
     return { ids: rows.slice(0, cap).map((row) => row.id), hasMore: rows.length > cap };
   }
 
+  latestUnread(actorId: string, channelId: string) {
+    const q = this.scope(actorId, [channelId]);
+    const row = this.db.prepare(`SELECT m.seq, m.thread_id AS threadId
+      ${q.from} WHERE ${q.where} ORDER BY m.seq DESC LIMIT 1`).get(...q.params) as
+      { seq: number; threadId: string | null } | undefined;
+    return row ? { channelId, seq: row.seq, threadId: row.threadId } : null;
+  }
+
   counts(actorId: string, channelIds: string[]) {
     const q = this.scope(actorId, channelIds);
     const rows = this.db.prepare(`SELECT m.channel_id AS id, COUNT(*) AS n

@@ -23,14 +23,19 @@ export function useThreadPane({ sel, threadId, selRef, threadIdRef, viewingThrea
   const threadLoad = useRef(createRequestGate());
   const threadLoadIdRef = useRef(0);
 
-  const loadThread = useCallback(async (channelId: string, root: string, confirmed?: Message, returnToLive = !!confirmed) => {
+  const loadThread = useCallback(async (channelId: string, root: string, confirmed?: Message, returnToLive = !!confirmed, targetSeq?: number) => {
     if (!viewingThread(channelId, root)) return;
     const requestId = ++threadLoadIdRef.current;
     const load = threadLoad.current.begin();
     setThreadView(view => beginThreadLoad(view, channelId, root, requestId, returnToLive, confirmed ? [confirmed] : []));
     try {
-      const data = await api.messages(channelId, root, undefined, load.signal);
-      if (load.valid() && viewingThread(channelId, root)) setThreadView(view => receiveThreadSnapshot(view, root, data, requestId));
+      const data = await api.messages(channelId, root, targetSeq === undefined ? undefined : targetSeq + 1, load.signal);
+      if (load.valid() && viewingThread(channelId, root)) {
+        if (targetSeq !== undefined && !data.messages.some(m => m.seq === targetSeq))
+          throw new Error("The unread reply is no longer available. Refresh and try again.");
+        setThreadView(view => receiveThreadSnapshot(view, root, data, requestId, targetSeq));
+        return true;
+      }
     } catch (error) {
       if (load.valid() && viewingThread(channelId, root) && requestId === threadLoadIdRef.current) {
         setThreadView(view => failThreadLoad(view, requestId));

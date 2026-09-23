@@ -21,7 +21,7 @@ export function Msg({
   const time = new Date(m.createdAt).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
   const placed = (m.reactions ?? []).filter((r) => r.count > 0);
   return (
-    <article className={`msg role-${m.authorRole} kind-${m.kind}`}>
+    <article className={`msg role-${m.authorRole} kind-${m.kind}`} data-message-seq={m.seq}>
       <Avatar name={m.authorName} role={m.authorRole} />
       <div>
         <div className="msg-h">

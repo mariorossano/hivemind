@@ -16,6 +16,14 @@ function pane(messages: Message[], threadId: string | null = "root"): ChannelPay
     threads: [], replyCounts: {}, hasOlder: false, hasNewer: true, cursors: { after: 2 } };
 }
 
+test('an unread reply jump survives a full live arrival window without acknowledging later replies', () => {
+  let view = beginThreadLoad(null, 'channel', 'root', 1, true);
+  for (let seq = 3; seq <= LIVE_MESSAGE_WINDOW + 2; seq++) view = receiveThreadMessage(view, message(seq));
+  const next = receiveThreadSnapshot(view, 'root', pane([message(1), message(2)]), 1, 2)!;
+  assert.deepEqual(next.pane!.messages.map(m => m.seq), [1, 2]);
+  assert.equal(next.pane!.historyThrough, 2); assert.equal(next.pane!.deferredLive, true);
+});
+
 test("live window is immutable, finite and preserves no-op references", () => {
   const items = [1, 2, 3];
   assert.equal(retainNewest(items).items, items);

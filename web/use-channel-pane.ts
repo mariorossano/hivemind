@@ -14,7 +14,8 @@ export function useChannelPane(selRef: MutableRefObject<Sel>) {
   const channelJournal = useRef<ChannelJournal | null>(null);
   const channelRefreshIntent = useRef<{ channelId: string; confirmations: Message[] } | null>(null);
 
-  const loadChannel = useCallback(async (id: string, before?: number, confirmed?: Message[]) => {
+  const loadChannel = useCallback(async (id: string, before?: number, confirmed?: Message[], targetSeq?: number) => {
+    if (targetSeq !== undefined) before = targetSeq + 1;
     // A replacement/reconnect GET must not silently cancel the Human's pending
     // return-to-live. Explicit older-page navigation and selection changes can.
     if (before !== undefined) channelRefreshIntent.current = null;
@@ -36,9 +37,14 @@ export function useChannelPane(selRef: MutableRefObject<Sel>) {
           if (attempt < 2) continue;
           throw new Error("Live traffic overtook the channel refresh. Reload the page to retry.");
         }
-        setPane((current) => reconcileChannelSnapshot(current, data, journal, before !== undefined, !!intent));
+        if (targetSeq !== undefined && !data.messages.some(m => m.seq === targetSeq))
+          throw new Error("The unread message is no longer available. Refresh and try again.");
+        setPane((current) => {
+          if (targetSeq === undefined) return reconcileChannelSnapshot(current, data, journal, before !== undefined, !!intent);
+          return reconcileChannelSnapshot(null, data, journal, false, true, targetSeq);
+        });
         if (channelRefreshIntent.current === intent) channelRefreshIntent.current = null;
-        return;
+        return true;
       } catch (error) {
         if (!load.valid() || selRef.current.kind !== "channel" || selRef.current.id !== id) return;
         throw error;

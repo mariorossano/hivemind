@@ -18,7 +18,7 @@ type AgentActions = {
 
 /** The left rail: brand and tools, the search box and one section per project. */
 export function Sidebar({ snap, sel, go, live, theme, onToggleTheme, query, setQuery, onSearchNow, onTelegram,
-  onAdaptiveRouting, onLaunch, onHelp, selectedProject, inboxBox, projectSheets, onNewChannel, dms, agentActions }: {
+  onAdaptiveRouting, onLaunch, onHelp, selectedProject, inboxBox, projectSheets, onNewChannel, dms, agentActions, onUnread }: {
   snap: Snapshot;
   sel: Sel;
   go: (next: Sel) => void;
@@ -38,6 +38,7 @@ export function Sidebar({ snap, sel, go, live, theme, onToggleTheme, query, setQ
   onNewChannel: (project: string) => void;
   dms: DmNav;
   agentActions: AgentActions;
+  onUnread: (channelId: string) => void;
 }) {
   const projects = snap.projects ?? [];
   return (
@@ -121,14 +122,14 @@ export function Sidebar({ snap, sel, go, live, theme, onToggleTheme, query, setQ
           open={projectSheets.openProjects[project.slug] ?? project.slug === selectedProject}
           onToggle={(open) => projectSheets.setOpenProjects((g) => ({ ...g, [project.slug]: open }))}
           onSettings={() => projectSheets.editProject(project)} inboxBox={inboxBox} onNewChannel={onNewChannel}
-          dms={dms} agentActions={agentActions} onLaunch={onLaunch} />
+          dms={dms} agentActions={agentActions} onLaunch={onLaunch} onUnread={onUnread} />
       ))}
     </aside>
   );
 }
 
 function ProjectSection({ project, snap, sel, go, query, open, onToggle, onSettings, inboxBox, onNewChannel, dms, agentActions,
-  onLaunch }: {
+  onLaunch, onUnread }: {
   project: Project;
   snap: Snapshot;
   sel: Sel;
@@ -142,6 +143,7 @@ function ProjectSection({ project, snap, sel, go, query, open, onToggle, onSetti
   dms: DmNav;
   agentActions: AgentActions;
   onLaunch: (project: string) => void;
+  onUnread: (channelId: string) => void;
 }) {
   const { closedDms, closeDm, reopenDm, dmPicker, setDmPicker, dmPickQ, setDmPickQ, dmMenu, setDmMenu } = dms;
   const channels = snap.channels ?? [];
@@ -205,6 +207,7 @@ function ProjectSection({ project, snap, sel, go, query, open, onToggle, onSetti
       unread={snap.unread[ch.id] ?? 0}
       active={sel.kind === "channel" && sel.id === ch.id}
       onClick={() => go({ kind: "channel", id: ch.id })}
+      onUnread={() => onUnread(ch.id)}
     />
   );
   const dmRow = (ch: Channel) => (
@@ -215,6 +218,7 @@ function ProjectSection({ project, snap, sel, go, query, open, onToggle, onSetti
       active={sel.kind === "channel" && sel.id === ch.id}
       menuOpen={dmMenu === ch.id}
       onClick={() => go({ kind: "channel", id: ch.id })}
+      onUnread={() => { setDmMenu(null); onUnread(ch.id); }}
       onMenu={() => setDmMenu((cur) => (cur === ch.id ? null : ch.id))}
       onClose={() => hideDm(ch)}
     />

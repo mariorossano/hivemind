@@ -111,7 +111,7 @@ export function receiveThreadTask(view: ThreadView, task: TaskSnapshot): ThreadV
   return { ...view, pane: { ...view.pane, task: reconcileTask(view.pane.task, task) } };
 }
 
-export function receiveThreadSnapshot(view: ThreadView | null, threadId: string, data: ChannelPayload, requestId: number): ThreadView | null {
+export function receiveThreadSnapshot(view: ThreadView | null, threadId: string, data: ChannelPayload, requestId: number, holdThrough?: number): ThreadView | null {
   if (!view || view.channelId !== data.channel.id || view.threadId !== threadId || view.pendingLoad?.id !== requestId) return view;
   const returnToLive = view.returnToLive;
   const currentMessages = returnToLive ? [] : view.pane?.messages ?? view.pendingMessages;
@@ -126,8 +126,9 @@ export function receiveThreadSnapshot(view: ThreadView | null, threadId: string,
   return {
     ...view, pendingMessages: [], pendingTask: undefined, pendingLoad: undefined,
     historyTruncated: undefined, returnToLive: undefined, confirmations: undefined,
-    pane: boundLivePane({ ...data, threads, historyThrough: returnToLive ? undefined : view.pane?.historyThrough,
-      deferredLive: returnToLive ? undefined : view.pane?.deferredLive, messages: messages.filter(message => belongs(view, message)),
+    pane: boundLivePane({ ...data, threads, historyThrough: holdThrough ?? (returnToLive ? undefined : view.pane?.historyThrough),
+      deferredLive: holdThrough !== undefined ? Boolean(data.hasNewer) : returnToLive ? undefined : view.pane?.deferredLive,
+      messages: messages.filter(message => belongs(view, message)),
       hasOlder: data.hasOlder || (!returnToLive && view.historyTruncated) || view.pendingLoad.truncated,
       task: reconcileTask(view.pane?.task ?? view.pendingTask, data.task) }),
   };

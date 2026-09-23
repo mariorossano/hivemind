@@ -34,6 +34,7 @@ import { useAgentConfirm, useChannelSheets, useProjectSheets, useTelegramSheet }
 import { useTheme } from "./use-theme.ts";
 import { useThreadPane } from "./use-thread-pane.ts";
 import { useThreadScrollAnchor } from "./use-thread-scroll-anchor.ts";
+import { useUnreadJump } from "./use-unread-jump.ts";
 
 export function App() {
   // Hook order is effect order: the read queues (useHiveSnapshot) exist before
@@ -91,6 +92,8 @@ export function App() {
   const [theme, setTheme] = useTheme();
   const { stickBottom, threadOpenAnchor } = useThreadScrollAnchor({ channelStream: channelPane.channelStream,
     threadStream: threadState.threadStream, pane, threadPane, selectedChannelId, threadId });
+  const openUnread = useUnreadJump({ selection, channel: channelPane, thread: threadState, go,
+    clearSearch: () => search.setQuery(''), refreshSnap, setErr });
   useEffect(() => { setRoutingPanelOpen(false); }, [activeChannel?.id]);
   const compose = useSend({ sel, selection, channel: channelPane, thread: threadState, activeBrainChannel,
     refreshRoutingView, setErr });
@@ -148,7 +151,7 @@ export function App() {
 
   return (
     <div className="shell">
-      <Sidebar snap={snap} sel={sel} go={go} live={live} theme={theme}
+      <Sidebar snap={snap} sel={sel} go={go} live={live} theme={theme} onUnread={openUnread}
         onToggleTheme={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
         query={search.query} setQuery={search.setQuery} onSearchNow={search.searchNow}
         onTelegram={() => telegramSheet.openTelegram(snap?.projects ?? [])}
