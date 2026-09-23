@@ -93,7 +93,7 @@ node scripts/benchmark-topology.mjs validate --input /tmp/study-observed.json
 
 The exported study passes `benchmark-topology.mjs validate`. It carries only relative `evidenceRef` values (`trials/<id>/attempt-NNN`). Raw logs, databases and workspaces stay local in the run directory. Every automated observation has `independentlyReviewed: false` and `routingReview: null`. `defects` is the automated acceptance count until an independent reviewer records their own. A reviewer writes a **new** study file with their defect counts, `independentlyReviewed: true` and any routing labels they can support. Only then does `summarize` accept it.
 
-`instrumentationHealthy` is false for unknown usage, unknown wall time, sanitized collector warnings in the trial server log, pending Jev attempts, incomplete Jev history, or invalid/missing router evidence. TODO(#135): consume the export's capture-completeness state once the collector reports it.
+`instrumentationHealthy` is false for unknown usage, unknown wall time, sanitized collector warnings in the trial server log, pending Jev attempts, incomplete Jev history, or invalid/missing router evidence. For Auto trials it additionally requires the router export's `coverage.capture` to be `complete` (#135): an `incomplete` or `unknown` capture, or an export without capture state, is never healthy.
 
 ## Authorizing a paid run (Human only)
 
