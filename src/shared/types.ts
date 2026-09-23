@@ -11,7 +11,13 @@ export const DEFAULT_PROJECT_NAME = "Chapter";
 export const DEFAULT_WAIT_MS = 1_500_000;
 /** MCP wait HTTP poll. Short so localhost fetch does not die mid-sleep. */
 export const MCP_WAIT_POLL_MS = 20_000;
-export const BODY_MAX = 4_000;
+/**
+ * Maximum message body length in UTF-16 code units, for every sender (Human UI,
+ * Telegram, agents via MCP/HTTP/CLI, bots and task events). Dependent byte caps
+ * derive from it: a JSON-escaped body is at most 6 bytes per unit (\uXXXX), so
+ * JSON ingress caps must exceed BODY_MAX * 6 plus metadata headroom.
+ */
+export const BODY_MAX = 20_000;
 export const WAIT_MAIL_CAP = 8;
 export const WAIT_SCAN_MAX = 256;
 export const WAIT_MAX_BYTES = 64 * 1024;
