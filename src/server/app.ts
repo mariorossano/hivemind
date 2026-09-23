@@ -99,7 +99,9 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
   ui.put("/channels/:id/adaptive-routing/lock", async c => c.json(hive.adaptiveTopology.setLock(hive.identity.getAgent("human"), c.req.param("id"), await readLimitedJson(c.req.raw, CREDENTIAL_JSON_BYTES))));
   ui.get("/snapshot", c => {
     const human = hive.identity.getAgent("human");
-    return c.json({ you: human, projects: hive.projects.listProjects(), agents: hive.identity.listAgents(), channels: hive.channels.listChannels(human),
+    const channels = hive.channels.listChannels(human);
+    return c.json({ you: human, projects: hive.projects.listProjects(), agents: hive.identity.listAgents(), channels,
+      archivedChannelIds: hive.rooms.archivedChannelIds(channels),
       ...hive.reads.readSnapshot(human), queued: hive.delivery.queuedCounts(), inbox: hive.delivery.inboxStatuses(),
       telegram: { running: Boolean(hooks.telegramRunning?.()), configured: publicTelegramView(hive.home).configured, ...hive.telegramAdmin.health() } });
   });

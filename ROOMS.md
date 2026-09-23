@@ -4,6 +4,24 @@ This is an optional layer on existing channels, structured tasks and delivery
 receipts. It does not launch agents, parse provider events, execute task code or
 change the brain/worker roles. Ordinary channels/tasks remain compatible.
 
+## Archived channels in the Human sidebar
+
+Channels with an archived room move out of the main channel list into a collapsed
+**Archived** section in their project. Expand it to consult them; searching for a
+channel or following a link to it reveals the archived entry automatically.
+Archiving or reopening a room updates the sidebar live, without navigating away
+from an open channel or thread. Reopening restores the entry to the main list.
+
+This is navigation only: history, access, unread counts, delivery receipts and
+source lifecycle rules are unchanged. Expanding the section does not mark messages
+read; opening a channel uses the usual visible-message read tracking. Reading or
+receiving a message in an archived channel does not reopen it or resume a monitor.
+Channels without a room and direct-message navigation are unchanged.
+
+The UI uses `archivedChannelIds` from `/api/ui/snapshot`, while `channels` continues
+to include archived channels. Deploy the server and web bundle together; an older
+server without this metadata leaves all channels in the main list.
+
 ## Two modes
 
 - `finite`: a private room for one scoped collaboration, with an originating task,

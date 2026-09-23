@@ -168,6 +168,9 @@ function ProjectSection({ project, snap, sel, go, query, open, onToggle, onSetti
       (c.type === "public" || c.type === "brains" || c.type === "private") &&
       match(c.name),
   );
+  const archivedIds = new Set(snap.archivedChannelIds ?? []);
+  const activeChannels = publics.filter(ch => !archivedIds.has(ch.id));
+  const archivedChannels = publics.filter(ch => archivedIds.has(ch.id));
   const projectDms = channels.filter((c) => c.project === project.slug && c.type === "dm" && match(c.name));
   const openDms = projectDms
     .filter((c) => !closedDms.includes(c.id))
@@ -186,6 +189,15 @@ function ProjectSection({ project, snap, sel, go, query, open, onToggle, onSetti
     (a) => a.role === "human" || a.project === project.slug,
   ).filter((a) => !q || match(a.name) || match(a.focus ?? "") || match(a.role));
   const n = snap.mentionCounts[project.slug] ?? 0;
+  const channelRow = (ch: Channel) => (
+    <ChannelItem
+      key={ch.id}
+      ch={ch}
+      unread={snap.unread[ch.id] ?? 0}
+      active={sel.kind === "channel" && sel.id === ch.id}
+      onClick={() => go({ kind: "channel", id: ch.id })}
+    />
+  );
   const dmRow = (ch: Channel) => (
     <DmRow
       key={ch.id}
@@ -254,15 +266,13 @@ function ProjectSection({ project, snap, sel, go, query, open, onToggle, onSetti
                 +
               </button>
             </div>
-            {publics.map((ch) => (
-              <ChannelItem
-                key={ch.id}
-                ch={ch}
-                unread={snap.unread[ch.id] ?? 0}
-                active={sel.kind === "channel" && sel.id === ch.id}
-                onClick={() => go({ kind: "channel", id: ch.id })}
-              />
-            ))}
+            {activeChannels.map(channelRow)}
+            {archivedChannels.length > 0 && (
+              <details className="archived-channels" open={q || (sel.kind === "channel" && archivedChannels.some(ch => ch.id === sel.id)) ? true : undefined}>
+                <summary>Archived <span>{archivedChannels.length}</span></summary>
+                {archivedChannels.map(channelRow)}
+              </details>
+            )}
           </div>
           <div className="group">
             <div className="group-h">

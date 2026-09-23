@@ -169,6 +169,8 @@ export function useRealtime({ selection, hive, channel, thread, inboxLoad, chang
       }
       if (ev.type === 'room') {
         const payload = ev.payload as { channelId: string };
+        // Archive/reopen also changes navigation for rooms that are not currently selected.
+        refreshSnap().catch(error => { if (error?.name !== "AbortError") setErr(String(error.message || error)); });
         if (selRef.current.kind === 'channel' && selRef.current.id === payload.channelId) {
           setRoomTick(t => t + 1);
           if (threadIdRef.current) loadThread(payload.channelId, threadIdRef.current).catch(() => undefined);
