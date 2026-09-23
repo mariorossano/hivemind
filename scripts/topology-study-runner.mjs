@@ -11,7 +11,7 @@ import {
 import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { CONDITIONS, readJson, validateEvidence, validateStudy } from './benchmark-topology.mjs';
+import { CONDITIONS, readJson, routerCapture, validateEvidence, validateStudy } from './benchmark-topology.mjs';
 import { TOPOLOGY_POLICY_VERSION } from '../src/shared/adaptive-topology-policy.ts';
 import { TYPESAFE_MODEL } from '../src/server/adaptive-config.ts';
 import { validJevModel } from '../src/shared/jev-model.ts';
@@ -262,12 +262,10 @@ export function observationFrom({ study, trial, result, attempt, pin, run }) {
   const known = result.seatUsage.every(s => s.tokens !== null);
   const workloadTokens = known ? result.seatUsage.reduce((sum, s) => sum + s.tokens, 0) : null;
   assert.ok(workloadTokens === null || count(workloadTokens), 'Workload token total overflow');
-  // TODO(#135): when the collector's capture-completeness export lands on main, require it explicitly (and cover it in
-  // tests). Until then health is inferred from sanitized server warnings, pending attempts and history completeness; an
-  // export that already states a non-complete `coverage.capture` is honoured.
-  const capture = auto && evidenceValid ? routerEvidence.coverage.capture : undefined;
-  const collectorHealthy = auto ? evidenceValid && routerEvidence.coverage.pendingAttempts === 0 && routerEvidence.coverage.historyComplete &&
-    (capture === undefined || capture === 'complete') : result.jevAttempts === 0;
+  // The collector's exported capture state (#135) is required explicitly: only `complete` is healthy. An export without
+  // capture state (made before #135) is `unknown`, never healthy. Sanitized server warnings still veto on their own.
+  const collectorHealthy = auto ? evidenceValid && routerCapture(routerEvidence) === 'complete' &&
+    routerEvidence.coverage.pendingAttempts === 0 && routerEvidence.coverage.historyComplete : result.jevAttempts === 0;
   const instrumentationHealthy = known && result.wallMs !== null && result.collectorWarnings === 0 && collectorHealthy;
   if (result.collectorWarnings > 0) notes.push('collector_warnings');
   const observation = {
@@ -424,7 +422,7 @@ export function exportRun({ runDir }) {
     manifestSha256: ctx.run.manifestSha256, evidenceKind: ctx.run.evidenceKind, coverage, counts,
     jev: { requestedModel: ctx.run.jev.requestedModel, resolvedModelPin: cohortPin(ctx) },
     independentReview: 'pending: automated runs are never marked independently reviewed; routingReview stays null',
-    captureCompleteness: 'TODO(#135): not yet exported by the collector; inferred from warnings, pending attempts and history completeness',
+    captureCompleteness: 'required: Auto instrumentation is healthy only when the router export states coverage.capture = complete (#135)',
     trials };
   const serialized = JSON.stringify(report) + JSON.stringify(study);
   assert.ok(!serialized.includes(ctx.dir), 'Export must contain only redacted relative references');

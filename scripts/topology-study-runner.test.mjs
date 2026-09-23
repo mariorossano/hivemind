@@ -33,7 +33,8 @@ function evidence({ models = ['jev-resolved-v1'], requested = ['jev-fixture-pin'
   return { schemaVersion: 1, evidenceClass: 'adaptive-evidence-v1', contractVersion: 'adaptive-routing-v2', policyVersion: 'topology-policy-v2.1',
     executionAlias: 'execution-1', models, modelsTruncated: false, requestedModels: requested, requestedModelsTruncated: false,
     attempts: [{ ordinal: 1, phase: 'initial', status: 'ok' }],
-    coverage: { attemptsStarted: 1, attemptsFinished: 1, pendingAttempts: 0, retainedAttempts: 1, prunedAttempts: 0, historyComplete: true, usageComplete: true },
+    coverage: { attemptsStarted: 1, attemptsFinished: 1, pendingAttempts: 0, retainedAttempts: 1, prunedAttempts: 0, historyComplete: true, usageComplete: true,
+      capture: 'complete', captureReasons: [], aggregateCapture: 'complete', collectionGap: null },
     overhead: { successfulAttempts: 1, unavailableAttempts: 0, tokenObservations: 1, unknownUsageAttempts: 0, knownInputTokens: 10, knownOutputTokens: 5,
       totalInputTokens: 10, totalOutputTokens: 5, latencyObservations: 1, knownLatencyMs: 50, summedLatencyMs: 50 } };
 }
@@ -182,12 +183,25 @@ test('unknown usage stays null and marks instrumentation unhealthy instead of ze
   } finally { ctx.cleanup(); }
   const partial = setup({ repeats: 1 });
   try {
+    // A collection gap (#135) keeps valid evidence but is never healthy, even with no server warning.
     const incomplete = evidence();
-    incomplete.coverage.capture = 'incomplete'; // forward-compatible with the #135 capture state
+    Object.assign(incomplete.coverage, { capture: 'incomplete', captureReasons: ['collection_gap'], aggregateCapture: 'incomplete',
+      collectionGap: { missedBegins: 1, missedFinishes: 0, unattributed: 0 }, historyComplete: false, usageComplete: false });
+    Object.assign(incomplete.overhead, { totalInputTokens: null, totalOutputTokens: null, summedLatencyMs: null });
     await authorized(partial, fakeHost({ behave: spec => spec.condition === 'auto' ? { routerEvidence: incomplete } : {} }));
     const auto = exported(partial).study.trials.find(t => t.condition === 'auto').observed;
     assert.equal(auto.instrumentationHealthy, false); assert.notEqual(auto.routerEvidence, null);
+    assert.match(exported(partial).report.captureCompleteness, /required/);
   } finally { partial.cleanup(); }
+  const legacy = setup({ repeats: 1 });
+  try {
+    // An export without capture state predates #135: its completeness is unknown, so it is not healthy either.
+    const unknown = evidence();
+    for (const k of ['capture', 'captureReasons', 'aggregateCapture', 'collectionGap']) delete unknown.coverage[k];
+    await authorized(legacy, fakeHost({ behave: spec => spec.condition === 'auto' ? { routerEvidence: unknown } : {} }));
+    const auto = exported(legacy).study.trials.find(t => t.condition === 'auto').observed;
+    assert.equal(auto.instrumentationHealthy, false); assert.notEqual(auto.routerEvidence, null);
+  } finally { legacy.cleanup(); }
 });
 
 test('a lost response is retained for reconciliation, never re-run, and the cohort continues only after a Human resolution', async () => {

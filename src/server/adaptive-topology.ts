@@ -168,12 +168,14 @@ export class AdaptiveTopologyRuntime {
     return { brains, owners: brains.length === 1 ? brains : [] };
   }
   constructor(private hive: Hive) {
-    this.observations = new AdaptiveObservationStores(hive.db);
+    this.observations = new AdaptiveObservationStores(hive.db, health => hive.bus.emit('evidence-health', health));
   }
   async stop(): Promise<void> {
     this.stopped = true; this.abort.abort();
     await Promise.allSettled(this.serial.values());
     this.admission.dispose();
+    // A graceful restart persists held gap markers when the store accepts writes again; a crash cannot.
+    this.observations.collector.flush(() => this.observations.evidence);
   }
   private queued<T>(key: string, work: () => Promise<T> | T): Promise<T> {
     const next = (this.serial.get(key) ?? Promise.resolve()).then(work);
@@ -195,6 +197,9 @@ export class AdaptiveTopologyRuntime {
       const text = requestText(request).replace(/\s+/g, ' ').trim();
       display.requestExcerpt = text.length > 140 ? `${text.slice(0, 139)}…` : text;
     }
+    const jevCalled = Boolean(state.recommendation && state.recommendation.providerStatus !== 'bypassed');
+    const evidence = this.observations.capture(state.executionId, jevCalled);
+    if (evidence) display.evidence = evidence;
     return display;
   }
   /** The brain's current execution in this channel; draining predecessors are reached by id, task or thread. */
@@ -803,7 +808,7 @@ export class AdaptiveTopologyRuntime {
     const state = executions.filter(item => item.current).sort((a, b) => Number(Boolean(a.completedAt)) - Number(Boolean(b.completedAt)) || b.updatedAt - a.updatedAt)[0] ?? null;
     const events = this.hive.db.prepare('SELECT snapshot FROM adaptive_topology_events WHERE channel_id=? ORDER BY rowid DESC LIMIT 100')
       .all(channel.id).map(row => JSON.parse(String(row.snapshot)) as AdaptiveRoutingEvent).reverse();
-    return { state, executions, events };
+    return { state, executions, events, collector: this.observations.collectorHealth() };
   }
   setLock(actor: Agent, channelId: string, raw: unknown): AdaptiveRoutingView {
     if (actor.role !== 'human') throw new HiveError(403, 'Only Human changes routing locks');
