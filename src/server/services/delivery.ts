@@ -165,6 +165,12 @@ export class DeliveryService {
         this.deps.identity.touch(actor.id, true);
         resolve(batch);
       };
+      const fail = (error: HiveError) => {
+        if (done) return;
+        done = true;
+        cleanup();
+        reject(error);
+      };
       const finish = (consume: boolean) => {
         if (done) return;
         if (!consume || signal?.aborted) {
@@ -182,12 +188,8 @@ export class DeliveryService {
       };
       waiter = {
         wake: () => finish(true),
-        supersede: () => {
-          if (done) return;
-          done = true;
-          cleanup();
-          reject(new HiveError(409, "superseded"));
-        },
+        supersede: () => fail(new HiveError(409, "superseded")),
+        interrupt: () => fail(new HiveError(503, "Server is shutting down")),
       };
       const onAbort = () => finish(false);
       this.deps.waiters.install(actor.id, waiter);
@@ -206,8 +208,8 @@ export class DeliveryService {
     });
   }
 
-  /** Supersedes every pending wait (server shutdown). */
+  /** Interrupts pending waits for shutdown without superseding durable sessions. */
   cancelWaits() {
-    this.deps.waiters.supersedeAll();
+    this.deps.waiters.interruptAll();
   }
 }
