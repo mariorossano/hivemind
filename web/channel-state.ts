@@ -105,6 +105,9 @@ export function reconcileChannelSnapshot(
   const threads = new Map(data.threads.map(thread => [thread.id, thread]));
   for (const thread of journal.threads.values()) threads.set(thread.id, thread);
   const pane = boundLivePane({ ...data,
+    // Background refreshes keep the committed jump's short-lived anchor.
+    // Explicit history/live navigation must not resurrect it.
+    unreadTarget: held && !older ? previous!.unreadTarget : undefined,
     messages: [...byId.values()].sort((a, b) => a.seq - b.seq),
     // Apply explicit jump bounds BEFORE live-window trimming; a burst of new
     // messages must not evict the historical destination from the page.

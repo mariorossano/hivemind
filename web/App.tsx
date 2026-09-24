@@ -51,7 +51,7 @@ export function App() {
   const { view: routingView, error: routingError, refresh: refreshRoutingView,
     onEvent: onRoutingEvent, onChange: changeRoutingView } = useAdaptiveRouting(routingChannelId);
   const [routingPanelOpen, setRoutingPanelOpen] = useState(false);
-  const channelPane = useChannelPane(selRef);
+  const channelPane = useChannelPane(selRef, selection.unreadLookup);
   const threadState = useThreadPane(selection, setErr);
   const { pane } = channelPane;
   const { threadPane } = threadState;
@@ -73,6 +73,7 @@ export function App() {
   const { mailLog, mergeMail } = useMailLog({ snap, channels, pane, threadPane, inboxPage: inbox.inboxPage });
   const { changeSelection, go } = useChangeSelection(selection, {
     channelLoad: channelPane.channelLoad, channelJournal: channelPane.channelJournal,
+    channelJumpIntent: channelPane.channelJumpIntent, threadJumpIntent: threadState.threadJumpIntent,
     channelRefreshIntent: channelPane.channelRefreshIntent, channelReads: hive.channelReads,
     threadLoad: threadState.threadLoad, setThreadView: threadState.setThreadView, threadReads: hive.threadReads,
     inboxLoad: inbox.inboxLoad,

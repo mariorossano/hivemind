@@ -25,6 +25,21 @@ conversation/thread are acknowledged. This is not Mark all read. Other pages,
 unopened threads and later live arrivals remain unread. Requests are cancelled
 or ignored after navigation, including a second badge action or a delayed page.
 
+A pending jump belongs to the navigation intent, not to one HTTP request.
+Reconnect and automatic room/task/decision refreshes inherit its destination;
+only the committed target page triggers focus and highlighting. A second jump,
+explicit paging, return-to-live, or a selection change supersedes that intent.
+This also cancels the initial `last-unread` lookup, before a destination has
+been found. Delayed targets, empty results and errors from that lookup cannot
+override a newer navigation action. Automatic refreshes do not cancel it.
+The short-lived scroll anchor releases on mouse, touch or keyboard interaction
+anywhere in the conversation pane, including its refresh button and composer.
+Automatic updates to the same historical page retain the committed target
+identity without restarting the highlight timer or stealing focus again.
+Cancelling a pending thread jump also clears its owned load/return-to-live
+state, including after a failed request. Cleanup cannot clear a newer jump,
+send confirmation or explicit live-navigation action.
+
 No schema migration, agent restart, permission change or monitor change is
 required by this feature. Deploy the UI and server endpoint together; a frontend
 asset refresh alone cannot add the endpoint to an already-running server.
@@ -34,5 +49,11 @@ asset refresh alone cannot add the endpoint to an already-running server.
 Regression coverage includes ordinary roots, old-thread replies, sparse and
 legacy receipts, self-message exclusion, visibility, read-only GETs, historical
 pages, full live-arrival windows, repeated same-thread jumps, keyboard activation,
-navigation races and empty/failed lookups. Tests use isolated fixtures, not real
-Human receipts. Full suite: 1,260 passed, one pre-existing skip; browser: 47 passed.
+navigation races and empty/failed lookups. Follow-up regressions cover in-flight
+jumps replaced by reconnect/room refresh, a second jump, explicit cancellation,
+and immediate return-to-live in both panes via mouse and keyboard. Delayed
+destination lookups (success, empty and failure) are tested against explicit
+live navigation and a subsequent badge click. Further coverage checks completed
+anchors through automatic refresh and late reflow, paging during lookup, and
+empty/failed replacement lookups after pending/failed target loads. Tests use
+isolated fixtures, not real Human receipts.

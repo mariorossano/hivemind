@@ -1,12 +1,9 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { createRequestGate } from '../src/shared/read-client.ts';
-import { api } from './api.ts';
+import { useEffect, useLayoutEffect, useState } from 'react';
+import { api, type UnreadTarget } from './api.ts';
 import type { Sel } from './selection.ts';
 import type { Selection } from './use-selection.ts';
 import type { ChannelPane } from './use-channel-pane.ts';
 import type { ThreadPane } from './use-thread-pane.ts';
-
-type Target = { channelId: string; threadId: string | null; seq: number };
 
 /** Explicit badge navigation. Lookup is read-only; ordinary pane receipts remain unchanged. */
 export function useUnreadJump({ selection, channel, thread, go, clearSearch, refreshSnap, setErr }: {
@@ -14,16 +11,19 @@ export function useUnreadJump({ selection, channel, thread, go, clearSearch, ref
   go: (next: Sel) => void; clearSearch: () => void;
   refreshSnap: () => Promise<unknown>; setErr: (error: string) => void;
 }) {
-  const lookup = useRef(createRequestGate());
-  const [target, setTarget] = useState<Target | null>(null);
-  const [ready, setReady] = useState<Target | null>(null);
+  const lookup = selection.unreadLookup;
+  const [target, setTarget] = useState<UnreadTarget | null>(null);
+  // Observe the page actually committed, even if an automatic refresh replaced
+  // the original request. Identity distinguishes repeated jumps to the same seq.
+  const pane = target?.threadId ? thread.threadPane : channel.pane;
+  const ready = target && pane?.unreadTarget === target ? target : null;
   const { sel, selRef, threadId, threadIdRef } = selection;
   const selected = sel.kind === 'channel' ? sel.id : null;
-  const matches = (t: Target) => selRef.current.kind === 'channel' && selRef.current.id === t.channelId && threadIdRef.current === t.threadId;
+  const matches = (t: UnreadTarget) => selRef.current.kind === 'channel' && selRef.current.id === t.channelId && threadIdRef.current === t.threadId;
 
   const openUnread = async (channelId: string) => {
     const from = selRef.current, request = lookup.current.begin();
-    setTarget(null); setReady(null);
+    setTarget(null);
     try {
       const { target: next } = await api.lastUnread(channelId, request.signal);
       if (!request.valid() || selRef.current !== from) return;
@@ -43,15 +43,21 @@ export function useUnreadJump({ selection, channel, thread, go, clearSearch, ref
   // page load cancels their default GET through the same per-pane request gate.
   useEffect(() => {
     if (!target) return;
-    if (!matches(target)) { setTarget(null); setReady(null); return; }
+    if (!matches(target)) { setTarget(null); return; }
     let cancelled = false;
     const load = target.threadId
-      ? thread.loadThread(target.channelId, target.threadId, undefined, true, target.seq)
-      : channel.loadChannel(target.channelId, undefined, undefined, target.seq);
-    void load.then(loaded => { if (loaded && !cancelled && matches(target)) setReady(target); })
-      .catch(error => { if (!cancelled && matches(target) && error?.name !== 'AbortError') setErr(String(error)); });
-    return () => { cancelled = true; (target.threadId ? thread.threadLoad : channel.channelLoad).current.cancel(); };
-  }, [target, selected, threadId, channel.loadChannel, thread.loadThread]);
+      ? thread.loadThread(target.channelId, target.threadId, undefined, true, target)
+      : channel.loadChannel(target.channelId, undefined, undefined, target);
+    void load.catch(error => { if (!cancelled && matches(target) && error?.name !== 'AbortError') setErr(String(error)); });
+    return () => {
+      cancelled = true;
+      if (target.threadId) thread.cancelUnreadJump(target);
+      else if (channel.channelJumpIntent.current === target) {
+        channel.channelJumpIntent.current = null;
+        channel.channelLoad.current.cancel();
+      }
+    };
+  }, [target, selected, threadId, channel.loadChannel, thread.loadThread, thread.cancelUnreadJump]);
 
   // Ordinary live-bottom anchoring runs first. A held target page prevents later
   // messages from moving the Human away again, including targets in old threads.
@@ -60,14 +66,24 @@ export function useUnreadJump({ selection, channel, thread, go, clearSearch, ref
     const stream = ready.threadId ? thread.threadStream.current : channel.channelStream.current;
     const element = stream?.querySelector<HTMLElement>(`[data-message-seq="${ready.seq}"]`);
     if (!stream || !element) return;
-    const scroll = () => { stream.scrollTop += element.getBoundingClientRect().top - stream.getBoundingClientRect().top - 24; };
+    let released = false;
+    const scroll = () => {
+      if (!released && element.isConnected)
+        stream.scrollTop += element.getBoundingClientRect().top - stream.getBoundingClientRect().top - 24;
+    };
     element.classList.add('unread-target'); element.tabIndex = -1;
     element.focus({ preventScroll: true }); scroll();
     const resize = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(scroll);
     for (const child of Array.from(stream.children)) resize?.observe(child);
     const events = ['wheel', 'touchstart', 'pointerdown', 'keydown'] as const;
-    const release = () => { resize?.disconnect(); for (const event of events) stream.removeEventListener(event, release); };
-    for (const event of events) stream.addEventListener(event, release, { passive: true });
+    // Return-to-live/refresh and the composer are siblings of the stream.
+    // Their mouse/keyboard actions must release the anchor BEFORE the new page.
+    const interactionScope = stream.parentElement ?? stream;
+    const release = () => {
+      released = true; resize?.disconnect();
+      for (const event of events) interactionScope.removeEventListener(event, release, true);
+    };
+    for (const event of events) interactionScope.addEventListener(event, release, { passive: true, capture: true });
     const timer = window.setTimeout(() => { release(); element.classList.remove('unread-target'); }, 2500);
     return () => { release(); window.clearTimeout(timer); element.classList.remove('unread-target'); };
   }, [ready, selected, threadId]);

@@ -4,7 +4,7 @@ import type { Message } from "../src/shared/types.ts";
 import { LIVE_MESSAGE_WINDOW, retainNewest } from "../src/shared/realtime.ts";
 import type { ChannelPayload } from "./api.ts";
 import { boundLivePane, holdLivePane } from "./pane-window.ts";
-import { beginThreadLoad, receiveThreadMessage, receiveThreadSnapshot } from "./thread-state.ts";
+import { beginThreadLoad, cancelThreadLoad, failThreadLoad, receiveThreadMessage, receiveThreadSnapshot } from "./thread-state.ts";
 
 function message(seq: number, threadId: string | null = "root"): Message {
   return { id: seq === 1 ? "root" : `m-${seq}`, seq, channelId: "channel", threadId: seq === 1 ? null : threadId,
@@ -23,6 +23,54 @@ test('an unread reply jump survives a full live arrival window without acknowled
   assert.deepEqual(next.pane!.messages.map(m => m.seq), [1, 2]);
   assert.equal(next.pane!.historyThrough, 2); assert.equal(next.pane!.deferredLive, true);
 });
+
+function unreadThreadView() {
+  const target = { channelId: 'channel', threadId: 'root', seq: 2 };
+  const view = receiveThreadSnapshot(beginThreadLoad(null, 'channel', 'root', 1, true, [], target),
+    'root', pane([message(1), message(2)]), 1, 2)!;
+  return { ...view, pane: { ...view.pane!, unreadTarget: target } };
+}
+
+test('thread refresh preserves committed unread identity but explicit live navigation discards it', () => {
+  const current = unreadThreadView(), target = current.pane.unreadTarget;
+  const refreshed = receiveThreadSnapshot(beginThreadLoad(current, 'channel', 'root', 2), 'root', pane([message(3)]), 2)!;
+  assert.equal(refreshed.pane!.unreadTarget, target);
+  assert.deepEqual(refreshed.pane!.messages.map(m => m.seq), [1, 2]);
+  assert.equal(refreshed.unreadJump, undefined);
+  const live = receiveThreadSnapshot(beginThreadLoad(refreshed, 'channel', 'root', 3, true), 'root', pane([message(3)]), 3)!;
+  assert.equal(live.pane!.unreadTarget, undefined);
+  assert.deepEqual(live.pane!.messages.map(m => m.seq), [3]);
+  assert.equal(receiveThreadSnapshot(beginThreadLoad(live, 'channel', 'root', 4), 'root', pane([message(4)]), 4)!.pane!.unreadTarget, undefined);
+});
+
+for (const outcome of ['pending', 'replaced', 'failed'] as const) {
+  test('cancelling an owned unread jump clears its live-navigation intent: ' + outcome, () => {
+    const current = unreadThreadView(), target = { channelId: 'channel', threadId: 'root', seq: 1 };
+    let next = beginThreadLoad(current, 'channel', 'root', 2, true, [], target);
+    if (outcome === 'replaced') next = beginThreadLoad(next, 'channel', 'root', 3, true, [], target);
+    if (outcome === 'failed') next = failThreadLoad(next, 2)!;
+    const cancelled = cancelThreadLoad(next, target)!;
+    assert.equal(cancelled.returnToLive, undefined);
+    assert.equal(cancelled.unreadJump, undefined);
+    assert.equal(cancelled.pendingLoad, undefined);
+    assert.equal(cancelled.pane, current.pane);
+    const refreshed = receiveThreadSnapshot(beginThreadLoad(cancelled, 'channel', 'root', 4), 'root', pane([message(3)]), 4)!;
+    assert.deepEqual(refreshed.pane!.messages.map(m => m.seq), [1, 2]);
+  });
+}
+
+for (const replacement of ['jump', 'live', 'send', 'completed', 'selection'] as const) {
+  test('late unread cleanup leaves newer thread navigation untouched: ' + replacement, () => {
+    const current = unreadThreadView(), target = { channelId: 'channel', threadId: 'root', seq: 1 };
+    const pending = beginThreadLoad(current, 'channel', 'root', 2, true, [], target);
+    const next = replacement === 'completed'
+      ? receiveThreadSnapshot(pending, 'root', pane([message(1)]), 2, 1)!
+      : beginThreadLoad(pending, 'channel', replacement === 'selection' ? 'other' : 'root', 3, true,
+        replacement === 'send' ? [message(3)] : [], replacement === 'jump' ? { ...target } : undefined);
+    assert.equal(cancelThreadLoad(next, target), next);
+    if (replacement === 'send') assert.deepEqual(next.confirmations, [message(3)]);
+  });
+}
 
 test("live window is immutable, finite and preserves no-op references", () => {
   const items = [1, 2, 3];
