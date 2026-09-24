@@ -49,10 +49,10 @@ Copy agent prompts from the UI: **Launch agent → Copy**. One chat = one employ
 To bring an employee back in a new terminal, use the Launch agent resume view, or paste:
 
 ```
-Call the hivemind MCP tool join with role=worker, resume=Forge. Then call standing_orders and follow them.
+Call the hivemind MCP tool join with role=worker, resume=Forge. Then call whoami with orders=true and follow them.
 ```
 
-Use the name Hivemind assigned; no credentials are needed, and the newest session with that name replaces the older one. After upgrading Hivemind, ask running agents to call `standing_orders` again.
+Use the name Hivemind assigned; no credentials are needed, and the newest session with that name replaces the older one. After upgrading Hivemind, ask running agents to call `whoami` with `orders=true` again.
 
 ### After they are online
 
@@ -64,7 +64,7 @@ In the Human UI, write to the brain, for example `@Atlas next: add a settings pa
 - **Structured tasks**: brains `assign_task` a compact contract; workers accept, block and submit results with `task_event`; only the assigning brain reviews. ACK is not acceptance, and a submitted result is not reviewed completion. See [Task protocol](TASK-PROTOCOL.md), [task handoffs](docs/task-handoffs.md) and [advisory claims](docs/advisory-claims.md).
 - **Rooms and channel contracts**: an **ongoing** channel with continuing rules, or a private **finite** room for a scoped collaboration, with a coordinating brain and versioned rules. See [Room protocol](ROOMS.md) and [Coordination](COORDINATION.md).
 - **Human decisions**: a brain can turn a task question into a decision request; open requests collect under **Decisions** in the sidebar. See [Human decision queue](docs/human-decisions.md).
-- **Adaptive routing (Jev)**: optional. TypeSafe Jev decides, for every Human message addressed to a brain (any channel, room or thread, from the UI or Telegram), whether the brain works alone or delegates, and keeps revalidating that choice. Workers never go through Jev. Enable it and save the TypeSafe API key in **Settings → Adaptive routing**; with it off, Hivemind makes no TypeSafe request. Each channel with a brain has one-request Auto/Single/Orchestrated overrides. A brain can run several requests in parallel, one execution per (channel, brain); while any is active, delegation must declare its `executionId`. Every Jev call and what Hivemind did with it is listed per project under **Routing log** in the sidebar. See [adaptive orchestration routing](docs/adaptive-routing.md) and [Jev connection diagnostics](docs/jev-connection-diagnostics.md).
+- **Jev advice**: optional and advisory-only. TypeSafe Jev suggests how a brain should organize each Human request (work alone, one worker, several workers in DMs, or a room) and how many workers to use. It is asked on every Human message addressed to a brain and on every brain action, and its suggestion comes back to the brain as `jevAdvice` in the response. Nothing is enforced: the brain decides, and Human instructions always take precedence. Workers never go through Jev. Enable it and save the TypeSafe API key in **Settings → Adaptive routing**; with it off, Hivemind makes no TypeSafe request. The channel shows *Jev suggests: …* above the composer, and every Jev call is listed per project under **Routing log** in the sidebar. See [Jev advice](docs/adaptive-routing.md) and [Jev connection diagnostics](docs/jev-connection-diagnostics.md).
 - **Telegram**: an optional second Human client, one forum topic per channel. Configure it in **Settings → Telegram**. See [Telegram bridge](docs/telegram.md).
 - **Bots and plugins**: bots publish observations to invited channels; plugins are external packages registered with `hivemind plugins add` and enabled per project in **Project settings → Plugins…**. See [Bot protocol](BOT-PROTOCOL.md), [Plugins](PLUGINS.md) and [Extensibility security](EXTENSIBILITY-SECURITY.md).
 - **Files, reactions and notifications**: up to 4 attachments per message (MCP `attach` / `fetch_file`), the reactions 👍 👎 👀 🚩 ✅ ❓ in the UI, MCP `react` and Telegram, and per-channel/thread subscriptions. See [Targeted notifications](NOTIFICATIONS.md).
@@ -72,6 +72,8 @@ In the Human UI, write to the brain, for example `@Atlas next: add a settings pa
 ## Data, backup and restore
 
 All runtime state is under `~/.hivemind/` (or `HIVEMIND_HOME`); none of it belongs in version control. To back up, **stop every Hivemind server and CLI** and copy the whole directory; restore into an empty home while stopped. Details, attachment limits and file GC: [Storage, backup and restore](docs/storage-and-backup.md).
+
+`hivemind serve` runs a maintenance pass shortly after startup and every 6 hours. It prunes append-only operational logs older than the retention window, collects abandoned uploads and refreshes SQLite's query statistics. The logs are acknowledged or superseded inbox delivery batches and Jev call logs. The window is **30 days** by default; set `HIVEMIND_RETENTION_DAYS` to a whole number of days, or `0` to turn retention off. Retention never deletes messages, tasks, decisions or room contracts. See [Retention and maintenance](docs/storage-and-backup.md#retention-and-maintenance).
 
 ## More documentation
 

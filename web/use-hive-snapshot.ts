@@ -73,15 +73,30 @@ export function useHiveSnapshot(setErr: (error: string) => void) {
     const request = ++archivedRequest.current;
     const ticket = readFence.current.ticket();
     const next = await api.snapshot(load.signal);
-    if (!load.valid() || !readFence.current.current(ticket)) return;
+    if (!load.valid() || !readFence.current.current(ticket) || request < archivedAccepted.current) return;
     archivedAccepted.current = request;
     latestArchivedChannelIds.current = next.archivedChannelIds;
     setSnap(previous => previous ? { ...previous, archivedChannelIds: next.archivedChannelIds } : previous);
   }, []);
 
+  /**
+   * Applies a `room` event's archive state without refetching the snapshot. It
+   * counts as the newest accepted room result, so an older in-flight snapshot or
+   * room-only read cannot undo it. Before any snapshot there is nothing to patch.
+   */
+  const setArchivedChannel = useCallback((channelId: string, archived: boolean) => {
+    const current = latestArchivedChannelIds.current;
+    if (!current) return false;
+    archivedAccepted.current = ++archivedRequest.current;
+    archivedLoad.current.cancel();
+    const next = archived ? [...new Set([...current, channelId])].sort() : current.filter(id => id !== channelId);
+    latestArchivedChannelIds.current = next;
+    setSnap(previous => previous ? { ...previous, archivedChannelIds: next } : previous);
+    return true;
+  }, []);
+
   const refreshSnap = useCallback(async () => {
     const load = snapshotLoad.current.begin();
-    archivedLoad.current.cancel();
     const request = ++archivedRequest.current;
     const ticket = readFence.current.ticket();
     const raw = await api.snapshot(load.signal);
@@ -94,6 +109,9 @@ export function useHiveSnapshot(setErr: (error: string) => void) {
       archivedAccepted.current = request;
       latestArchivedChannelIds.current = next.archivedChannelIds;
     }
+    // Abort an older room-only request only once this snapshot has been
+    // accepted; if this refresh fails, the pending room request still lands.
+    if (archivedRequest.current === request) archivedLoad.current.cancel();
     const accepted = acceptRead(next, ticket);
     setSnap((previous) => ({ ...next, archivedChannelIds: latestArchivedChannelIds.current,
       ...(!accepted && previous ? readFields(previous) : {}) }));
@@ -104,6 +122,7 @@ export function useHiveSnapshot(setErr: (error: string) => void) {
   return {
     snap, setSnap, latestTelegramHealth, readFence, snapshotLoad, archivedLoad, readRefresh, channelReads, threadReads,
     readTick, reconnectTick, setReconnectTick, acceptRead, refreshSnap, refreshArchivedChannels,
+    setArchivedChannel,
   };
 }
 

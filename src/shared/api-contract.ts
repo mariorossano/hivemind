@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { BODY_MAX, DEFAULT_WAIT_MS, FILE_MAX_BYTES, HiveError, MESSAGE_EVENT_TYPES } from "./types.ts";
-import { executionIdSchema, requestIdSchema } from "./mutation.ts";
+import { requestIdSchema } from "./mutation.ts";
 
 /** Fits a worst-case JSON-escaped BODY_MAX body (6 bytes per unit) plus request metadata. */
 export const API_JSON_BYTES = 256 * 1024;
@@ -18,6 +18,11 @@ export const waitDurationSchema = safeInteger.min(1).max(MAX_WAIT_MS);
 export const senioritySchema = z.enum(["junior", "mid", "senior"]);
 export const nameSchema = z.string().trim().min(1).max(100);
 export const referenceSchema = z.string().min(1).max(256);
+/** A channel reference is a UUID, a name or a display `#name`; the one place that strips the `#` (MCP client and server). */
+export function normalizeChannelReference(reference: string): string {
+  const value = reference.trim();
+  return value.startsWith("#") ? value.slice(1) : value;
+}
 export const memberNamesSchema = z.array(nameSchema).max(32);
 export const attachmentIdsSchema = z.array(z.string().uuid()).max(4);
 export const messageBodySchema = z.string().max(BODY_MAX).refine(value =>
@@ -33,19 +38,6 @@ export const sendInputSchema = z.object({
   threadId: z.string().uuid().nullish(), eventType: z.enum(MESSAGE_EVENT_TYPES).optional(),
   traceId: z.string().uuid().optional(), causeMessageId: z.string().uuid().optional(),
   recipients: memberNamesSchema.min(1).optional(), attachmentIds: attachmentIdsSchema.optional(),
-  executionId: executionIdSchema.optional(),
-}).strict();
-export const humanSendInputSchema = sendInputSchema.omit({ executionId: true }).extend({
-  routing: z.enum([
-    "auto",
-    "single",
-    "brain_one_worker",
-    "brain_multi_dm",
-    "brain_multi_room",
-    "orchestrated_auto",
-    "orchestrated",
-  ]).optional(),
-  lockScope: z.enum(["none", "task", "conversation"]).optional(),
 }).strict();
 export const channelInputSchema = z.object({ name: nameSchema,
   type: z.enum(["public", "private", "brains"]).optional(), topic: z.string().max(4000).nullish(),

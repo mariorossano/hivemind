@@ -2,7 +2,6 @@ import { Readable } from "node:stream";
 import { Hono } from "hono";
 import { requestJson, validateRequest } from "./api-input.ts";
 import { threadResponseSchema, uploadLength } from "../shared/api-contract.ts";
-import { cors } from "hono/cors";
 import { DEFAULT_WAIT_MS, HiveError, type Agent } from "../shared/types.ts";
 import { resolveUploadMime } from "../shared/mime.ts";
 import { standingOrders } from "../shared/standing-orders.ts";
@@ -14,8 +13,9 @@ import { launchContext, projectPlugins, saveProjectPlugin, setProjectPluginAvail
 import { BotIngressBudget, readLimitedJson, assertLocalHumanRequest, BOT_JSON_BYTES, PLUGIN_REQUEST_BYTES, CREDENTIAL_JSON_BYTES } from "./ingress.ts";
 import { adaptiveRoutingPublic, saveAdaptiveRouting } from "./adaptive-config.ts";
 import { decodeJevCallCursor } from "../shared/jev-calls.ts";
+import { ACTIVITY_REASONS, type ActivityReason } from "../shared/read-state.ts";
 import { installJevDiagnostics } from './adaptive-routing-diagnostics.ts';
-import { assignAdaptiveTask, mutateAdaptiveTask, mutateAdaptiveRoom, sendAdaptiveAgentMessage, setAdaptiveThreadStatus } from './adaptive-topology-actions.ts';
+import { adviseAfterWait, assignAdaptiveTask, mutateAdaptiveTask, mutateAdaptiveRoom, sendAdaptiveAgentMessage, setAdaptiveThreadStatus } from './adaptive-topology-actions.ts';
 
 export type AppHooks = {
   jevDiagnosticFetch?: typeof fetch;
@@ -30,9 +30,13 @@ function fileDownload(hive: Hive, actor: Agent, id: string) {
       "content-disposition": `inline; filename="${safeFileName(opened.meta.name)}"` },
   });
 }
+/** Thread roots a message page shows: its messages and the open thread; aggregates are scoped to them. */
+function windowRoots(messages: readonly { id: string }[], threadId: string | null): string[] {
+  return threadId ? [threadId, ...messages.map(message => message.id)] : messages.map(message => message.id);
+}
+
 export function createApp(hive: Hive, hooks: AppHooks = {}) {
   const app = new Hono();
-  app.use("*", cors({ origin: ["http://127.0.0.1:7421", "http://localhost:7421", "http://127.0.0.1:7420"] }));
   app.onError((err, c) => {
     if (err instanceof HiveError) {
       if (err.status === 429) c.header("Retry-After", "1");
@@ -42,6 +46,15 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
     return c.json({ error: "Internal server error" }, 500);
   });
   app.get("/api/health", c => c.json({ ok: true, name: "hivemind" }));
+  /** The channel and root of a thread id (a message, task or decision id); null when the id is unknown. */
+  const threadOwner = (id: string): { channelId: string; threadId: string } | null => {
+    const ref = hive.messageQueries.messageRef(id);
+    if (ref) return { channelId: ref.channelId, threadId: ref.threadId ?? ref.id };
+    const human = hive.identity.getAgent('human');
+    if (hive.tasks.has(id)) return { channelId: hive.tasks.get(human, id).channelId, threadId: id };
+    if (hive.decisions.has(id)) return { channelId: hive.decisions.get(human, id).channelId, threadId: id };
+    return null;
+  };
   const ui = new Hono();
   ui.use("*", async (c, next) => {
     c.header("Cache-Control", "no-store");
@@ -80,7 +93,6 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
   ui.put("/adaptive-routing", async c => {
     hive.identity.getAgent("human");
     const saved = saveAdaptiveRouting(hive.home, await readLimitedJson(c.req.raw, CREDENTIAL_JSON_BYTES));
-    hive.adaptiveTopology.settingsChanged();
     jevDiagnostics.settingsChanged();
     return c.json(saved);
   });
@@ -96,14 +108,22 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
   });
   ui.get('/projects/:id/jev-calls/:callId', c => c.json({ call: hive.adaptiveTopology.observations.jevCalls.get(projectRef(c.req.param('id')).id, c.req.param('callId')) }));
   ui.get("/channels/:id/adaptive-routing", c => c.json(hive.adaptiveTopology.view(hive.identity.getAgent("human"), c.req.param("id"))));
-  ui.put("/channels/:id/adaptive-routing/lock", async c => c.json(hive.adaptiveTopology.setLock(hive.identity.getAgent("human"), c.req.param("id"), await readLimitedJson(c.req.raw, CREDENTIAL_JSON_BYTES))));
   ui.get("/snapshot", c => {
     const human = hive.identity.getAgent("human");
     const channels = hive.channels.listChannels(human);
     return c.json({ you: human, projects: hive.projects.listProjects(), agents: hive.identity.listAgents(), channels,
       archivedChannelIds: hive.rooms.archivedChannelIds(channels),
-      ...hive.reads.readSnapshot(human), queued: hive.delivery.queuedCounts(), inbox: hive.delivery.inboxStatuses(),
+      ...hive.reads.readSnapshot(human), ...hive.delivery.queueSnapshot(),
       telegram: { running: Boolean(hooks.telegramRunning?.()), configured: publicTelegramView(hive.home).configured, ...hive.telegramAdmin.health() } });
+  });
+  // Sidebar badges and roster status lines, refreshed on task and decision events.
+  ui.get("/nav-status", c => {
+    const human = hive.identity.getAgent("human");
+    const awaiting = hive.decisions.awaitingCounts(human);
+    return c.json({
+      awaitingDecisions: Object.fromEntries(hive.projects.listProjects().map(project => [project.slug, awaiting[project.id] ?? 0])),
+      agentWork: hive.tasks.workStatus(),
+    });
   });
   ui.get("/read-state", c => c.json(hive.reads.readSnapshot(hive.identity.getAgent("human"))));
   ui.get("/telegram", c => {
@@ -184,6 +204,17 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
     const project = c.req.query('project') ? hive.projects.getProjectBySlug(String(c.req.query('project'))).id : undefined;
     return c.json(hive.reads.mentionInbox(hive.identity.getAgent('human'), 30, beforeSeq, project));
   });
+  ui.get("/activity", c => {
+    const project = c.req.query('project') ? hive.projects.getProjectBySlug(String(c.req.query('project'))).id : undefined;
+    const reasons = (c.req.query('reason') ?? '').split(',').filter(Boolean);
+    if (reasons.length > ACTIVITY_REASONS.length || reasons.some(reason => !(ACTIVITY_REASONS as readonly string[]).includes(reason)))
+      throw new HiveError(400, 'Unknown activity reason');
+    return c.json(hive.reads.activity(hive.identity.getAgent('human'), {
+      projectId: project, unreadOnly: c.req.query('unread') === '1', reasons: reasons as ActivityReason[],
+      beforeSeq: c.req.query('beforeSeq') ? Number(c.req.query('beforeSeq')) : undefined,
+      limit: c.req.query('limit') ? Number(c.req.query('limit')) : undefined,
+    }));
+  });
   ui.post("/mentions/seen", async c => {
     const human = hive.identity.getAgent('human'), body = await requestJson(c.req.raw);
     const project = body.project ? hive.projects.getProjectBySlug(String(body.project)).id : undefined;
@@ -202,16 +233,27 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
   ui.get("/channels/:id/messages", c => {
     const human = hive.identity.getAgent('human'), id = c.req.param('id'), threadId = c.req.query('threadId') || null;
     const after = c.req.query('afterSeq'), before = c.req.query('beforeSeq');
+    const ch = hive.channels.getChannel(id);
+    // A thread opened under the wrong channel (a stale or hand-edited link) must not show another channel's task
+    // or decision: name the owning channel so the UI can redirect there.
+    const owner = threadId ? threadOwner(threadId) : null;
+    if (owner && owner.channelId !== ch.id) {
+      return hive.channels.canSeeChannel(human, hive.channels.getChannel(owner.channelId))
+        ? c.json({ error: 'This thread belongs to another channel', channelId: owner.channelId, threadId: owner.threadId }, 409)
+        : c.json({ error: 'Thread not found in this channel' }, 404);
+    }
     const listed = hive.messageQueries.listMessages(human, id, { threadId, afterSeq: after !== undefined ? Number(after) : undefined,
       beforeSeq: before !== undefined ? Number(before) : undefined, limit: Number(c.req.query('limit') ?? 80) });
-    const ch = hive.channels.getChannel(id);
+    const roots = windowRoots(listed.messages, threadId);
     return c.json({ channel: ch, threadId, messages: listed.messages, hasOlder: listed.hasOlder, hasNewer: listed.hasNewer,
-      cursors: listed.cursors, threads: hive.messageQueries.threadsInChannel(ch.id).map(thread => threadResponseSchema.parse(thread)),
-      replyCounts: hive.messageQueries.replyCounts(ch.id), snapshotSeq: hive.messageQueries.latestSeq(ch.id),
-      task: threadId && hive.tasks.has(threadId) ? hive.tasks.get(human, threadId) : undefined,
+      cursors: listed.cursors, threads: hive.messageQueries.threadsInChannel(ch.id, roots).map(thread => threadResponseSchema.parse(thread)),
+      replyCounts: hive.messageQueries.replyCounts(ch.id, roots), snapshotSeq: hive.messageQueries.latestSeq(ch.id),
+      firstUnreadSeq: threadId ? undefined : hive.reads.firstUnreadSeq(human, ch.id),
+      task: threadId && hive.tasks.has(threadId) ? hive.tasks.view(human, threadId) : undefined,
       decision: threadId && hive.decisions.has(threadId) ? hive.decisions.get(human, threadId) : undefined,
       decisions: threadId && hive.tasks.has(threadId) ? hive.decisions.forTask(human, threadId) : undefined });
   });
+  ui.get('/channels/:id/tasks', c => c.json(hive.tasks.listForChannel(hive.identity.getAgent('human'), c.req.param('id'))));
   ui.post("/channels", async c => {
     const body = await requestJson(c.req.raw);
     return c.json({ channel: hive.channels.createChannel(hive.identity.getAgent('human'), { name: String(body.name ?? ''), type: body.type ?? 'public',
@@ -239,13 +281,11 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
       eventType: body.eventType, traceId: body.traceId, causeMessageId: body.causeMessageId, recipients: body.recipients,
       attachmentIds: Array.isArray(body.attachmentIds) ? body.attachmentIds.map(String) : undefined };
     if (hive.messages.hasActiveSendRequest(human, channel.id, body.requestId))
-      return c.json({ message: hive.messages.postMessage(human, messageInput), routing: null, adaptiveState: null });
-    // Every Human message addressed to a brain, in any channel or thread, passes through Jev first.
-    const routed = await hive.adaptiveTopology.routeHumanRequest(human, messageInput,
-      String(body.routing ?? 'auto'), String(body.lockScope ?? 'none'));
-    if (!routed) return c.json({ message: hive.messages.postMessage(human, messageInput), routing: null, adaptiveState: null });
-    return c.json({ message: routed.message, routing: routed.routing, routingMessage: routed.routingMessage,
-      routingMessages: routed.routingMessages, adaptiveState: routed.state, adaptiveStates: routed.states });
+      return c.json({ message: hive.messages.postMessage(human, messageInput) });
+    const message = hive.messages.postMessage(human, messageInput);
+    // Committed and broadcast first; Jev advises the owning brain in the background and never delays the send (#214).
+    hive.adaptiveTopology.humanMessagePosted(human, message);
+    return c.json({ message });
   });
   ui.post('/files', async c => {
     const human = hive.identity.getAgent('human'), name = c.req.header('x-file-name') || 'paste.png';
@@ -288,6 +328,11 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
     }
     return c.json({ ok: true, ...hive.reads.readSnapshot(human) });
   });
+  ui.post('/unread', async c => {
+    const human = hive.identity.getAgent('human'), body = await requestJson(c.req.raw);
+    hive.reads.markUnreadFrom(human, String(body.channelId), body.fromSeq);
+    return c.json({ ok: true, ...hive.reads.readSnapshot(human) });
+  });
   ui.post('/tasks/:id/routing', async c => c.json(hive.routing.suggest(hive.identity.getAgent('human'), c.req.param('id'), await requestJson(c.req.raw))));
   ui.post('/tasks/:id/routing-override', async c => c.json(hive.routing.override(hive.identity.getAgent('human'), c.req.param('id'), await requestJson(c.req.raw))));
   ui.get('/tasks/:id/timeline', c => c.json({ timeline: hive.timeline.traceForTask(hive.identity.getAgent('human'), c.req.param('id')) }));
@@ -322,11 +367,10 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
       ordersRef: result.created ? undefined : 'unchanged', handoffs: hive.tasks.handoffs(result.agent) });
   });
   agent.get('/me', c => {
-    const me = c.get('me'), adaptiveRouting = hive.adaptiveTopology.forAgent(me) ?? undefined;
-    const executions = hive.adaptiveTopology.policiesFor(me), adaptiveExecutions = executions.length ? executions : undefined;
-    if (c.req.query('orders') === '1') return c.json({ you: me, standingOrders: standingOrders(me), adaptiveRouting, adaptiveExecutions });
+    const me = c.get('me');
+    if (c.req.query('orders') === '1') return c.json({ you: me, standingOrders: standingOrders(me) });
     return c.json({ you: { name: me.name, role: me.role, seniority: me.seniority, focus: me.focus, online: me.online, project: me.project },
-      ordersRef: 'unchanged', adaptiveRouting, adaptiveExecutions });
+      ordersRef: 'unchanged' });
   });
   agent.get('/agents', c => c.json({ agents: hive.identity.listAgents(c.get('me')).map(({ createdAt: _c, ...a }) => a) }));
   agent.get('/search', c => {
@@ -344,31 +388,32 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
   });
   agent.get('/channels/:id/messages', c => {
     const me = c.get('me'), after = c.req.query('afterSeq'), before = c.req.query('beforeSeq');
-    const listed = hive.messageQueries.listMessages(me, c.req.param('id'), { threadId: c.req.query('threadId') || null,
+    const threadId = c.req.query('threadId') || null;
+    const listed = hive.messageQueries.listMessages(me, c.req.param('id'), { threadId,
       afterSeq: after !== undefined ? Number(after) : undefined, beforeSeq: before !== undefined ? Number(before) : undefined,
       limit: Number(c.req.query('limit') ?? 20) });
     const ch = hive.channels.getChannel(c.req.param('id'), me.projectId), meta = c.req.query('meta') === '1';
     return c.json({ channel: { id: ch.id, name: ch.name, type: ch.type }, messages: listed.messages,
       hasOlder: listed.hasOlder, hasNewer: listed.hasNewer, cursors: listed.cursors,
-      threads: meta ? hive.messageQueries.threadsInChannel(ch.id).map(thread => threadResponseSchema.parse(thread)) : undefined,
-      replyCounts: meta ? hive.messageQueries.replyCounts(ch.id) : undefined });
+      threads: meta ? hive.messageQueries.threadsInChannel(ch.id, windowRoots(listed.messages, threadId)).map(thread => threadResponseSchema.parse(thread)) : undefined,
+      replyCounts: meta ? hive.messageQueries.replyCounts(ch.id, windowRoots(listed.messages, threadId)) : undefined });
   });
   agent.post('/channels', async c => {
     const body = await requestJson(c.req.raw);
     return c.json({ channel: hive.channels.createChannel(c.get('me'), { name: String(body.name ?? ''), type: body.type ?? 'public', topic: body.topic, memberNames: body.memberNames }) });
   });
   agent.post('/channels/:id/messages', async c => c.json(await sendAdaptiveAgentMessage(
-    hive, c.get('me'), c.req.param('id'), await requestJson(c.req.raw), c.get('token'))));
+    hive, c.get('me'), c.req.param('id'), await requestJson(c.req.raw))));
   agent.get('/messages/:seq', c => c.json({ message: hive.messageQueries.getVisibleMessage(c.get('me'), Number(c.req.param('seq'))) }));
   agent.post('/messages/expand', async c => c.json(hive.messageQueries.expandDigest(c.get('me'), await requestJson(c.req.raw))));
-  agent.post('/tasks', async c => c.json(await assignAdaptiveTask(hive, c.get('me'), await requestJson(c.req.raw), c.get('token'))));
+  agent.post('/tasks', async c => c.json(await assignAdaptiveTask(hive, c.get('me'), await requestJson(c.req.raw))));
   agent.post('/decisions', async c => c.json(hive.decisions.create(c.get('me'), await requestJson(c.req.raw))));
   agent.get('/decisions/:id', c => c.json({ decision: hive.decisions.get(c.get('me'), c.req.param('id')) }));
   agent.get('/tasks/:id/decisions', c => c.json({ decisions: hive.decisions.forTask(c.get('me'), c.req.param('id')) }));
   agent.post('/decisions/:id/events', async c => c.json(hive.decisions.event(c.get('me'), c.req.param('id'), await requestJson(c.req.raw))));
   agent.get('/channels/:id/room', c => c.json(hive.rooms.view(c.get('me'), c.req.param('id'), c.req.query('beforeTask'))));
   agent.get('/channels/:id/room/history', c => c.json({ history: hive.rooms.history(c.get('me'), c.req.param('id'), Number(c.req.query('before') ?? Number.MAX_SAFE_INTEGER)) }));
-  agent.post('/channels/:id/room', async c => c.json(await mutateAdaptiveRoom(hive, c.get('me'), c.req.param('id'), await requestJson(c.req.raw), c.get('token'))));
+  agent.post('/channels/:id/room', async c => c.json(await mutateAdaptiveRoom(hive, c.get('me'), c.req.param('id'), await requestJson(c.req.raw))));
   agent.get('/workers/:id/capabilities', c => c.json({ capability: hive.routing.get(c.get('me'), c.req.param('id')) }));
   agent.post('/capabilities', async c => c.json({ capability: hive.routing.set(c.get('me'), await requestJson(c.req.raw)) }));
   agent.post('/tasks/:id/routing', async c => c.json(hive.routing.suggest(c.get('me'), c.req.param('id'), await requestJson(c.req.raw))));
@@ -379,8 +424,8 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
   agent.get('/tasks/:id/handoff', c => c.json(hive.tasks.handoff(c.get('me'), c.req.param('id'))));
   agent.get('/tasks/:id/timeline', c => c.json({ timeline: hive.timeline.traceForTask(c.get('me'), c.req.param('id')) }));
   agent.get('/tasks/:id/timeline/export', c => c.json({ fixture: hive.timeline.exportTask(c.get('me'), c.req.param('id')) }));
-  agent.get('/tasks/:id', c => c.json({ task: hive.tasks.get(c.get('me'), c.req.param('id')) }));
-  agent.post('/tasks/:id/events', async c => c.json(await mutateAdaptiveTask(hive, c.get('me'), c.req.param('id'), await requestJson(c.req.raw), c.get('token'))));
+  agent.get('/tasks/:id', c => c.json({ task: hive.tasks.view(c.get('me'), c.req.param('id')) }));
+  agent.post('/tasks/:id/events', async c => c.json(await mutateAdaptiveTask(hive, c.get('me'), c.req.param('id'), await requestJson(c.req.raw))));
   agent.post('/files', async c => {
     const name = c.req.header('x-file-name') || 'file';
     const file = await hive.files.createFile(c.get('me'), { authorize: () => hive.identity.agentByToken(c.get('token')), name,
@@ -400,8 +445,8 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
   });
   agent.post('/threads/:id/status', async c => {
     const body = await requestJson(c.req.raw);
-    const { thread, ...routing } = await setAdaptiveThreadStatus(hive, c.get('me'), c.req.param('id'), body.status ?? null, c.get('token'));
-    return c.json({ thread: threadResponseSchema.parse(thread), ...routing });
+    const { thread, ...advice } = await setAdaptiveThreadStatus(hive, c.get('me'), c.req.param('id'), body.status ?? null);
+    return c.json({ thread: threadResponseSchema.parse(thread), ...advice });
   });
   agent.post('/channels/:id/invite', async c => {
     const body = await requestJson(c.req.raw);
@@ -417,9 +462,7 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
     if (body?.sessionId == null) throw new HiveError(409, 'HTTP 409: Inbox delivery protocol changed. Restart the Hivemind MCP client and rejoin. HTTP/CLI clients must open an inbox session and include sessionId in wait. Do not retry this wait unchanged.');
     if (typeof body.sessionId !== 'string') throw new HiveError(400, 'Expected sessionId');
     const result = await hive.delivery.wait(me, Number(body.timeoutMs ?? DEFAULT_WAIT_MS), c.req.raw.signal, { compact: Boolean(body.compact), sessionId: body.sessionId });
-    const executions = hive.adaptiveTopology.policiesFor(me);
-    return c.json({ ...result, adaptiveRouting: hive.adaptiveTopology.forAgent(me) ?? undefined,
-      adaptiveExecutions: executions.length ? executions : undefined });
+    return c.json({ ...result, ...adviseAfterWait(hive, me, result) });
   });
   agent.post('/inbox/session', async c => {
     const body = await requestJson(c.req.raw);

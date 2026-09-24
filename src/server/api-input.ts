@@ -2,7 +2,7 @@ import { setCapabilitiesSchema, suggestWorkersSchema, routingOutcomeSchema, rout
 import { z } from "zod";
 import { readLimitedJson } from "./ingress.ts";
 import { API_JSON_BYTES, channelInputSchema, cursorSchema, integerArgument,
-  humanSendInputSchema, joinInputSchema, memberNamesSchema, nameSchema, reactionInputSchema, referenceSchema, sendInputSchema,
+  joinInputSchema, memberNamesSchema, nameSchema, reactionInputSchema, referenceSchema, sendInputSchema,
   sequenceSchema, validated, waitDurationSchema } from "../shared/api-contract.ts";
 import { subscriptionSchema, subscriptionScopeSchema } from "../shared/notifications.ts";
 import { claimPreviewSchema } from '../shared/task-claims.ts';
@@ -21,6 +21,7 @@ const project = z.object({ name: z.string().trim().min(1).max(160), slug: z.stri
 const read = z.object({ channelId: referenceSchema, threadId: z.string().uuid().nullish(),
   messageSeqs: z.array(sequenceSchema).max(200).optional(), seq: sequenceSchema.optional() }).strict()
   .refine(v => (v.messageSeqs !== undefined) !== (v.seq !== undefined));
+const unread = z.object({ channelId: referenceSchema, fromSeq: sequenceSchema }).strict();
 const expand = z.object({ channel: referenceSchema, messageIds: z.array(z.string().uuid()).max(100).min(1),
   afterSeq: cursorSchema.optional() }).strict();
 const wait = z.object({ sessionId: z.string().uuid().optional(), compact: z.boolean().optional(), timeoutMs: waitDurationSchema.optional() }).strict();
@@ -35,8 +36,7 @@ const telegram = z.object({ botToken: z.string().max(512).optional(),
 function schemaFor(path: string, method: string): z.ZodType | undefined {
   if (path.endsWith('/api/agent/join')) return join;
   if (/\/channels\/[^/]+\/messages$/.test(path)) {
-    if (path.startsWith('/api/bot/')) return undefined;
-    return path.startsWith('/api/ui/') ? humanSendInputSchema : sendInputSchema;
+    return path.startsWith('/api/bot/') ? undefined : sendInputSchema;
   }
   if (path.endsWith('/channels')) return channelInputSchema;
   if (/\/messages\/[^/]+\/reactions$/.test(path)) return reactionInputSchema;
@@ -47,6 +47,7 @@ function schemaFor(path: string, method: string): z.ZodType | undefined {
   if (/\/api\/ui\/projects\/[^/]+$/.test(path) && method === 'PATCH') return project.pick({ name: true, worktree: true }).partial();
   if (path === '/api/ui/telegram') return telegram;
   if (path === '/api/ui/read') return read;
+  if (path === '/api/ui/unread') return unread;
   if (path === '/api/ui/mentions/seen') return z.object({ project: z.string().min(1).max(32).optional() }).strict();
   if (path === '/api/agent/wait') return wait;
   if (path === '/api/agent/inbox/session') return z.object({ sessionId: z.string().uuid() }).strict();
@@ -71,6 +72,14 @@ function schemaFor(path: string, method: string): z.ZodType | undefined {
   // Bot/plugin/recovery schemas have their own narrower ingress readers.
   return undefined;
 }
+/** Agent coordination routes where older clients may still send the removed `executionId` (#211, #218). */
+const LEGACY_EXECUTION_ID = /^\/api\/agent\/(?:channels\/[^/]+\/(?:messages|room)|tasks(?:\/[^/]+\/events)?)$/;
+/** Older agent clients may still send executionId: it is dropped unvalidated, never stored or forwarded. */
+function withoutLegacyFields(pathname: string, value: unknown): unknown {
+  if (!LEGACY_EXECUTION_ID.test(pathname) || !value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const { executionId: _ignored, ...rest } = value as Record<string, unknown>;
+  return rest;
+}
 let readingBodies = 0;
 const cache = new WeakMap<Request, Record<string, unknown>>();
 // Fields are validated using the route-specific shared schema before handlers
@@ -86,7 +95,7 @@ export async function requestJson(request: Request): Promise<Record<string, any>
     const emptyAllowed = schema === empty || new URL(request.url).pathname === '/api/ui/mentions/seen';
     value = emptyAllowed && !request.body ? {} : await readLimitedJson(request, API_JSON_BYTES, 10_000, emptyAllowed);
   } finally { readingBodies--; }
-  const parsed = validated(schema, value) as Record<string, unknown>;
+  const parsed = validated(schema, withoutLegacyFields(new URL(request.url).pathname, value)) as Record<string, unknown>;
   cache.set(request, parsed); return parsed;
 }
 export async function validateRequest(request: Request): Promise<void> {

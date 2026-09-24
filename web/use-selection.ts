@@ -4,6 +4,7 @@ import type { Snapshot, UnreadTarget } from "./api.ts";
 import type { ChannelJournal } from "./channel-state.ts";
 import type { Message } from "../src/shared/types.ts";
 import type { ThreadView } from "./thread-state.ts";
+import { loadSelectedProject } from "./nav-model.ts";
 import { parseHash, repairSel, setHash, type Sel } from "./selection.ts";
 
 type Gate = MutableRefObject<ReturnType<typeof createRequestGate>>;
@@ -83,10 +84,10 @@ export function useChangeSelection(
     setThreadId(nextThread);
   }, []);
 
-  const go = (next: Sel) => {
+  const go = useCallback((next: Sel) => {
     changeSelection(next);
     setHash(next);
-  };
+  }, [changeSelection]);
 
   return { changeSelection, go };
 }
@@ -95,7 +96,7 @@ export function useChangeSelection(
 export function useSelectionRepair(snap: Snapshot | null, sel: Sel, changeSelection: (next: Sel) => void) {
   useEffect(() => {
     if (!snap) return;
-    const next = repairSel(sel, snap);
+    const next = repairSel(sel, snap, loadSelectedProject());
     if (!next) return;
     changeSelection(next);
     setHash(next);

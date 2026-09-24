@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { DecisionDeps } from './services/ports.ts';
-import { HiveError, type Agent, type Message } from '../shared/types.ts';
+import { agentLabel, HiveError, type Agent, type Channel, type Message } from '../shared/types.ts';
+import { receiptKey } from './inbox-delivery.ts';
 import {
   decisionAnswerSchema, decisionBody, decisionEventSchema, requestDecisionSchema,
   type DecisionDeliveryState, type DecisionPage, type DecisionSnapshot, type DecisionView,
@@ -8,6 +9,10 @@ import {
 
 type DecisionRow = { id: string; snapshot: string };
 type MutationRow = { decision_id: string; message_id: string | null; request_hash: string };
+/** An awaiting decision still bound to its task's current revision and not past its deadline (`?` = now). */
+const OPEN_DECISION = `json_extract(d.snapshot, '$.storedState') = 'awaiting_input'
+      AND CAST(json_extract(d.snapshot, '$.taskRevision') AS INTEGER) = CAST(json_extract(t.snapshot, '$.revision') AS INTEGER)
+      AND (json_extract(d.snapshot, '$.requestedByAt') IS NULL OR CAST(json_extract(d.snapshot, '$.requestedByAt') AS INTEGER) > ?)`;
 
 export class DecisionStore {
   constructor(private readonly deps: DecisionDeps, private atomic: <T>(work: () => T) => T) {}
@@ -23,43 +28,61 @@ export class DecisionStore {
   private save(snapshot: DecisionSnapshot) {
     this.deps.storage.db.prepare('UPDATE decision_requests SET snapshot = ? WHERE id = ?').run(JSON.stringify(snapshot), snapshot.id);
   }
-  private visible(actor: Agent, snapshot: DecisionSnapshot) {
-    if (actor.role === 'bot' || !this.deps.channels.canSeeChannel(actor, this.deps.channels.getChannel(snapshot.channelId)))
-      throw new HiveError(403, 'Cannot read this decision');
-    return snapshot;
+  /** Channel access per distinct channel of the batch (each channel is read once). */
+  private visible(actor: Agent, snapshots: readonly DecisionSnapshot[]) {
+    const channels = new Map<string, Channel>();
+    for (const snapshot of snapshots) {
+      let channel = channels.get(snapshot.channelId);
+      if (!channel) channels.set(snapshot.channelId, channel = this.deps.channels.getChannel(snapshot.channelId));
+      if (actor.role === 'bot' || !this.deps.channels.canSeeChannel(actor, channel)) throw new HiveError(403, 'Cannot read this decision');
+    }
   }
-  private projected(snapshot: DecisionSnapshot) {
-    const task = this.deps.tasks.get(this.deps.identity.getAgent('human'), snapshot.taskId);
+  private projected(snapshot: DecisionSnapshot, revision: number | undefined) {
+    if (revision === undefined) throw new HiveError(404, 'Task not found');
     if (snapshot.storedState !== 'awaiting_input')
-      return { state: snapshot.storedState, currentTaskRevision: task.revision, staleReason: null } as const;
-    if (task.revision !== snapshot.taskRevision)
-      return { state: 'superseded' as const, currentTaskRevision: task.revision, staleReason: 'task_changed' as const };
+      return { state: snapshot.storedState, currentTaskRevision: revision, staleReason: null } as const;
+    if (revision !== snapshot.taskRevision)
+      return { state: 'superseded' as const, currentTaskRevision: revision, staleReason: 'task_changed' as const };
     if (snapshot.requestedByAt !== null && Date.now() >= snapshot.requestedByAt)
-      return { state: 'expired' as const, currentTaskRevision: task.revision, staleReason: 'deadline_passed' as const };
-    return { state: 'awaiting_input' as const, currentTaskRevision: task.revision, staleReason: null };
+      return { state: 'expired' as const, currentTaskRevision: revision, staleReason: 'deadline_passed' as const };
+    return { state: 'awaiting_input' as const, currentTaskRevision: revision, staleReason: null };
   }
-  private delivery(agentId: string, seq: number): DecisionDeliveryState {
-    return this.deps.inbox.receiptState(agentId, seq);
-  }
-  private view(actor: Agent, snapshot: DecisionSnapshot): DecisionView {
-    this.visible(actor, snapshot);
-    const projection = this.projected(snapshot);
-    const recipients = [{ id: snapshot.requesterId, name: snapshot.requesterName }, ...snapshot.affectedWorkers]
+  private recipients(snapshot: DecisionSnapshot) {
+    return [{ id: snapshot.requesterId, name: snapshot.requesterName }, ...snapshot.affectedWorkers]
       .filter((value, index, all) => all.findIndex(other => other.id === value.id) === index);
-    return {
-      ...snapshot,
-      ...projection,
-      delivery: snapshot.answer ? recipients.map(person => ({
-        agentId: person.id, name: person.name, state: this.delivery(person.id, snapshot.answer!.seq),
-      })) : [],
-      warning: projection.state === 'awaiting_input'
-        ? 'Human input is advisory to the current task revision; answering does not complete, assign or execute the task.'
-        : projection.state === 'superseded'
-          ? 'This request is stale or explicitly superseded. Replies remain history and do not apply to the changed task.'
-          : projection.state === 'expired'
-            ? 'The requested-by time passed. No recommendation was applied automatically.'
-            : 'Delivery receipts confirm transport only, not task acceptance or completion.',
-    };
+  }
+  private view(actor: Agent, snapshot: DecisionSnapshot): DecisionView { return this.views(actor, [snapshot])[0]!; }
+  /** Projects a batch with a constant number of statements: task revisions and receipts are read together. */
+  private views(actor: Agent, snapshots: readonly DecisionSnapshot[]): DecisionView[] {
+    if (!snapshots.length) return [];
+    this.visible(actor, snapshots);
+    const revisions = this.deps.tasks.revisions([...new Set(snapshots.map(snapshot => snapshot.taskId))]);
+    const receipts = this.deps.inbox.receiptStates(snapshots.flatMap(snapshot => snapshot.answer
+      ? this.recipients(snapshot).map(person => ({ agentId: person.id, seq: snapshot.answer!.seq })) : []));
+    // Removed agents read "Name (removed)" in views; stored snapshots keep the plain name.
+    const removed = this.deps.identity.removedAmong(snapshots.flatMap(snapshot => this.recipients(snapshot).map(person => person.id)));
+    const label = <T extends { id: string; name: string }>(person: T): T =>
+      ({ ...person, name: agentLabel({ name: person.name, removedAt: removed.has(person.id) ? 0 : null }) });
+    return snapshots.map(snapshot => {
+      const projection = this.projected(snapshot, revisions.get(snapshot.taskId));
+      return {
+        ...snapshot,
+        requesterName: label({ id: snapshot.requesterId, name: snapshot.requesterName }).name,
+        affectedWorkers: snapshot.affectedWorkers.map(label),
+        ...projection,
+        delivery: snapshot.answer ? this.recipients(snapshot).map(label).map(person => ({
+          agentId: person.id, name: person.name,
+          state: receipts.get(receiptKey(person.id, snapshot.answer!.seq)) ?? 'pending' as DecisionDeliveryState,
+        })) : [],
+        warning: projection.state === 'awaiting_input'
+          ? 'Human input is advisory to the current task revision; answering does not complete, assign or execute the task.'
+          : projection.state === 'superseded'
+            ? 'This request is stale or explicitly superseded. Replies remain history and do not apply to the changed task.'
+            : projection.state === 'expired'
+              ? 'The requested-by time passed. No recommendation was applied automatically.'
+              : 'Delivery receipts confirm transport only, not task acceptance or completion.',
+      };
+    });
   }
 
   get(actor: Agent, id: string) { return this.view(actor, this.snapshot(id)); }
@@ -68,15 +91,21 @@ export class DecisionStore {
     this.deps.tasks.get(actor, taskId);
     const rows = this.deps.storage.db.prepare('SELECT id, snapshot FROM decision_requests WHERE task_id = ? ORDER BY created_at DESC LIMIT 20')
       .all(taskId) as DecisionRow[];
-    return rows.map(row => this.view(actor, JSON.parse(row.snapshot) as DecisionSnapshot));
+    return this.views(actor, rows.map(row => JSON.parse(row.snapshot) as DecisionSnapshot));
+  }
+
+  /** Currently applicable awaiting decisions per project id (the Decisions badge); projects with none are omitted. */
+  awaitingCounts(actor: Agent): Record<string, number> {
+    if (actor.role !== 'human') throw new HiveError(403, 'Only Human has the decision queue');
+    const rows = this.deps.storage.db.prepare(`SELECT d.project_id AS id, COUNT(*) AS n FROM decision_requests d
+      JOIN task_records t ON t.id = d.task_id WHERE ${OPEN_DECISION} GROUP BY d.project_id`).all(Date.now()) as { id: string; n: number }[];
+    return Object.fromEntries(rows.map(row => [row.id, Number(row.n)]));
   }
 
   listHuman(actor: Agent, projectId: string, includeClosed = true): DecisionPage {
     if (actor.role !== 'human') throw new HiveError(403, 'Only Human has the decision queue');
     const now = Date.now();
-    const open = `json_extract(d.snapshot, '$.storedState') = 'awaiting_input'
-      AND CAST(json_extract(d.snapshot, '$.taskRevision') AS INTEGER) = CAST(json_extract(t.snapshot, '$.revision') AS INTEGER)
-      AND (json_extract(d.snapshot, '$.requestedByAt') IS NULL OR CAST(json_extract(d.snapshot, '$.requestedByAt') AS INTEGER) > ?)`;
+    const open = OPEN_DECISION;
     const awaiting = Number(this.deps.storage.db.prepare(`SELECT COUNT(*) AS n FROM decision_requests d
       JOIN task_records t ON t.id = d.task_id WHERE d.project_id = ? AND ${open}`).get(projectId, now)!.n);
     const openRows = this.deps.storage.db.prepare(`SELECT d.id, d.snapshot FROM decision_requests d
@@ -88,7 +117,7 @@ export class DecisionStore {
       JOIN task_records t ON t.id = d.task_id WHERE d.project_id = ? AND NOT (${open})
       ORDER BY CAST(json_extract(d.snapshot, '$.updatedAt') AS INTEGER) DESC, d.created_at DESC LIMIT ?`)
       .all(projectId, now, remaining) as DecisionRow[] : [];
-    const items = [...openRows, ...closedRows].map(row => this.view(actor, JSON.parse(row.snapshot) as DecisionSnapshot));
+    const items = this.views(actor, [...openRows, ...closedRows].map(row => JSON.parse(row.snapshot) as DecisionSnapshot));
     return { items, awaiting,
       warning: 'Shows up to 100 requests, always prioritizing currently applicable awaiting decisions. Recommendations are not authority and expired/stale requests never auto-apply.' };
   }
@@ -167,17 +196,37 @@ export class DecisionStore {
     return { decision, message, duplicate: false };
   }
 
+  /** Who a Human reply in a decision thread is addressed to; removed agents receive nothing. */
   replyRecipientNames(threadId: string | null) {
     if (!threadId || !this.has(threadId)) return [];
     const snapshot = this.snapshot(threadId);
-    return [...new Set([snapshot.requesterName, ...snapshot.affectedWorkers.map(worker => worker.name)])];
+    return [...new Set([{ id: snapshot.requesterId, name: snapshot.requesterName }, ...snapshot.affectedWorkers]
+      .filter(person => this.deps.identity.findActiveAgent(person.id)).map(person => person.name))];
+  }
+
+  /**
+   * #215, inside the removal transaction: the removed brain's awaiting requests are withdrawn with the reason, so the
+   * Human queue no longer offers them; they stay in history. Returns how many were withdrawn.
+   */
+  withdrawForRemovedBrain(brain: Agent): number {
+    const rows = this.deps.storage.db.prepare(`SELECT id, snapshot FROM decision_requests
+      WHERE requester_id = ? AND json_extract(snapshot, '$.storedState') = 'awaiting_input'`).all(brain.id) as DecisionRow[];
+    const now = Date.now(), human = this.deps.identity.getAgent('human');
+    for (const row of rows) {
+      const snapshot = JSON.parse(row.snapshot) as DecisionSnapshot;
+      snapshot.storedState = 'withdrawn'; snapshot.revision += 1; snapshot.updatedAt = now;
+      snapshot.withdrawn = { reason: `${brain.name} was removed from the hive`, at: now }; this.save(snapshot);
+    }
+    // The bus defers these until the removal commits.
+    for (const row of rows) this.deps.bus.emit('decision', this.get(human, row.id));
+    return rows.length;
   }
 
   captureHumanReply(actor: Agent, message: Message, source: 'hive' | 'telegram' = 'hive'): DecisionView | null {
     if (actor.role !== 'human' || !message.threadId || !this.has(message.threadId)) return null;
     const snapshot = this.snapshot(message.threadId);
     if (snapshot.channelId !== message.channelId) return null;
-    const projection = this.projected(snapshot);
+    const projection = this.projected(snapshot, this.deps.tasks.revisions([snapshot.taskId]).get(snapshot.taskId));
     if (projection.state !== 'awaiting_input') return this.view(actor, snapshot);
     snapshot.storedState = 'answered'; snapshot.revision += 1; snapshot.updatedAt = message.createdAt;
     snapshot.answer = { messageId: message.id, seq: message.seq, body: message.body, at: message.createdAt,

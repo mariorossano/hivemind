@@ -1,15 +1,21 @@
 import { useEffect, useRef, useState } from 'react';
 import type { JevCall, JevCallLogView, JevCallSummary, JevRequestGroup } from '../src/shared/jev-calls.ts';
 import { api } from './api.ts';
-import { topologyLabel } from './AdaptiveRoutingPanel.tsx';
 import { CollectorHealthNotice } from './EvidenceHealth.tsx';
 import type { EvidenceCollectorHealth } from '../src/shared/evidence-health.ts';
-import { answerLabel, answerRejected, appendOlderPage, errorLabel, contextRows, mergeRefreshedPage, outcomeLabel, percent, questionRows, reasonLabel, requestedModel, triggerLabel, workersLabel } from './jev-log-view.ts';
+import { adviceLabel, answerLabel, answerRejected, appendOlderPage, errorLabel, contextRows, mergeLiveCall, mergeRefreshedPage, modelLabel, outcomeLabel, percent, questionRows, reasonLabel, requestedModel, triggerLabel, uncertaintyLabel, workersLabel } from './jev-log-view.ts';
+import { MIN_TOPOLOGY_CONFIDENCE } from '../src/shared/adaptive-topology-policy.ts';
+import { incoherenceLabel, topologyName as topologyLabel } from '../src/shared/jev-outcome.ts';
+import type { JevLiveSubscribe } from './use-realtime.ts';
 
 type Props = {
   project: string;
-  /** Incremented on every realtime Jev call so the history refreshes. */
+  /** The project's id, as carried by realtime calls (`project` may be a slug). */
+  projectId?: string;
+  /** Incremented when the history must be reloaded (reconnect). */
   tick: number;
+  /** Realtime calls and collector health, merged in place instead of refetching the log. */
+  subscribe?: JevLiveSubscribe;
   channelLabel: (channelId: string) => string;
   agentName: (agentId: string) => string;
   onOpenChannel: (channelId: string) => void;
@@ -18,22 +24,35 @@ type Props = {
 const time = (at: number) => new Date(at).toLocaleString([], { dateStyle: 'short', timeStyle: 'medium' });
 
 /** Routing log: Human-only history of every exchange with Jev, grouped by the request that caused it. */
-export function JevLog({ project, tick, channelLabel, agentName, onOpenChannel }: Props) {
+export function JevLog({ project, projectId, tick, subscribe, channelLabel, agentName, onOpenChannel }: Props) {
   const [view, setView] = useState<JevCallLogView | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
   const [collector, setCollector] = useState<EvidenceCollectorHealth | null>(null);
   const detail = useRef<HTMLDivElement>(null);
+  /** Calls received since the current page request started, replayed onto its (possibly older) result. */
+  const liveCalls = useRef<JevCallSummary[]>([]);
   // On narrow screens the detail sits below the list: bring it into view when a call is chosen.
   useEffect(() => {
     if (selected && window.matchMedia?.('(max-width: 900px)').matches) detail.current?.scrollIntoView({ block: 'start' });
   }, [selected]);
   useEffect(() => { setView(null); setSelected(null); }, [project]);
   useEffect(() => {
+    if (!subscribe) return;
+    return subscribe(event => {
+      if (event.type === 'health') { setCollector(event.health); return; }
+      const { call } = event;
+      if (call.projectId !== projectId && call.projectId !== project) return;
+      liveCalls.current = [...liveCalls.current.slice(-99), call];
+      setView(current => current ? mergeLiveCall(current, call) : current);
+    });
+  }, [subscribe, project, projectId]);
+  useEffect(() => {
     const controller = new AbortController();
+    liveCalls.current = [];
     api.jevCalls(project, undefined, controller.signal).then(next => {
-      setView(current => mergeRefreshedPage(current, next));
+      setView(current => liveCalls.current.reduce(mergeLiveCall, mergeRefreshedPage(current, next)));
       setError(null);
     }).catch(reason => { if ((reason as Error)?.name !== 'AbortError') setError(String((reason as Error)?.message ?? reason)); });
     // Collector health is diagnostic only; failing to read it never hides the history.
@@ -93,12 +112,11 @@ function RequestCard({ group, selected, channelLabel, agentName, onSelect, onOpe
   </section>;
 }
 
-/** The request's current state at a glance: the applied mode, or what happened to the last call. */
+/** The request at a glance: Jev's latest advice (#211), or, for calls recorded before #211, the mode applied then. */
 function badgeLabel(call: JevCallSummary): string {
   if (call.phase === 'observation') return 'Observed';
   if (call.outcome) return topologyLabel(call.outcome.appliedTopology);
-  if (call.status === 'unavailable') return answerRejected(call) ? 'Answer rejected' : 'Jev unavailable';
-  return 'Not applied';
+  return adviceLabel(call);
 }
 
 function CallRow({ call, active, onSelect }: { call: JevCallSummary; active: boolean; onSelect: () => void }) {
@@ -127,6 +145,8 @@ function CallDetail({ project, id, channelLabel, agentName }: { project: string;
   if (!call) return <p className="empty">Loading call…</p>;
   const outcome = outcomeLabel(call);
   const request = (call.sent as { state?: { request?: string } } | null)?.state?.request ?? call.request;
+  const uncertain = call.status === 'ok' ? uncertaintyLabel(call) : null;
+  const model = modelLabel(call);
   return <article className="jev-call-detail" aria-label="Jev call detail">
     <header>
       <h2>{triggerLabel(call.trigger, call.phase)}</h2>
@@ -144,8 +164,10 @@ function CallDetail({ project, id, channelLabel, agentName }: { project: string;
     <section>
       <h3>2 · Jev's answers</h3>
       {call.status === 'unavailable' && <p className="routing-warning">{answerRejected(call)
-        ? <>Jev answered, but Hivemind rejected the answer: {errorLabel(call.error)}. Hivemind kept the current mode.</>
-        : <>No answer: {errorLabel(call.error)}. Hivemind kept the current mode.</>}</p>}
+        ? <>Jev answered, but Hivemind rejected the answer: {errorLabel(call.error)}. The brain was told Jev had no advice.</>
+        : <>No answer: {errorLabel(call.error)}. The brain was told Jev had no advice.</>}</p>}
+      {call.incoherent && <p className="routing-warning">Jev's answers contradict each other ({incoherenceLabel(call.incoherent)}).
+        The brain received it as uncertain advice.</p>}
       {(call.status !== 'unavailable' || call.received !== null) && <table className="jev-answers">
           <thead><tr><th>Question</th><th>Answer</th><th>Confidence</th></tr></thead>
           <tbody>{questionRows(call.sent, call.received).map(row => <tr key={row.id}>
@@ -165,17 +187,18 @@ function CallDetail({ project, id, channelLabel, agentName }: { project: string;
     </section>
 
     <section>
-      <h3>3 · Decision and result</h3>
+      <h3>3 · Advice</h3>
       <dl className="jev-context">
-        <div><dt>Jev recommends</dt><dd>{call.status === 'ok' ? `${topologyLabel(call.targetTopology)}${call.targetWorkers ? ` · ${workersLabel(call.targetWorkers)}` : ''}` : '—'}</dd></div>
+        <div><dt>Jev suggested</dt><dd>{call.status === 'ok' ? `${topologyLabel(call.targetTopology)}${call.targetWorkers ? ` · ${workersLabel(call.targetWorkers)}` : ''}` : '—'}
+          {uncertain ? <small> ({uncertain}: below {Math.round(MIN_TOPOLOGY_CONFIDENCE * 100)}% or not coherent)</small> : null}</dd></div>
         <div><dt>Overall confidence</dt><dd>{percent(call.confidence)} <small>(lowest answer confidence)</small></dd></div>
         <div><dt>Reason</dt><dd>{reasonLabel(call.reason)}</dd></div>
         {call.status === 'unavailable' && <div><dt>{answerRejected(call) ? 'Why it was rejected' : 'Failure'}</dt>
           <dd>{errorLabel(call.error)}{call.error ? <small> ({call.error})</small> : null}</dd></div>}
-        <div><dt>What Hivemind did</dt><dd className={`jev-outcome ${outcome.tone}`}>{outcome.text}</dd></div>
+        <div><dt>What happened</dt><dd className={`jev-outcome ${outcome.tone}`}>{outcome.text}</dd></div>
         <div><dt>Requested model</dt><dd>{requestedModel(call) ?? '—'}</dd></div>
-        <div><dt>Resolved model · time · tokens</dt><dd>{call.model ?? '—'}{call.model && requestedModel(call) && call.model !== requestedModel(call)
-          ? <small> (differs from requested)</small> : null} · {call.latencyMs} ms · {call.inputTokens ?? '—'} in / {call.outputTokens ?? '—'} out</dd></div>
+        <div><dt>Resolved model · time · tokens</dt><dd>{model.text}{model.mismatch
+          ? <small className="routing-warning"> (differs from the pinned model)</small> : null} · {call.latencyMs} ms · {call.inputTokens ?? '—'} in / {call.outputTokens ?? '—'} out</dd></div>
       </dl>
     </section>
 

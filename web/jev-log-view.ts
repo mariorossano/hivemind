@@ -1,13 +1,21 @@
 import type { AdaptiveTopology } from '../src/shared/adaptive-topology.ts';
 import type { JevCall, JevCallLogView, JevCallSummary, JevCallTrigger, JevRequestGroup } from '../src/shared/jev-calls.ts';
 import { parseTopologyPlan } from '../src/shared/adaptive-topology-policy.ts';
-import { topologyLabel } from './AdaptiveRoutingPanel.tsx';
+import { incoherenceLabel, jevAdviceLabel, jevAnswerState, jevModelDisplay, topologyName as topologyLabel } from '../src/shared/jev-outcome.ts';
 
 /** The identifier Hivemind asked for; calls recorded before #134 only have it in the exact sent payload. */
 export function requestedModel(call: JevCall): string | null {
   if (call.requestedModel !== undefined) return call.requestedModel;
   const model = (call.sent as { model?: unknown } | null)?.model;
   return typeof model === 'string' ? model : null;
+}
+
+/**
+ * Requested and resolved model in one line (#209): the default alias resolving to a concrete version is normal
+ * (`jev-latest → jev-1.13.0`); only a pinned identifier that resolved to something else is flagged.
+ */
+export function modelLabel(call: JevCall): { text: string; mismatch: boolean } {
+  return jevModelDisplay(requestedModel(call), call.model);
 }
 
 export function workersLabel(n: number): string { return `${n} worker${n === 1 ? '' : 's'}`; }
@@ -19,10 +27,12 @@ export function triggerLabel(trigger: JevCallTrigger, phase: JevCallSummary['pha
     case 'human_request': return 'Your new request';
     case 'human_message': return phase === 'initial' ? 'Your thread reply (new request)' : 'Your reply in the thread';
     case 'brain_message': return `Brain message${trigger.eventType ? ` · ${trigger.eventType}` : ''}`;
-    case 'delegation_attempt': return 'Brain tried to delegate';
+    case 'delegation_attempt': return 'Brain delegated';
     case 'task_event': return `Brain task update${trigger.eventType ? ` · ${trigger.eventType}` : ''}`;
-    case 'room_event': return 'Brain changed a room';
-    case 'capacity_change': return 'Worker capacity changed';
+    case 'room_event': return `Brain changed a room${trigger.eventType ? ` · ${trigger.eventType}` : ''}`;
+    case 'thread_status': return `Brain set a thread status${trigger.eventType ? ` · ${trigger.eventType}` : ''}`;
+    case 'wait': return 'Brain received mail';
+    case 'capacity_change': return 'Worker capacity changed (before #211)';
     case 'observation': return 'No single brain owns this request';
   }
 }
@@ -33,16 +43,23 @@ const REASONS: Record<string, string> = {
   parallel_workstreams: 'Independent parallel workstreams',
   shared_coordination_pressure: 'Workers need shared coordination',
   orchestration_needed_no_capacity: 'Needs workers, but none are available',
-  provider_timeout_preserve_current: 'Jev timed out · mode kept',
-  provider_unavailable_preserve_current: 'Jev unavailable · mode kept',
-  response_rejected_preserve_current: 'Jev answer rejected · mode kept',
-  capacity_changed_during_evaluation_preserve_current: 'Capacity kept changing · mode kept',
+  incoherent_plan_vs_sufficiency: 'Jev chose Single while saying delegation helps (incoherent)',
+  provider_timeout: 'Jev timed out',
+  provider_unavailable: 'Jev unavailable',
+  response_rejected: 'Jev answer rejected',
+  // The same failures as recorded before #214.
+  provider_timeout_preserve_current: 'Jev timed out',
+  provider_unavailable_preserve_current: 'Jev unavailable',
+  response_rejected_preserve_current: 'Jev answer rejected',
+  // Recorded before #211, when a changing capacity discarded the answer.
+  capacity_changed_during_evaluation_preserve_current: 'Capacity kept changing',
   capacity_changed_during_initial_routing: 'Capacity changed during the call',
 };
 export function reasonLabel(reason: string): string { return REASONS[reason] ?? reason.replaceAll('_', ' '); }
 
 const ERRORS: Record<string, string> = {
   plan_not_offered: 'Jev chose a plan that was not offered',
+  // Rejected before #209; such answers are now accepted as incoherent (uncertain). Kept for calls recorded earlier.
   plan_contradicts_sufficiency: 'Jev chose Single while saying the brain alone is not enough',
   model_missing: 'The answer did not name the resolved model',
   missing_usage: 'The answer did not report token usage',
@@ -71,30 +88,48 @@ export function errorLabel(error: string | null | undefined): string {
 }
 
 /** Whether Jev's response arrived and was read: it was then rejected, not missing. */
-export function answerRejected(call: Pick<JevCallSummary, 'status' | 'model' | 'inputTokens' | 'reason'>): boolean {
-  return call.status === 'unavailable' && (call.reason === 'response_rejected_preserve_current' || call.model !== null || call.inputTokens !== null);
+export function answerRejected(call: Pick<JevCallSummary, 'status' | 'model' | 'inputTokens' | 'reason' | 'confidence'>): boolean {
+  return jevAnswerState({ ...call, providerStatus: call.status }) === 'rejected';
+}
+
+/** Why a valid answer is only uncertain advice (#209), or null when it is confident. */
+export function uncertaintyLabel(call: Pick<JevCallSummary, 'status' | 'model' | 'inputTokens' | 'reason' | 'confidence' | 'incoherent'>): string | null {
+  const state = jevAnswerState({ ...call, providerStatus: call.status });
+  if (state === 'incoherent') return `uncertain · incoherent: ${incoherenceLabel(call.incoherent!)}`;
+  return state === 'uncertain' ? 'uncertain' : null;
 }
 
 /** Jev's answer in one line. */
-export function answerLabel(call: Pick<JevCallSummary, 'status' | 'targetTopology' | 'targetWorkers' | 'confidence' | 'error' | 'model' | 'inputTokens' | 'reason'>): string {
+export function answerLabel(call: Pick<JevCallSummary, 'status' | 'targetTopology' | 'targetWorkers' | 'confidence' | 'error' | 'model' | 'inputTokens' | 'reason' | 'incoherent'>): string {
   if (call.status === 'unavailable') return `${answerRejected(call) ? 'Answer rejected' : 'No answer'} · ${errorLabel(call.error)}`;
-  return `${topologyLabel(call.targetTopology)}${call.targetWorkers ? ` · ${workersLabel(call.targetWorkers)}` : ''} · ${percent(call.confidence)}`;
+  const uncertain = uncertaintyLabel(call);
+  return `${topologyLabel(call.targetTopology)}${call.targetWorkers ? ` · ${workersLabel(call.targetWorkers)}` : ''} · ${percent(call.confidence)}${uncertain ? ` · ${uncertain}` : ''}`;
 }
 
-/** What Hivemind did with the answer. */
-export function outcomeLabel(call: Pick<JevCallSummary, 'outcome' | 'status' | 'targetTopology'>): { text: string; tone: 'applied' | 'kept' | 'warning' | 'idle' } {
+type OutcomeCall = Pick<JevCallSummary, 'outcome' | 'status' | 'targetTopology' | 'targetWorkers' | 'confidence' | 'reason'
+  | 'phase' | 'model' | 'inputTokens' | 'incoherent' | 'error'>;
+/**
+ * What happened with the answer (#211): advice is returned to the brain and never applied. Calls recorded before
+ * #211 keep the enforced outcome they had then.
+ */
+export function outcomeLabel(call: OutcomeCall): { text: string; tone: 'applied' | 'kept' | 'warning' | 'idle' } {
   const outcome = call.outcome;
-  if (!outcome) return call.status === 'unavailable'
-    ? { text: 'Current mode kept', tone: 'warning' }
-    : { text: 'Not used · routing state changed during the call', tone: 'idle' };
-  if (outcome.kind === 'observation') return { text: 'Recorded only · not enforced', tone: 'idle' };
-  if (outcome.kind === 'transition' || outcome.applied)
-    return { text: `Applied → ${topologyLabel(outcome.appliedTopology)}${outcome.appliedWorkers ? ` · ${workersLabel(outcome.appliedWorkers)}` : ''}`, tone: 'applied' };
-  if (outcome.kind === 'warning') return { text: `⚠ ${outcome.warning ?? 'Warning'}`, tone: 'warning' };
-  if (outcome.kind === 'lock') return { text: `Your lock kept ${topologyLabel(outcome.appliedTopology)}`, tone: 'kept' };
-  return outcome.appliedTopology === call.targetTopology
-    ? { text: `Mode confirmed · ${topologyLabel(outcome.appliedTopology)}`, tone: 'kept' }
-    : { text: `Kept ${topologyLabel(outcome.appliedTopology)} · waiting for confirmation`, tone: 'kept' };
+  if (outcome) {
+    if (outcome.kind === 'observation') return { text: 'Recorded only · not enforced', tone: 'idle' };
+    if (outcome.kind === 'transition' || outcome.applied)
+      return { text: `Before #211: applied ${topologyLabel(outcome.appliedTopology)}${outcome.appliedWorkers ? ` · ${workersLabel(outcome.appliedWorkers)}` : ''}`, tone: 'kept' };
+    return { text: `Before #211: kept ${topologyLabel(outcome.appliedTopology)}`, tone: 'kept' };
+  }
+  if (call.phase === 'observation') return { text: 'Recorded only · no single owning brain', tone: 'idle' };
+  const state = jevAnswerState({ ...call, providerStatus: call.status });
+  if (state === 'answered') return { text: 'Advice returned to the brain · not enforced', tone: 'applied' };
+  if (state === 'uncertain' || state === 'incoherent') return { text: 'Uncertain advice returned to the brain', tone: 'kept' };
+  return { text: 'No advice delivered to the brain', tone: 'warning' };
+}
+
+/** A call's advice in the #211 wording: `Jev suggested Multi-DM · 2 workers (72%)`, `Jev uncertain`, `Jev unavailable (timeout)`. */
+export function adviceLabel(call: OutcomeCall): string {
+  return jevAdviceLabel({ ...call, providerStatus: call.status });
 }
 
 const QUESTIONS: Record<string, string> = {
@@ -155,19 +190,20 @@ export function questionRows(sent: unknown, received: unknown): QuestionRow[] {
 export function contextRows(sent: unknown): Array<[string, string]> {
   const state = (sent as { state?: Record<string, unknown> } | null)?.state;
   if (!state) return [];
-  const current = state.current as { topology: AdaptiveTopology; workerBudget: number; desiredTopology: AdaptiveTopology | null } | null;
+  // `current` and `execution` only exist in calls recorded before #211, when a mode and locks were enforced.
+  const current = state.current as { topology: AdaptiveTopology; workerBudget: number; desiredTopology: AdaptiveTopology | null } | null | undefined;
   const capacity = state.capacity as { workers?: { free?: number; busyCurrent?: number; busyOther?: number; online?: number; total?: number } } | undefined;
   const tasks = state.tasks as { active?: number; blockers?: number; openDependencies?: number } | undefined;
   const execution = state.execution as { lockedTopology?: AdaptiveTopology | null; lockScope?: string; orchestratedOnly?: boolean } | undefined;
   const trigger = state.trigger as { summary?: string } | undefined;
   const w = capacity?.workers ?? {};
   const rows: Array<[string, string]> = [
-    ['Mode at the time', current ? `${topologyLabel(current.topology)}${current.workerBudget ? ` · ${workersLabel(current.workerBudget)}` : ''}${current.desiredTopology ? ` · pending → ${topologyLabel(current.desiredTopology)}` : ''}` : 'None yet (first call)'],
-    ['Workers', `${w.free ?? 0} free · ${w.busyCurrent ?? 0} on this request · ${w.busyOther ?? 0} busy elsewhere · ${w.online ?? 0}/${w.total ?? 0} online`],
+    ...(current !== undefined ? [['Mode at the time (before #211)', current ? `${topologyLabel(current.topology)}${current.workerBudget ? ` · ${workersLabel(current.workerBudget)}` : ''}${current.desiredTopology ? ` · pending → ${topologyLabel(current.desiredTopology)}` : ''}` : 'None yet (first call)'] as [string, string]] : []),
+    ['Workers', `${w.free ?? 0} free · ${w.busyCurrent ?? 0} working for this brain · ${w.busyOther ?? 0} busy elsewhere · ${w.online ?? 0}/${w.total ?? 0} online`],
     ['Delegated work', `${tasks?.active ?? 0} active · ${tasks?.blockers ?? 0} blocked · ${tasks?.openDependencies ?? 0} open dependencies`],
   ];
-  if (execution?.lockedTopology) rows.push(['Your lock', `${topologyLabel(execution.lockedTopology)} · ${execution.lockScope}`]);
-  if (execution?.orchestratedOnly) rows.push(['Your choice', 'Orchestration required']);
+  if (execution?.lockedTopology) rows.push(['Your lock (before #211)', `${topologyLabel(execution.lockedTopology)} · ${execution.lockScope}`]);
+  if (execution?.orchestratedOnly) rows.push(['Your choice (before #211)', 'Orchestration required']);
   if (trigger?.summary) rows.push(['Triggering message', trigger.summary]);
   return rows;
 }
@@ -196,4 +232,27 @@ export function appendOlderPage(current: JevCallLogView | null, older: JevCallLo
   const seen = new Set(current.requests.map(group => group.executionId));
   return { requests: [...current.requests, ...older.requests.filter(group => !seen.has(group.executionId))],
     hasMore: older.hasMore, nextCursor: older.nextCursor };
+}
+
+/**
+ * Merges one realtime call (new or settled) into the loaded log without refetching it: the call joins or replaces its
+ * entry in its request group, and the group moves to its page-order position.
+ */
+export function mergeLiveCall(view: JevCallLogView, call: JevCallSummary): JevCallLogView {
+  const group = view.requests.find(item => item.executionId === call.executionId);
+  let merged: JevRequestGroup;
+  if (!group) {
+    merged = { executionId: call.executionId, channelId: call.channelId, brainId: call.brainId, request: call.request,
+      firstAt: call.createdAt, lastAt: call.createdAt, callCount: 1, calls: [call] };
+  } else {
+    const known = group.calls.some(item => item.id === call.id);
+    const calls = known ? group.calls.map(item => item.id === call.id ? call : item)
+      : [...group.calls, call].sort((a, b) => a.createdAt - b.createdAt);
+    merged = { ...group, request: group.request || call.request, firstAt: Math.min(group.firstAt, call.createdAt),
+      lastAt: Math.max(group.lastAt, call.createdAt), callCount: group.callCount + (known ? 0 : 1), calls };
+  }
+  const rest = view.requests.filter(item => item !== group);
+  const at = rest.findIndex(item => isOlderGroup(item, merged));
+  const requests = at === -1 ? [...rest, merged] : [...rest.slice(0, at), merged, ...rest.slice(at)];
+  return { ...view, requests };
 }

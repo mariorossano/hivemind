@@ -95,9 +95,9 @@ for (const roomFirst of [true, false]) {
     const room = f.load('refreshArchivedChannels');
     f.hive.readFence.current.reset();
     const reconnect = f.load('refreshSnap');
-    assert.equal(room.signal?.aborted, true);
     if (roomFirst) await room.finish(snapshot(['room']));
     await reconnect.finish(snapshot([]));
+    assert.equal(room.signal?.aborted, true);
     if (!roomFirst) await room.finish(snapshot(['room']));
     assert.deepEqual(f.hive.snap?.archivedChannelIds, []);
   });
@@ -146,3 +146,47 @@ for (const ids of [[], undefined]) {
     assert.equal(f.hive.snap?.archivedChannelIds, ids);
   });
 }
+
+test('a failed full refresh does not abort a pending room refresh', async t => {
+  const f = await fixture(t);
+  await f.load('refreshSnap').finish(snapshot([]));
+  const room = f.load('refreshArchivedChannels');
+  await f.load('refreshSnap').fail(new Error('Fixture offline'));
+  assert.equal(room.signal?.aborted, false);
+  await room.finish(snapshot(['room']));
+  assert.deepEqual(f.hive.snap?.archivedChannelIds, ['room']);
+});
+
+test('an accepted full refresh aborts and supersedes an older pending room refresh', async t => {
+  const f = await fixture(t);
+  await f.load('refreshSnap').finish(snapshot([]));
+  const room = f.load('refreshArchivedChannels');
+  const full = f.load('refreshSnap');
+  assert.equal(room.signal?.aborted, false);
+  await full.finish(snapshot(['current']));
+  assert.equal(room.signal?.aborted, true);
+  await room.finish(snapshot(['stale']));
+  assert.deepEqual(f.hive.snap?.archivedChannelIds, ['current']);
+});
+
+test('a room event patches archive metadata locally and supersedes older in-flight snapshot and room reads', async t => {
+  const f = await fixture(t);
+  const initial = f.load('refreshSnap');
+  let applied = false;
+  await act(async () => { applied = f.hive.setArchivedChannel('early', true); });
+  assert.equal(applied, false, 'before the first snapshot the caller falls back to a refetch');
+  await initial.finish(snapshot(['old']));
+  const staleFull = f.load('refreshSnap');
+  const staleRoom = f.load('refreshArchivedChannels');
+  await act(async () => { applied = f.hive.setArchivedChannel('room', true); });
+  assert.equal(applied, true);
+  assert.deepEqual(f.hive.snap?.archivedChannelIds, ['old', 'room']);
+  assert.equal(staleRoom.signal?.aborted, true);
+  await staleRoom.finish(snapshot(['old']));
+  await staleFull.finish(snapshot(['old']));
+  assert.deepEqual(f.hive.snap?.archivedChannelIds, ['old', 'room'], 'responses requested before the event cannot undo it');
+  await act(async () => { f.hive.setArchivedChannel('old', false); f.hive.setArchivedChannel('room', true); });
+  assert.deepEqual(f.hive.snap?.archivedChannelIds, ['room'], 'reopen removes; a repeated archive is idempotent');
+  await f.load('refreshSnap').finish(snapshot(['later']));
+  assert.deepEqual(f.hive.snap?.archivedChannelIds, ['later'], 'a snapshot requested after the event wins');
+});

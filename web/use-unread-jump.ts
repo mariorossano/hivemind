@@ -88,5 +88,5 @@ export function useUnreadJump({ selection, channel, thread, go, clearSearch, ref
     return () => { release(); window.clearTimeout(timer); element.classList.remove('unread-target'); };
   }, [ready, selected, threadId]);
 
-  return openUnread;
+  return { openUnread, target };
 }

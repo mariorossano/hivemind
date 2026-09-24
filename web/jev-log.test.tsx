@@ -4,8 +4,10 @@ import { Window } from 'happy-dom';
 import { act } from 'react';
 import { JevLog } from './JevLog.tsx';
 import { api } from './api.ts';
-import { answerLabel, appendOlderPage, errorLabel, mergeRefreshedPage, outcomeLabel, questionRows, requestedModel, triggerLabel } from './jev-log-view.ts';
+import { answerLabel, appendOlderPage, errorLabel, mergeRefreshedPage, modelLabel, outcomeLabel, questionRows, reasonLabel, requestedModel, triggerLabel } from './jev-log-view.ts';
+import { routingEventLabel } from './AdaptiveRoutingPanel.tsx';
 import type { JevCall, JevCallSummary, JevRequestGroup } from '../src/shared/jev-calls.ts';
+import type { AdaptiveRoutingEvent } from '../src/shared/adaptive-topology.ts';
 
 const window = new Window({ url: 'http://localhost/' });
 Object.assign(globalThis, { window, document: window.document, location: window.location,
@@ -18,8 +20,7 @@ function summary(id: string, patch: Partial<JevCallSummary> = {}): JevCallSummar
   return { id, routeId: `route-${id}`, projectId: 'p', channelId: 'dm', executionId: 'exec-1', brainId: 'brain-1', createdAt: 1_000,
     phase: 'initial', trigger: { kind: 'human_request', eventType: null }, request: 'Refactor the parser.', status: 'ok',
     targetTopology: 'brain_one_worker', targetWorkers: 1, confidence: 0.93, reason: 'one_worker_sufficient', error: null,
-    model: 'jev-latest', latencyMs: 420, inputTokens: 900, outputTokens: 40,
-    outcome: { kind: 'transition', applied: true, appliedTopology: 'brain_one_worker', appliedWorkers: 1, warning: null }, ...patch };
+    model: 'jev-latest', latencyMs: 420, inputTokens: 900, outputTokens: 40, outcome: null, ...patch };
 }
 const sent = { model: 'jev-latest', state: { request: 'Refactor the parser.', current: null,
   capacity: { workers: { free: 2, busyCurrent: 0, busyOther: 1, online: 3, total: 3 } }, tasks: { active: 0, blockers: 0, openDependencies: 0 },
@@ -38,10 +39,26 @@ test('labels explain triggers, answers and outcomes in plain words', () => {
   const noAnswer = { status: 'unavailable' as const, model: null, inputTokens: null, outputTokens: null, reason: 'provider_timeout_preserve_current' };
   assert.equal(answerLabel(summary('b', { ...noAnswer, error: 'timeout' })), 'No answer · Jev did not answer in time');
   assert.equal(answerLabel(summary('b', { ...noAnswer, error: 'Invalid Jev response' })), 'No answer · Invalid Jev response', 'Calls logged before #207 keep their text');
-  assert.equal(answerLabel(summary('b', { status: 'unavailable', error: 'plan_not_offered', reason: 'response_rejected_preserve_current' })),
+  assert.equal(answerLabel(summary('b', { status: 'unavailable', error: 'plan_not_offered', reason: 'response_rejected' })),
     'Answer rejected · Jev chose a plan that was not offered');
-  assert.equal(outcomeLabel(summary('a')).tone, 'applied');
-  assert.match(outcomeLabel(summary('c', { outcome: null })).text, /Not used/);
+  assert.equal(answerLabel(summary('b', { status: 'unavailable', error: 'plan_not_offered', reason: 'response_rejected_preserve_current' })),
+    'Answer rejected · Jev chose a plan that was not offered', 'Calls logged before #214 keep their old reason name');
+  // #214 renamed the failure reasons; rows recorded earlier read the same.
+  for (const [current, legacy, label] of [['provider_timeout', 'provider_timeout_preserve_current', 'Jev timed out'],
+    ['provider_unavailable', 'provider_unavailable_preserve_current', 'Jev unavailable'],
+    ['response_rejected', 'response_rejected_preserve_current', 'Jev answer rejected']]) {
+    assert.equal(reasonLabel(current!), label); assert.equal(reasonLabel(legacy!), label);
+  }
+  assert.equal(triggerLabel({ kind: 'wait', eventType: null }, 'continuous'), 'Brain received mail');
+  assert.equal(triggerLabel({ kind: 'thread_status', eventType: 'done' }, 'continuous'), 'Brain set a thread status · done');
+  assert.deepEqual(outcomeLabel(summary('a')), { text: 'Advice returned to the brain · not enforced', tone: 'applied' });
+  assert.equal(outcomeLabel(summary('low', { confidence: 0.2 })).text, 'Uncertain advice returned to the brain');
+  assert.equal(outcomeLabel(summary('b', { status: 'unavailable', confidence: null, model: null, inputTokens: null, error: 'timeout',
+    reason: 'provider_timeout_preserve_current' })).text, 'No advice delivered to the brain');
+  assert.match(outcomeLabel(summary('o', { phase: 'observation' })).text, /Recorded only · no single owning brain/);
+  // Calls recorded before #211 keep what was enforced then.
+  assert.equal(outcomeLabel(summary('c', { outcome: { kind: 'transition', applied: true, appliedTopology: 'brain_one_worker', appliedWorkers: 1, warning: null } })).text,
+    'Before #211: applied Brain + 1 · 1 worker');
   assert.match(outcomeLabel(summary('d', { outcome: { kind: 'observation', applied: false, appliedTopology: 'single', appliedWorkers: 0, warning: null } })).text, /not enforced/);
   const rows = questionRows(sent, received);
   assert.deepEqual(rows.map(row => row.answer), ['No, delegation helps', 'High (1.60 / 2)', 'Brain + 1']);
@@ -96,12 +113,64 @@ test('a rejected call shows its specific reason with the resolved model and toke
   assert.match(text(), /Answer rejected · Jev chose a plan that was not offered/);
   assert.doesNotMatch(text(), /Invalid Jev response/);
   await act(async () => (host.querySelector('button.jev-call') as HTMLElement).click());
-  assert.match(text(), /Jev answered, but Hivemind rejected the answer: Jev chose a plan that was not offered\./);
+  assert.match(text(), /Jev answered, but Hivemind rejected the answer: Jev chose a plan that was not offered\. The brain was told Jev had no advice\./);
   assert.match(text(), /Why it was rejectedJev chose a plan that was not offered \(plan_not_offered\)/);
-  assert.match(text(), /Jev answer rejected · mode kept/);
+  assert.match(text(), /ReasonJev answer rejected/);
+  assert.doesNotMatch(text(), /mode kept/);
   assert.match(text(), /jev-1\.13\.0/);
   assert.match(text(), /2851 in \/ 248 out/);
   assert.match(text(), /Plan for the next phase/);
+});
+
+test('uncertain and incoherent answers are labelled as such, and the default alias resolving is information only (#209)', async t => {
+  assert.equal(answerLabel(summary('low', { confidence: 0.17 })), 'Brain + 1 · 1 worker · 17% · uncertain');
+  const incoherent = summary('incoherent', { targetTopology: 'single', targetWorkers: 0, confidence: 0.39, incoherent: 'plan_vs_sufficiency',
+    reason: 'incoherent_plan_vs_sufficiency', model: 'jev-1.13.0', requestedModel: 'jev-latest' });
+  assert.equal(answerLabel(incoherent), 'Single · 39% · uncertain · incoherent: plan contradicts sufficiency');
+  assert.deepEqual(modelLabel({ ...incoherent, sent: null, received: null }), { text: 'jev-latest → jev-1.13.0', mismatch: false });
+  assert.deepEqual(modelLabel({ ...incoherent, requestedModel: 'jev-2026-09-01', sent: null, received: null }),
+    { text: 'jev-2026-09-01 → jev-1.13.0', mismatch: true });
+
+  const host = document.createElement('div'); document.body.append(host); const root = createRoot(host);
+  t.after(async () => { await act(async () => root.unmount()); host.remove(); });
+  let detail: JevCall = { ...incoherent, sent, received };
+  t.mock.method(api, 'jevCalls', async () => ({ hasMore: false, nextCursor: null, requests: [{ executionId: 'exec-1', channelId: 'dm', brainId: 'brain-1',
+    request: 'Una volta terminati questi passaggi quale è il piano?', firstAt: 1_000, lastAt: 1_000, callCount: 1, calls: [incoherent] }] }));
+  t.mock.method(api, 'jevCall', async () => ({ call: detail }));
+  const render = async () => {
+    await act(async () => root.render(<JevLog project="chapter" tick={0} channelLabel={() => 'dm'} agentName={() => 'Atlas'} onOpenChannel={() => {}} />));
+    await act(async () => (host.querySelector('button.jev-call') as HTMLElement).click());
+  };
+  await render();
+  const text = () => host.textContent ?? '';
+  assert.doesNotMatch(text(), /Jev unavailable|Answer rejected|differs/);
+  assert.match(text(), /Jev uncertain \(incoherent: plan contradicts sufficiency\)/);
+  assert.match(text(), /Uncertain advice returned to the brain/);
+  assert.match(text(), /Jev's answers contradict each other \(plan contradicts sufficiency\)\. The brain received it as uncertain advice\./);
+  assert.match(text(), /uncertain · incoherent: plan contradicts sufficiency: below 60% or not coherent/);
+  assert.match(text(), /jev-latest → jev-1\.13\.0/);
+  assert.match(text(), /ReasonJev chose Single while saying delegation helps \(incoherent\)/);
+  // A pinned identifier that resolves to something else is still flagged.
+  await act(async () => root.unmount());
+  const pinnedRoot = createRoot(host);
+  t.after(async () => { await act(async () => pinnedRoot.unmount()); });
+  detail = { ...detail, requestedModel: 'jev-2026-09-01' };
+  await act(async () => pinnedRoot.render(<JevLog project="chapter" tick={1} channelLabel={() => 'dm'} agentName={() => 'Atlas'} onOpenChannel={() => {}} />));
+  await act(async () => (host.querySelector('button.jev-call') as HTMLElement).click());
+  assert.match(text(), /jev-2026-09-01 → jev-1\.13\.0 \(differs from the pinned model\)/);
+});
+
+test('routing events say what Jev suggested, or whether it was unavailable, rejected, uncertain or incoherent (#211)', () => {
+  const base: AdaptiveRoutingEvent = { id: 'e', executionId: 'x', channelId: 'dm', projectId: 'p', createdAt: 1, kind: 'advice',
+    trigger: 'task_event', targetTopology: 'single', targetWorkers: 0, confidence: 0.39, reason: 'single_sufficient', providerStatus: 'ok' };
+  assert.equal(routingEventLabel(base), 'Brain task update · Jev uncertain (39%) · Single');
+  assert.equal(routingEventLabel({ ...base, confidence: 0.99, incoherent: 'plan_vs_sufficiency', reason: 'incoherent_plan_vs_sufficiency' }),
+    'Brain task update · Jev uncertain (incoherent: plan contradicts sufficiency)');
+  assert.equal(routingEventLabel({ ...base, confidence: 0.95 }), 'Brain task update · Jev suggested Single (95%)');
+  assert.equal(routingEventLabel({ ...base, trigger: 'human_request', providerStatus: 'unavailable', confidence: null, error: 'timeout',
+    reason: 'provider_timeout_preserve_current' }), 'Your new request · Jev unavailable (timeout)');
+  assert.equal(routingEventLabel({ ...base, providerStatus: 'unavailable', confidence: null, error: 'plan_not_offered',
+    reason: 'response_rejected_preserve_current' }), 'Brain task update · Jev answer rejected (plan_not_offered)');
 });
 
 test('requested model comes from the summary, or from the exact sent payload for calls recorded before pinning', () => {
@@ -115,8 +184,8 @@ test('requested model comes from the summary, or from the exact sent payload for
 test('the Routing log groups calls by request and shows the exact exchange of the selected call', async t => {
   const host = document.createElement('div'); document.body.append(host); const root = createRoot(host);
   t.after(async () => { await act(async () => root.unmount()); host.remove(); });
-  const calls = [summary('first'), summary('second', { phase: 'continuous', trigger: { kind: 'brain_message', eventType: 'progress' }, createdAt: 2_000,
-    outcome: { kind: 'evaluation', applied: false, appliedTopology: 'brain_one_worker', appliedWorkers: 1, warning: null } })];
+  const calls = [summary('first', { outcome: { kind: 'evaluation', applied: false, appliedTopology: 'brain_one_worker', appliedWorkers: 1, warning: null } }),
+    summary('second', { phase: 'continuous', trigger: { kind: 'brain_message', eventType: 'progress' }, createdAt: 2_000 })];
   t.mock.method(api, 'jevCalls', async () => ({ hasMore: false, nextCursor: null, requests: [{ executionId: 'exec-1', channelId: 'dm', brainId: 'brain-1',
     request: 'Refactor the parser.', firstAt: 1_000, lastAt: 2_000, callCount: 2, calls }] }));
   const detail: JevCall = { ...calls[0]!, sent, received };
@@ -131,12 +200,14 @@ test('the Routing log groups calls by request and shows the exact exchange of th
   assert.match(text(), /Refactor the parser\./);
   assert.match(text(), /Your new request/);
   assert.match(text(), /Brain message · progress/);
-  assert.match(text(), /Applied → Brain \+ 1/);
-  assert.match(text(), /Mode confirmed · Brain \+ 1/);
+  assert.match(text(), /Jev suggested Brain \+ 1 \(93%\)/, 'the request badge shows the latest advice');
+  assert.match(text(), /Advice returned to the brain · not enforced/);
+  assert.match(text(), /Before #211: kept Brain \+ 1/, 'a legacy call keeps its enforced outcome');
+  assert.doesNotMatch(text(), /Applied →|Mode confirmed/);
   const call = Array.from(host.querySelectorAll('button.jev-call'))[0] as HTMLElement;
   await act(async () => call.click());
   assert.match(text(), /1 · Sent to Jev/);
-  assert.match(text(), /2 free · 0 on this request · 1 busy elsewhere/);
+  assert.match(text(), /2 free · 0 working for this brain · 1 busy elsewhere/);
   assert.match(text(), /Can the brain handle it alone\?/);
   assert.match(text(), /No, delegation helps/);
   assert.match(text(), /One worker is enough/);

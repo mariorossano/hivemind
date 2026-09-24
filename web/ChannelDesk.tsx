@@ -1,24 +1,45 @@
-import type { MutableRefObject } from "react";
+import { useCallback, useLayoutEffect, useMemo, useRef, useState, type MutableRefObject } from "react";
 import type { AdaptiveRoutingView } from "../src/shared/adaptive-topology.ts";
-import type { Agent, Channel } from "../src/shared/types.ts";
-import { routingEventLabel, topologyLabel } from "./AdaptiveRoutingPanel.tsx";
-import { routingStreamEntries } from "./adaptive-routing-view.ts";
-import { api } from "./api.ts";
+import type { DecisionView } from "../src/shared/decisions.ts";
+import type { ChannelTaskPage } from "../src/shared/tasks.ts";
+import type { Agent, Channel, Message, ThreadStatus } from "../src/shared/types.ts";
+import { adviceSummary } from "./AdaptiveRoutingPanel.tsx";
+import { adviceStrip } from "./adaptive-routing-view.ts";
+import { api, type UnreadTarget } from "./api.ts";
+import { Avatar } from "./Avatar.tsx";
 import { applyChannelMessage, recordChannelMessage } from "./channel-state.ts";
 import { Composer } from "./Composer.tsx";
+import { DecisionCard } from "./DecisionQueue.tsx";
 import { channelTitle, memberNames } from "./labels.ts";
-import { Msg } from "./Msg.tsx";
+import { BackButton } from "./MobileNav.tsx";
+import { MessageRow } from "./MessageRow.tsx";
+import { streamRows } from "./message-stream.ts";
+import { StreamDivider } from "./StreamCards.tsx";
 import { holdLivePane, isReadingHistory } from "./pane-window.ts";
+import { Popover } from "./Popover.tsx";
+import { RelativeTime } from "./RelativeTime.tsx";
 import { RoomPanel } from './RoomPanel.tsx';
 import type { Sel } from "./selection.ts";
+import { isOpenTask } from "./task-progress.ts";
+import { TaskChip } from "./TaskCard.tsx";
 import type { ChannelPane } from "./use-channel-pane.ts";
+import { useChannelWork } from "./use-channel-work.ts";
 import type { useSend } from "./use-send.ts";
 import type { ThreadOpenAnchor } from "./use-thread-scroll-anchor.ts";
 
-/** The selected channel: header, room panel, message stream with inline routing events, routing strip and composer. */
-export function ChannelDesk({ channelId, activeChannel, agents, roomAgents, channel, threadPaneId, stickBottom, threadOpenAnchor,
-  go, roomTick, routingView, activeBrainChannel, activeExecutions, finishingExecutions, brainNames, onOpenRouting, onInvite, compose, setErr }: {
+const NO_MESSAGES: Message[] = [];
+
+export type ChannelTab = "messages" | "tasks" | "contract" | "decisions";
+
+/**
+ * The selected channel: header with its members, tabs (Messages · Tasks · Contract for rooms · Decisions) and, on
+ * Messages, the message stream, Jev advice strip and composer.
+ */
+export function ChannelDesk({ channelId, activeChannel, agents, roomAgents, channel, threadPaneId, stickBottom, threadOpenAnchor, unreadTarget,
+  go, roomTick, decisionTick, onDecisionAnswered, routingView, activeBrainChannel, brainNames, onOpenRouting, onInvite, compose, onMarkUnread, setErr, onBack }: {
   channelId: string;
+  /** A new explicit badge navigation reveals Messages without remounting its draft. */
+  unreadTarget?: UnreadTarget | null;
   activeChannel: Channel | undefined;
   agents: Agent[];
   roomAgents: Agent[];
@@ -28,48 +49,119 @@ export function ChannelDesk({ channelId, activeChannel, agents, roomAgents, chan
   threadOpenAnchor: MutableRefObject<ThreadOpenAnchor | null>;
   go: (next: Sel) => void;
   roomTick: number;
+  decisionTick: number;
+  onDecisionAnswered: () => void;
   routingView: AdaptiveRoutingView | null;
   activeBrainChannel: boolean;
-  activeExecutions: number;
-  /** Superseded executions still draining in this channel. */
-  finishingExecutions: number;
   brainNames: Record<string, string>;
   onOpenRouting: () => void;
   onInvite: () => void;
   compose: ReturnType<typeof useSend>;
+  /** Marks root messages from `seq` on unread for the Human and refreshes the read state. */
+  onMarkUnread: (channelId: string, seq: number) => Promise<void>;
   setErr: (error: string) => void;
+  /** Phones only: leaves the full-screen channel for the list it was opened from. */
+  onBack: () => void;
 }) {
   const { pane, setPane, channelStream, channelJournal, loadChannel } = channel;
+  const loaded = pane?.channel.id === channelId;
+  const statuses = useMemo(() => new Map<string, ThreadStatus | null>((pane?.threads ?? []).map((t) => [t.id, t.status])), [pane?.threads]);
+  const firstUnreadSeq = loaded ? pane.firstUnreadSeq ?? null : null;
+  const messages = loaded ? pane.messages : NO_MESSAGES;
+  const rows = useMemo(() => streamRows(messages, { firstUnreadSeq }), [messages, firstUnreadSeq]);
+  const agentNames = useMemo(() => Object.fromEntries(agents.map((agent) => [agent.id, agent.name])), [agents]);
+  const markUnreadRef = useRef(onMarkUnread);
+  markUnreadRef.current = onMarkUnread;
+  // Stable across renders so memoized rows keep their props: the divider moves here at once, the server follows.
+  const markUnread = useCallback((m: Message) => {
+    setPane((current) => current?.channel.id === m.channelId ? { ...current, firstUnreadSeq: m.seq } : current);
+    markUnreadRef.current(m.channelId, m.seq).catch((error) => setErr(String(error)));
+  }, [setPane, setErr]);
+  const onThread = useCallback((m: Message, button: HTMLElement) => {
+    const stream = channelStream.current;
+    if (stream && threadPaneId !== m.id) {
+      threadOpenAnchor.current = {
+        channelId, threadId: m.id, button, bottom: button.getBoundingClientRect().bottom,
+        atBottom: stream.scrollHeight - stream.clientHeight - stream.scrollTop <= 48,
+      };
+    }
+    go({ kind: "channel", id: channelId, thread: m.id });
+  }, [channelStream, threadOpenAnchor, threadPaneId, channelId, go]);
+  const onReact = useCallback((m: Message, emoji: string) => {
+    api.react(m.seq, emoji, !m.reactions?.some(reaction => reaction.emoji === emoji && reaction.mine)).then((r) => {
+      recordChannelMessage(channelJournal.current, r.message, false);
+      setPane((p) => applyChannelMessage(p, r.message, false));
+    }).catch((error) => setErr(String(error)));
+  }, [channelJournal, setPane, setErr]);
+  const sendChannel = compose.sendChannel;
+  // A tab belongs to the channel it was picked in: another channel opens on Messages.
+  const [picked, setPicked] = useState<{ channelId: string; tab: ChannelTab; unreadTarget?: UnreadTarget | null }>({ channelId, tab: "messages" });
+  const room = Boolean(activeChannel && ["private", "public"].includes(activeChannel.type));
+  const newUnreadJump = unreadTarget?.channelId === channelId && unreadTarget !== picked.unreadTarget;
+  const requested = picked.channelId === channelId && !newUnreadJump ? picked.tab : "messages";
+  const tab = requested === "contract" && !room ? "messages" : requested;
+  const work = useChannelWork(activeChannel, roomTick, decisionTick);
+  // The hidden stream loses its scroll position; coming back to a live pane lands on its newest message.
+  useLayoutEffect(() => {
+    const stream = channelStream.current;
+    if (tab === "messages" && stream && pane?.historyThrough === undefined) stream.scrollTop = stream.scrollHeight;
+  }, [tab]);
+  const openTasks = work.tasks?.items.filter((task) => isOpenTask(task.state)).length ?? 0;
+  const awaiting = work.decisions?.filter((decision) => decision.state === "awaiting_input").length ?? 0;
+  const tabs: Array<{ id: ChannelTab; label: string; count?: number }> = [
+    { id: "messages", label: "Messages" },
+    { id: "tasks", label: "Tasks", count: openTasks },
+    ...(room ? [{ id: "contract" as const, label: "Contract" }] : []),
+    ...(activeChannel?.project ? [{ id: "decisions" as const, label: "Decisions", count: awaiting }] : []),
+  ];
   return (
     <>
-      <header className="desk-h">
+      <header className="desk-h channel-h">
+        <BackButton label="Back" onBack={onBack} />
         <div>
           <h1>{activeChannel ? channelTitle(activeChannel) : channelId}</h1>
           {activeChannel?.topic && <p>{activeChannel.topic}</p>}
-          {activeChannel && (
-            <p className="members">
-              {memberNames(activeChannel, agents)}
-            </p>
+        </div>
+        <div className="channel-h-tools">
+          {activeChannel && <MemberStack channel={activeChannel} agents={agents} />}
+          {room && (
+            <button type="button" className="text-btn" onClick={onInvite}>
+              Invite
+            </button>
           )}
         </div>
-        {(activeChannel?.type === "private" || activeChannel?.type === "public") && (
-          <button type="button" className="text-btn" onClick={onInvite}>
-            Invite
-          </button>
-        )}
       </header>
-      {pane?.historyThrough !== undefined && (
-        <button type="button" className="older" onClick={() => {
-          const id = channelId;
-          loadChannel(id, undefined, []).catch((error) => { if (error?.name !== "AbortError") setErr(String(error)); });
-        }}>
-          {pane.deferredLive ? "New messages — return to live" : "Return to live"}
-        </button>
-      )}
-      <div className="stream" ref={channelStream} onScroll={() => {
+      <div className="channel-tabs" role="tablist" aria-label="Channel views">
+        {tabs.map((item) => (
+          <button key={item.id} type="button" role="tab" id={`channel-tab-${item.id}`} aria-selected={tab === item.id}
+            aria-controls={tab === item.id ? `channel-panel-${item.id}` : undefined} onClick={() => setPicked({ channelId, tab: item.id, unreadTarget })}>
+            {item.label}
+            {item.count ? <span className="tab-count">{item.count}</span> : null}
+          </button>
+        ))}
+      </div>
+      {tab === "tasks" ? (
+        <div className="stream channel-panel" role="tabpanel" id="channel-panel-tasks" aria-labelledby="channel-tab-tasks">
+          <TaskList page={work.tasks} error={work.error} activeId={threadPaneId}
+            onOpen={(id) => go({ kind: "channel", id: channelId, thread: id })} />
+        </div>
+      ) : tab === "contract" && activeChannel ? (
+        <div className="stream channel-panel" role="tabpanel" id="channel-panel-contract" aria-labelledby="channel-tab-contract">
+          <RoomPanel key={activeChannel.id} channel={activeChannel} agents={agents} tick={roomTick} />
+        </div>
+      ) : tab === "decisions" ? (
+        <div className="stream channel-panel decision-queue" role="tabpanel" id="channel-panel-decisions" aria-labelledby="channel-tab-decisions">
+          <ChannelDecisions decisions={work.decisions} error={work.error}
+            onOpen={(decision) => go({ kind: "channel", id: channelId, thread: decision.id })}
+            onAnswered={(decision) => { work.answered(decision); onDecisionAnswered(); }} />
+        </div>
+      ) : null}
+      {/* Messages stays mounted while another tab shows, so the composer keeps its draft and the stream its place. */}
+      <div className="channel-messages" role="tabpanel" id="channel-panel-messages" aria-labelledby="channel-tab-messages"
+        hidden={tab !== "messages"}>
+      <div className="stream" role="log" aria-label="Messages" ref={channelStream} onScroll={() => {
         if (isReadingHistory(channelStream.current)) setPane((current) => current ? holdLivePane(current) : current);
       }}>
-        {activeChannel && ['private', 'public'].includes(activeChannel.type) && <RoomPanel key={activeChannel.id} channel={activeChannel} agents={agents} tick={roomTick} />}
         {pane?.hasOlder && (
           <button
             type="button"
@@ -87,98 +179,142 @@ export function ChannelDesk({ channelId, activeChannel, agents, roomAgents, chan
             Load older
           </button>
         )}
-        {routingStreamEntries(pane?.channel.id === channelId ? pane.messages : [],
-          routingView?.events ?? [], channelId).map(entry => entry.kind === "routing" ? (
-          <div key={entry.event.id} className="routing-inline" data-human-only="routing">
-            {routingEventLabel(entry.event)}
-          </div>
-        ) : ((m) => (
-          <Msg
-            key={m.id}
-            m={m}
-            replies={pane?.replyCounts[m.id] ?? 0}
-            status={pane?.threads.find((t) => t.id === m.id)?.status ?? null}
-            onThread={(button) => {
-              const stream = channelStream.current;
-              if (stream && threadPaneId !== m.id) {
-                threadOpenAnchor.current = {
-                  channelId, threadId: m.id, button, bottom: button.getBoundingClientRect().bottom,
-                  atBottom: stream.scrollHeight - stream.clientHeight - stream.scrollTop <= 48,
-                };
-              }
-              go({ kind: "channel", id: channelId, thread: m.id });
-            }}
-            onReact={(emoji) => api.react(m.seq, emoji, !m.reactions?.some(reaction => reaction.emoji === emoji && reaction.mine)).then((r) => {
-              recordChannelMessage(channelJournal.current, r.message, false);
-              setPane((p) => applyChannelMessage(p, r.message, false));
-            })}
+        {!loaded && <div className="loading" role="status">Loading messages…</div>}
+        {loaded && pane.messages.length === 0 && !pane.hasOlder && <div className="empty">No messages yet.</div>}
+        {rows.map((row) => row.type === "date" ? <StreamDivider key={row.key} label={row.label} />
+          : row.type === "new" ? <StreamDivider key={row.key} label="New messages" unread /> : (
+          <MessageRow
+            key={row.key}
+            m={row.message}
+            grouped={row.grouped}
+            replies={pane?.replyCounts[row.message.id] ?? 0}
+            status={statuses.get(row.message.id) ?? null}
+            taskRoute={row.message.taskEvent &&
+              `${agentNames[row.message.taskEvent.assignerId] ?? "Brain"} → ${agentNames[row.message.taskEvent.workerId] ?? "worker"}`}
+            onThread={onThread}
+            onReact={onReact}
+            onMarkUnread={markUnread}
           />
-        ))(entry.message))}
+        ))}
         <div />
       </div>
+      {pane?.channel.id === channelId && pane.historyThrough !== undefined && (
+        <div className="jump-dock">
+          <button type="button" className="jump-pill" onClick={() => {
+            loadChannel(channelId, undefined, []).catch((error) => { if (error?.name !== "AbortError") setErr(String(error)); });
+          }}>
+            {pane.deferredLive ? "New messages — jump to recent" : "Jump to recent"}
+          </button>
+        </div>
+      )}
       {activeBrainChannel && routingView && (
-        <RoutingStrip view={routingView} channelId={activeChannel?.id} activeExecutions={activeExecutions}
-          finishingExecutions={finishingExecutions} brainNames={brainNames} onOpen={onOpenRouting} />
+        <RoutingStrip view={routingView} channelId={activeChannel?.id} brainNames={brainNames} onOpen={onOpenRouting} />
       )}
       <Composer
         agents={roomAgents}
-        value={compose.draft}
-        onChange={compose.setDraft}
         placeholder={
           activeChannel
             ? `Message ${channelTitle(activeChannel)}`
             : "Write…"
         }
-        routing={activeBrainChannel ? {
-          value: compose.routingMode,
-          onChange: compose.setRoutingMode,
-          lockScope: compose.routingLockScope,
-          onLockScopeChange: compose.setRoutingLockScope,
-        } : undefined}
-        onSend={compose.sendChannel}
+        onSend={sendChannel}
       />
+      </div>
     </>
   );
 }
 
+/** The first few member avatars and the count; the popover lists everyone with role and presence. */
+export function MemberStack({ channel, agents }: { channel: Channel; agents: Agent[] }) {
+  const members = channel.memberIds.flatMap((id) => agents.filter((agent) => agent.id === id));
+  const label = `${members.length} ${members.length === 1 ? "member" : "members"}: ${memberNames(channel, agents)}`;
+  return (
+    <Popover className="member-stack" label={label} summary={<>
+      <span className="member-avatars" aria-hidden="true">
+        {members.slice(0, 4).map((agent) => <Avatar key={agent.id} name={agent.name} role={agent.role} online={agent.online} small />)}
+      </span>
+      <span className="member-count">{members.length}</span>
+    </>}>
+      <ul className="member-list" aria-label="Members">
+        {members.map((agent) => (
+          <li key={agent.id}>
+            <Avatar name={agent.name} role={agent.role} online={agent.online} small />
+            <span>{agent.name}</span>
+            <small>{agent.role}{agent.online ? " · online" : ""}</small>
+          </li>
+        ))}
+        {members.length === 0 && <li>No members</li>}
+      </ul>
+    </Popover>
+  );
+}
+
+/** The Tasks tab: every structured task of the channel, most recent activity first; a row opens its thread. */
+export function TaskList({ page, error, activeId, onOpen, now }: {
+  page: ChannelTaskPage | null;
+  error: string | null;
+  activeId: string | null | undefined;
+  onOpen: (taskId: string) => void;
+  now?: number;
+}) {
+  if (!page) return error ? <p role="alert">{error}</p> : <p className="empty">Loading tasks…</p>;
+  if (page.items.length === 0) return <p className="empty">No structured tasks in this channel yet.</p>;
+  return (
+    <>
+      <ul className="task-list">
+        {page.items.map((task) => (
+          <li key={task.id}>
+            <button type="button" aria-current={activeId === task.id ? "true" : undefined} onClick={() => onOpen(task.id)}>
+              <TaskChip state={task.state} />
+              <strong>{task.objective}</strong>
+              <small>{task.assignerName} → {task.workerName} · updated <RelativeTime at={task.updatedAt} now={now} /></small>
+            </button>
+          </li>
+        ))}
+      </ul>
+      {page.hasMore && <p className="empty">Showing the 100 most recently updated tasks.</p>}
+    </>
+  );
+}
+
+/** The Decisions tab: this channel's Human decision requests, answerable in place. */
+function ChannelDecisions({ decisions, error, onOpen, onAnswered }: {
+  decisions: DecisionView[] | null;
+  error: string | null;
+  onOpen: (decision: DecisionView) => void;
+  onAnswered: (decision: DecisionView) => void;
+}) {
+  if (!decisions) return error ? <p role="alert">{error}</p> : <p className="empty">Loading decisions…</p>;
+  if (decisions.length === 0) return <p className="empty">No decision requests in this channel.</p>;
+  return <>{decisions.map((decision) => (
+    <DecisionCard key={decision.id} decision={decision} onOpen={() => onOpen(decision)} onAnswered={onAnswered} />
+  ))}</>;
+}
+
+
 /**
- * The compact routing summary above the composer: the primary execution, how many brains run here and how many
- * older requests are still finishing. It also shows when only draining executions remain (no current one).
+ * Informational strip above the composer (#211): Jev's latest advice for the primary request in this channel, e.g.
+ * "Jev suggests: Multi-DM · 2 workers (72%)". Nothing is applied; it opens the Routing panel. Jev is optional (#214):
+ * the strip is absent while Jev is disabled, before it has advised, and when its call failed (the Routing log has it).
  */
-export function RoutingStrip({ view, channelId, activeExecutions, finishingExecutions, brainNames, onOpen }: {
+export function RoutingStrip({ view, channelId, brainNames, onOpen }: {
   view: AdaptiveRoutingView;
   channelId: string | undefined;
-  activeExecutions: number;
-  finishingExecutions: number;
   brainNames: Record<string, string>;
   onOpen: () => void;
 }) {
-  const state = view.state && view.state.channelId === channelId ? view.state : null;
-  if (!state && finishingExecutions === 0) return null;
-  const finishing = finishingExecutions > 0 ? `+${finishingExecutions} finishing` : "";
+  const { state, brains } = adviceStrip(view, channelId);
+  const failed = state?.advice?.state === "unavailable" || state?.advice?.state === "rejected";
+  if (!state?.recommendation || state.monitoring === "disabled" || failed) return null;
+  const unsure = state.advice && state.advice.state !== "ok";
   return (
-    <div className={`routing-strip ${state?.warning ? "warning" : ""}`}>
+    <div className={`routing-strip ${unsure ? "warning" : ""}`}>
       <button type="button" onClick={onOpen}>
-        {state ? (
-          <>
-            <strong>{topologyLabel(state.currentTopology)}</strong>
-            {state.workerBudget > 0 ? ` · ${state.workerBudget} worker${state.workerBudget === 1 ? "" : "s"}` : ""}
-            {state.lockScope !== "none" ? ` · locked ${state.lockScope}` : ""}
-            {activeExecutions > 1 ? ` · ${brainNames[state.brainId] ?? "brain"} · ${activeExecutions} brains` : ""}
-            {finishing ? ` · ${finishing}` : ""}
-          </>
-        ) : <strong>{finishing}</strong>}
+        <strong>{adviceSummary(state.recommendation)}</strong>
+        {brains > 1 ? ` · ${brainNames[state.brainId] ?? "brain"} · ${brains} brains` : ""}
       </button>
       <span>
-        {!state ? "Earlier requests are finishing their delegated work"
-          : state.monitoring === "completed" ? "Execution completed" : state.monitoring === "disabled"
-          ? "Jev disabled · automatic verification is off" : state.monitoring === "pending"
-          ? "Jev enabled · awaiting next coordination event" : state.warning
-          ? `⚠ ${state.warning}`
-          : (() => {
-              const last = [...view.events].reverse().find(event => event.kind === "transition");
-              return last ? routingEventLabel(last) : "Jev continuous routing active";
-            })()}
+        {state.monitoring === "completed" ? "Request closed · no further advice" : "Advisory only · the brain decides"}
       </span>
     </div>
   );

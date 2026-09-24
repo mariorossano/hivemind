@@ -5,28 +5,40 @@ import type { Socket } from "node:net";
 import path from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 import { getRequestListener } from "@hono/node-server";
-import { DEFAULT_PORT } from "../shared/types.ts";
+import { DEFAULT_PORT, type Message } from "../shared/types.ts";
 import { createRealtimeStream } from "../shared/realtime-client.ts";
 import { Hive } from "./hive.ts";
 import type { HiveEvents } from "./hive-events.ts";
 import { createApp } from "./app.ts";
 import { startTelegram } from "./telegram.ts";
 import { LocalHumanAuth } from "./local-auth.ts";
+import { acquireInstanceLock } from "./instance-lock.ts";
+import { hiveHome } from "./paths.ts";
 import { createStaticWeb } from "./static-web.ts";
 import { WS_HEARTBEAT_MS } from "../shared/realtime.ts";
 import { heartbeatClients, sendRealtime } from "./websocket-policy.ts";
 import { packageRoot } from "../shared/package-root.ts";
+import { retentionDays, startMaintenance } from "./maintenance.ts";
 
 /** Hive events forwarded verbatim to every web UI socket; Telegram wake signals stay server-side. */
 const FORWARDED_EVENTS = [
-  "message", "agent", "channel", "thread", "reaction", "queued", "project", "telegram-health",
+  "message", "activity", "agent", "channel", "thread", "reaction", "queued", "project", "telegram-health",
   "task", "room", "decision", "adaptive-routing", "jev-call", "evidence-health",
 ] as const satisfies ReadonlyArray<keyof HiveEvents>;
 type ForwardedEvent = (typeof FORWARDED_EVENTS)[number];
 
-export function startServer(opts: { port?: number; hive?: Hive; telegram?: boolean; shutdownGraceMs?: number } = {}) {
+export function startServer(opts: { port?: number; hive?: Hive; telegram?: boolean; shutdownGraceMs?: number; retentionDays?: number } = {}) {
   const port = integerArgument(String(opts.port ?? process.env.HIVEMIND_PORT ?? DEFAULT_PORT), 0, 65535);
-  const hive = opts.hive ?? new Hive();
+  const retention = opts.retentionDays ?? retentionDays();
+  // Fail fast, before migrating the database or polling Telegram, if this home is already served.
+  const lock = acquireInstanceLock(opts.hive?.home ?? hiveHome());
+  let hive: Hive;
+  try {
+    hive = opts.hive ?? new Hive();
+  } catch (error) {
+    lock.release();
+    throw error;
+  }
   const telegram = startTelegram(hive, opts.telegram !== false);
   const app = createApp(hive, {
     telegramRunning: () => telegram.running(),
@@ -83,7 +95,11 @@ export function startServer(opts: { port?: number; hive?: Hive; telegram?: boole
     const bytes = Buffer.byteLength(data);
     for (const ws of clients) sendRealtime(ws, data, bytes);
   };
-  const forwarders = FORWARDED_EVENTS.map(type => [type, (payload: unknown) => emit(type, payload)] as const);
+  const forwarders = FORWARDED_EVENTS.map(type => [type, (payload: unknown) => {
+    emit(type, payload);
+    // The Human's For you feed follows each committed message: `activity` goes out on the bus.
+    if (type === "message") hive.reads.publishActivity(payload as Message);
+  }] as const);
   for (const [type, forward] of forwarders) hive.bus.on(type, forward);
 
   server.requestTimeout = REQUEST_BODY_MS;
@@ -94,6 +110,7 @@ export function startServer(opts: { port?: number; hive?: Hive; telegram?: boole
   sweep.unref();
   const heartbeat = setInterval(() => heartbeatClients(clients, responsive), WS_HEARTBEAT_MS);
   heartbeat.unref();
+  const stopMaintenance = startMaintenance(hive, { retentionDays: retention });
   const ready = new Promise<number>((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, "127.0.0.1", () => {
@@ -118,6 +135,7 @@ export function startServer(opts: { port?: number; hive?: Hive; telegram?: boole
     const httpClosed = server.listening ? closeHttp() : ready.then(closeHttp, () => undefined);
     clearInterval(sweep);
     clearInterval(heartbeat);
+    stopMaintenance();
     for (const [type, forward] of forwarders) hive.bus.off(type, forward);
     hive.delivery.cancelWaits();
     for (const ws of clients) ws.close(1001, "server shutdown");
@@ -140,7 +158,7 @@ export function startServer(opts: { port?: number; hive?: Hive; telegram?: boole
       const failed = results.find(result => result.status === "rejected");
       if (failed?.status === "rejected") throw failed.reason;
     });
-    shutdownTask = Promise.race([drained, deadline]).finally(() => clearTimeout(timer));
+    shutdownTask = Promise.race([drained, deadline]).finally(() => { clearTimeout(timer); lock.release(); });
     return shutdownTask;
   };
   return { server, hive, port, shutdown, ready };

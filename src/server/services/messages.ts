@@ -4,7 +4,7 @@ import {
   BODY_MAX,
   FILES_PER_MESSAGE,
   MESSAGE_EVENT_TYPES,
-  REACTION_EMOJIS,
+  isReactionEmoji,
   HiveError,
   HUMAN_ID,
   type Agent,
@@ -37,12 +37,12 @@ export type MessageServiceDeps = Core & {
   readonly tasks: Pick<TaskStore, "has">;
   readonly timeline: Pick<TimelineStore, "prepare" | "recordMessage" | "source">;
   readonly decisions: Pick<DecisionStore, "replyRecipientNames" | "captureHumanReply">;
-  readonly adaptiveTopology: Pick<AdaptiveTopologyRuntime, "humanMessageCommitted" | "threadStatusChange" | "store">;
+  readonly adaptiveTopology: Pick<AdaptiveTopologyRuntime, "threadStatusChange">;
 };
 
 /**
  * The message write path: posting (with idempotent request IDs, recipients,
- * attachments and trace provenance), adaptive requests, system notices,
+ * attachments and trace provenance), system notices,
  * thread status, clear_context control messages and reactions.
  */
 export class MessageService implements MessagePoster {
@@ -143,9 +143,9 @@ export class MessageService implements MessagePoster {
       this.deps.identity.touch(actor.id, true);
       const msg = this.deps.messageQueries.getMessageById(id);
       const decision = actor.role === 'human' ? this.deps.decisions?.captureHumanReply(actor, msg, input.source ?? 'hive') ?? null : null;
+      this.deps.bus.outbox("message", { seq: msg.seq, id: msg.id, kind: msg.kind });
       this.deps.storage.afterCommit(() => {
         if (input.source === "telegram") this.telegramOrigin.add(msg.id);
-        this.deps.adaptiveTopology?.humanMessageCommitted(msg);
         this.deps.bus.emit("message", msg);
         this.deps.delivery.wakeMembers(ch, msg);
         if (decision) this.deps.bus.emit('decision', decision);
@@ -163,40 +163,6 @@ export class MessageService implements MessagePoster {
     return Boolean(row?.found);
   }
 
-  postAdaptiveRequest(
-    actor: Agent,
-    input: {
-      channel: string;
-      body: string;
-      requestId?: string;
-      threadId?: string | null;
-      eventType?: Message["eventType"];
-      traceId?: string;
-      causeMessageId?: string;
-      attachmentIds?: string[];
-      recipients?: string[];
-      source?: "hive" | "telegram";
-    },
-    directives: Array<{ body: string; requestId: string; recipients?: string[] }>,
-    persistReceipt?: (message: Message) => void,
-    persistRouting?: (message: Message) => void,
-  ): { message: Message; routingMessages: Message[] } {
-    return this.deps.storage.transaction(() => {
-      // One directive per owning brain, in the request's thread, immediately before the request.
-      const routingMessages = directives.map(directive => this.postMessage(actor, {
-        channel: input.channel,
-        body: directive.body,
-        requestId: directive.requestId,
-        threadId: input.threadId ?? null,
-        recipients: directive.recipients,
-        eventType: "assignment",
-      }));
-      const message = this.postMessage(actor, input, persistReceipt);
-      persistRouting?.(message);
-      return { message, routingMessages };
-    });
-  }
-
   fromTelegram(messageId: string): boolean {
     return this.telegramOrigin.has(messageId) || this.deps.timeline.source(messageId) === 'telegram';
   }
@@ -212,7 +178,9 @@ export class MessageService implements MessagePoster {
     this.db.prepare(`INSERT INTO messages(id, channel_id, thread_id, author_id, body, kind, event_type, mentions, created_at, recipients)
       VALUES (?, ?, ?, ?, ?, 'chat', ?, ?, ?, ?)`)
       .run(input.id, input.channelId, input.threadId, input.authorId, input.body, input.eventType, input.mentions, input.createdAt, input.recipients);
-    return Number((this.db.prepare("SELECT seq FROM messages WHERE id = ?").get(input.id) as { seq: number }).seq);
+    const seq = Number((this.db.prepare("SELECT seq FROM messages WHERE id = ?").get(input.id) as { seq: number }).seq);
+    this.deps.bus.outbox("message", { seq, id: input.id, kind: "chat" });
+    return seq;
   }
 
   /** Registers a thread root (without a status) if it has none yet. */
@@ -241,12 +209,6 @@ export class MessageService implements MessagePoster {
     }
     const ch = this.deps.channels.getChannel(row.channel_id);
     if (!this.deps.channels.canSeeChannel(actor, ch)) throw new HiveError(403, "Cannot access thread");
-    if (this.deps.adaptiveTopology.store.hasDelegations(threadId)) {
-      if (actor.role !== 'human' && actor.id !== this.deps.messageQueries.getMessageById(threadId).authorId)
-        throw new HiveError(403, 'Only Human or the delegating brain can close adaptive delegated work');
-      if (this.db.prepare('SELECT status FROM threads WHERE id=?').get(threadId)?.status === 'done' && status !== 'done')
-        throw new HiveError(409, 'Start a new guarded assignment instead of reopening completed adaptive work');
-    }
     return this.deps.storage.transaction(() => {
       const routingChanged = this.deps.adaptiveTopology?.threadStatusChange(actor, threadId, status);
       this.db.prepare(`INSERT INTO threads (id, channel_id, status) VALUES (?, ?, ?)
@@ -283,7 +245,7 @@ export class MessageService implements MessagePoster {
 
   /** Omitted present retains legacy toggle; retryable clients use explicit state. */
   setReaction(actor: Agent, seq: number, emoji: string, present?: boolean): { message: Message; added: boolean } {
-    if (!Number.isSafeInteger(seq) || seq < 1 || !REACTION_EMOJIS.includes(emoji as (typeof REACTION_EMOJIS)[number]) ||
+    if (!Number.isSafeInteger(seq) || seq < 1 || !isReactionEmoji(emoji) ||
       (present !== undefined && typeof present !== "boolean")) throw new HiveError(400, "Invalid reaction");
     return this.deps.storage.transaction(() => {
       const msg = this.deps.messageQueries.getMessageBySeq(seq), ch = this.deps.channels.getChannel(msg.channelId);
@@ -293,6 +255,7 @@ export class MessageService implements MessagePoster {
       if (had !== wanted) {
         if (wanted) this.db.prepare('INSERT INTO reactions(message_id,agent_id,emoji,created_at) VALUES(?,?,?,?)').run(msg.id, actor.id, emoji, now());
         else this.db.prepare('DELETE FROM reactions WHERE message_id=? AND agent_id=? AND emoji=?').run(msg.id, actor.id, emoji);
+        this.deps.bus.outbox("reaction", { seq: msg.seq });
         const forUi = this.deps.messageQueries.decorate([msg], HUMAN_ID)[0]!;
         this.deps.storage.afterCommit(() => this.deps.bus.emit("reaction", { seq: msg.seq, message: forUi }));
       }

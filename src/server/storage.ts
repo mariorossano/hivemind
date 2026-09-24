@@ -19,8 +19,9 @@ import type { DatabaseSync } from "node:sqlite";
  *   A failure that escapes the outermost call rolls back everything.
  * - `afterCommit(effect)` defers an effect (bus events, waking waiters) until
  *   the outermost transaction commits; outside a transaction it runs at once.
- *   Effects run in scheduling order; a failing effect does not stop the rest,
- *   and the first failure is rethrown after all have run.
+ *   Effects run in scheduling order and are infallible: the data they react to
+ *   is already durable, so a failing effect is logged and the rest still run;
+ *   the failure never reaches the caller whose transaction committed.
  * - `work` must be synchronous. A returned promise is rejected (and the
  *   transaction rolled back) because the transaction would end before it does.
  * - Never consults DatabaseSync.isTransaction (absent on Node 22.13.0); the
@@ -51,6 +52,12 @@ export class Storage {
   /** True while a transaction opened through this Storage is active. */
   get active(): boolean {
     return this.depth > 0;
+  }
+
+  /** Lets SQLite refresh the planner statistics it considers stale (cheap; run periodically, never inside a transaction). */
+  optimize(): void {
+    if (this.depth > 0) throw new Error("PRAGMA optimize must run outside a transaction");
+    this.db.exec("PRAGMA optimize");
   }
 
   transaction<T>(work: () => T, options: TransactionOptions = {}): T {
@@ -86,16 +93,20 @@ export class Storage {
   /** Runs `effect` after the outermost transaction commits, or now when none is active. */
   afterCommit(effect: () => void): void {
     if (this.depth > 0) this.effects.push(effect);
-    else effect();
+    else runEffect(effect);
   }
 
   private flush(): void {
-    const effects = this.effects.splice(0);
-    let failure: { error: unknown } | undefined;
-    for (const effect of effects) {
-      try { effect(); } catch (error) { failure ??= { error }; }
-    }
-    if (failure) throw failure.error;
+    for (const effect of this.effects.splice(0)) runEffect(effect);
+  }
+}
+
+/** Runs a post-commit effect, logging (never rethrowing) its failure. */
+export function runEffect(effect: () => void, label = "post-commit effect"): void {
+  try {
+    effect();
+  } catch (error) {
+    console.error(`hivemind ${label} failed:`, error instanceof Error ? error.message : String(error));
   }
 }
 

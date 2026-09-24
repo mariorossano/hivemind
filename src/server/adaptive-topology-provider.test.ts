@@ -2,50 +2,46 @@ import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
 import { evaluateAdaptiveTopology, topologyQuestions, MAX_PLAN_WORKERS, type TopologyEvaluationSnapshot } from './adaptive-topology-provider.ts';
-import { jevTopologyResponse } from './fixtures/jev-topology.ts';
+import { contradictoryJevAnswer, jevTopologyResponse } from './fixtures/jev-topology.ts';
 
-function snapshot(usable = 3, only = false): TopologyEvaluationSnapshot {
+function snapshot(usable = 3): TopologyEvaluationSnapshot {
   return { request: 'Complete this phase.', project: { slug: 'test', name: 'Test' },
-    current: { topology: 'brain_multi_room', workerBudget: 2, desiredTopology: null, desiredWorkers: null },
     capacity: { workers: { total: usable, online: usable, busyOther: 0, busyCurrent: 0, free: usable,
       usableForExecution: usable, available: [] }, activeTasks: 0, activeWorkers: 0, blockers: 0, openDependencies: 0, workstreams: 0 },
-    execution: { orchestratedOnly: only, lockedTopology: null, lockScope: 'none' },
     tasks: { active: 0, activeWorkers: 0, blockers: 0, openDependencies: 0, workstreams: 0 },
     recentCoordinationEvents: [], trigger: { kind: 'brain_message' }, previousDecision: null };
 }
 
-test('offered plans are every consistent plan for actual capacity, including zero capacity and orchestrated-only mode', () => {
-  for (const usable of [0, 1, 2, 3, 8, 300]) for (const only of [false, true]) {
-    const input = snapshot(usable, only); input.current = null;
+test('offered plans are every consistent plan for actual capacity, including zero capacity', () => {
+  for (const usable of [0, 1, 2, 3, 8, 300]) {
+    const input = snapshot(usable);
     const { plans, questions } = topologyQuestions(input);
     const expected = [
-      ...(!only || usable === 0 ? ['single'] : []), ...(usable >= 1 ? ['brain_one_worker'] : []),
+      'single', ...(usable >= 1 ? ['brain_one_worker'] : []),
       ...Array.from({ length: Math.max(0, Math.min(usable, MAX_PLAN_WORKERS) - 1) }, (_, i) => [`brain_multi_dm_${i + 2}`, `brain_multi_room_${i + 2}`]).flat(),
-      ...(usable === 0 || (only && usable === 1) ? ['capacity_blocked'] : []),
+      ...(usable === 0 ? ['capacity_blocked'] : []),
     ];
-    assert.deepEqual(Object.keys(plans), expected, `usable=${usable} only=${only}`);
-    assert.ok(Object.keys(plans).length <= 18 && Object.values(plans).every(text => text.length > 20));
+    assert.deepEqual(Object.keys(plans), expected, `usable=${usable}`);
+    assert.ok(Object.keys(plans).length <= 17 && Object.values(plans).every(text => text.length > 20));
     assert.deepEqual(Object.keys(questions), ['single_agent_sufficiency', 'complexity', 'parallelizability', 'coupling',
       'specialization_need', 'coordination_need', 'plan']);
     assert.ok(!('target_topology' in questions) && !('worker_budget' in questions));
   }
-  // A running plan above the cap stays offered, so the cap alone never forces a de-escalation.
-  const above = snapshot(12); above.current = { topology: 'brain_multi_dm', workerBudget: 11, desiredTopology: null, desiredWorkers: null };
-  const plans = Object.keys(topologyQuestions(above).plans);
-  assert.ok(plans.includes('brain_multi_dm_11') && plans.includes('brain_multi_room_11') && !plans.includes('brain_multi_dm_9'));
-  assert.ok(plans.includes('brain_multi_room_8'));
+  // No mode is applied (#211), so nothing above the cap is ever offered.
+  const plans = Object.keys(topologyQuestions(snapshot(12)).plans);
+  assert.ok(plans.includes('brain_multi_room_8') && !plans.includes('brain_multi_dm_9'));
+  const question = topologyQuestions(snapshot(3)).questions.plan as { instructions: Record<string, unknown> };
+  assert.deepEqual(Object.keys(question.instructions), ['question', 'free_workers', 'already_working_for_this_brain', 'usable_workers']);
   assert.throws(() => topologyQuestions(snapshot(-1)));
   assert.throws(() => topologyQuestions(snapshot(1.5)));
 });
 
 test('every plan kind parses into its topology and worker count and accounts for usage', async () => {
-  for (const [usable, only, target, workers] of [
-    [0, false, 'capacity_blocked', 0], [0, false, 'single', 0], [0, true, 'capacity_blocked', 0],
-    [1, false, 'brain_one_worker', 1], [1, true, 'capacity_blocked', 0], [1, true, 'brain_one_worker', 1],
-    [3, false, 'brain_multi_dm', 3], [3, true, 'brain_multi_room', 2], [3, false, 'single', 0],
-    [20, false, 'brain_multi_dm', 8], [20, true, 'brain_multi_room', 8], [2, false, 'brain_multi_dm', 2],
+  for (const [usable, target, workers] of [
+    [0, 'capacity_blocked', 0], [0, 'single', 0], [1, 'brain_one_worker', 1], [3, 'brain_multi_dm', 3],
+    [3, 'brain_multi_room', 2], [3, 'single', 0], [20, 'brain_multi_dm', 8], [20, 'brain_multi_room', 8], [2, 'brain_multi_dm', 2],
   ] as const) {
-    const input = snapshot(usable, only);
+    const input = snapshot(usable);
     let offered: string[] = [];
     const result = await evaluateAdaptiveTopology(input, { apiKey: 'unit-fixture' }, {
       fetchImpl: async (_url, init) => {
@@ -66,11 +62,6 @@ test('every plan kind parses into its topology and worker count and accounts for
     assert.equal(result.outputTokens, 20);
     assert.ok(offered.length >= 2);
   }
-  // A running plan above the cap can be kept.
-  const above = snapshot(12); above.current = { topology: 'brain_multi_room', workerBudget: 10, desiredTopology: null, desiredWorkers: null };
-  const kept = await evaluateAdaptiveTopology(above, { apiKey: 'unit-fixture' }, {
-    fetchImpl: async (_url, init) => Response.json(jevTopologyResponse(String(init?.body), 'brain_multi_room', 10)) });
-  assert.equal(kept.providerStatus, 'ok'); assert.equal(kept.targetWorkers, 10);
 });
 
 test('confidence is the lowest of the plan and signal answers', async () => {
@@ -87,9 +78,9 @@ test('confidence is the lowest of the plan and signal answers', async () => {
 });
 
 test('a plan that was not offered is rejected as plan_not_offered, keeping the resolved model and usage', async () => {
-  for (const choice of ['brain_multi_dm_9', 'brain_multi_dm_1', 'workers_2', 'brain_one_worker_2', 'made_up', 'single']) {
+  for (const choice of ['brain_multi_dm_9', 'brain_multi_dm_1', 'workers_2', 'brain_one_worker_2', 'made_up']) {
     const exchanges: Array<{ error: string | null; received: unknown }> = [];
-    const result = await evaluateAdaptiveTopology(snapshot(12, true), { apiKey: 'never-log-secret' }, {
+    const result = await evaluateAdaptiveTopology(snapshot(12), { apiKey: 'never-log-secret' }, {
       onExchange: exchange => exchanges.push(exchange),
       fetchImpl: async (_url, init) => {
         const payload = jevTopologyResponse(String(init?.body), 'brain_multi_dm', 2) as any;
@@ -100,16 +91,16 @@ test('a plan that was not offered is rejected as plan_not_offered, keeping the r
     });
     assert.equal(result.providerStatus, 'unavailable', choice);
     assert.equal(result.error, 'plan_not_offered', choice);
-    assert.equal(result.reason, 'response_rejected_preserve_current');
+    assert.equal(result.reason, 'response_rejected');
     assert.equal(result.model, 'jev-1.13.0');
     assert.equal(result.inputTokens, 2851); assert.equal(result.outputTokens, 248);
-    assert.equal(result.targetTopology, 'brain_multi_room'); assert.equal(result.targetWorkers, 2);
+    assert.equal(result.targetTopology, 'single'); assert.equal(result.targetWorkers, 0);
     assert.equal(exchanges.length, 1); assert.equal(exchanges[0]!.error, 'plan_not_offered'); assert.ok(exchanges[0]!.received);
     assert.doesNotMatch(JSON.stringify(result), /never-log-secret/);
   }
 });
 
-test('malformed or inconsistent provider replies are rejected with a specific reason and preserve current mode', async () => {
+test('malformed or inconsistent provider replies are rejected with a specific reason', async () => {
   const mutations: Array<[string, (payload: any) => unknown, string, boolean]> = [
     ['null envelope', () => null, 'malformed_response', false], ['array envelope', () => [], 'malformed_response', false],
     ['missing model', p => ({ ...p, model: null }), 'model_missing', false],
@@ -130,13 +121,6 @@ test('malformed or inconsistent provider replies are rejected with a specific re
     ['probability negative', p => { p.answers.complexity.probabilities['0'] = -1; return p; }, 'probabilities_invalid:complexity', true],
     ['probability sum', p => { p.answers.complexity.probabilities = { '0': 1, '1': 1, '2': 1 }; return p; }, 'probabilities_invalid:complexity', true],
     ['choice not maximum', p => { p.answers.plan.choice = 'brain_multi_dm_2'; return p; }, 'probabilities_invalid:plan', true],
-    ['contradictory sufficiency', p => {
-      p.answers.plan = { type: 'choice', choice: 'single', confidence: 0.99,
-        probabilities: Object.fromEntries(Object.keys(p.answers.plan.probabilities).map(k => [k, k === 'single' ? 0.95 : 0.01])) };
-      p.answers.single_agent_sufficiency = { type: 'choice', choice: 'insufficient', confidence: 0.99,
-        probabilities: { insufficient: 0.99, sufficient: 0.01 } };
-      return p;
-    }, 'plan_contradicts_sufficiency', true],
   ];
   for (const [label, mutate, code, withModel] of mutations) {
     const result = await evaluateAdaptiveTopology(snapshot(), { apiKey: 'never-log-secret' }, {
@@ -144,10 +128,10 @@ test('malformed or inconsistent provider replies are rejected with a specific re
     });
     assert.equal(result.providerStatus, 'unavailable', label);
     assert.equal(result.error, code, label);
-    assert.equal(result.reason, 'response_rejected_preserve_current', label);
+    assert.equal(result.reason, 'response_rejected', label);
     assert.equal(result.model !== null, withModel, label);
-    assert.equal(result.targetTopology, 'brain_multi_room', label);
-    assert.equal(result.targetWorkers, 2);
+    assert.equal(result.targetTopology, 'single', label);
+    assert.equal(result.targetWorkers, 0);
     assert.equal(result.confidence, null);
     assert.doesNotMatch(JSON.stringify(result), /never-log-secret|made_up/);
   }
@@ -160,6 +144,28 @@ test('malformed or inconsistent provider replies are rejected with a specific re
     },
   });
   assert.equal(delegating.providerStatus, 'ok'); assert.equal(delegating.singleSufficient, true); assert.equal(delegating.needsOrchestration, false);
+  assert.equal(delegating.incoherent, null);
+});
+
+test('a Single plan that contradicts "insufficient" is accepted as a valid but incoherent answer, not rejected', async () => {
+  const exchanges: Array<{ error: string | null }> = [];
+  const result = await evaluateAdaptiveTopology(snapshot(), { apiKey: 'unit-fixture' }, {
+    onExchange: exchange => exchanges.push(exchange),
+    fetchImpl: async (_url, init) => Response.json(contradictoryJevAnswer(jevTopologyResponse(String(init?.body), 'brain_multi_room', 2, 0.99))),
+  });
+  assert.equal(result.providerStatus, 'ok');
+  assert.equal(result.incoherent, 'plan_vs_sufficiency');
+  assert.equal(result.reason, 'incoherent_plan_vs_sufficiency');
+  assert.equal(result.error, null); assert.equal(exchanges[0]!.error, null);
+  assert.equal(result.targetTopology, 'single'); assert.equal(result.targetWorkers, 0);
+  // Jev's own (high) confidence is kept for transparency; routing treats the answer as uncertain regardless.
+  assert.equal(result.confidence, 0.99);
+  assert.equal(result.singleSufficient, false);
+  // With no usable worker, Single is the only feasible plan: "insufficient" is then coherent.
+  const alone = await evaluateAdaptiveTopology(snapshot(0), { apiKey: 'unit-fixture' }, {
+    fetchImpl: async (_url, init) => Response.json(contradictoryJevAnswer(jevTopologyResponse(String(init?.body), 'single', 0))),
+  });
+  assert.equal(alone.providerStatus, 'ok'); assert.equal(alone.incoherent, null);
 });
 
 test('HTTP errors, empty bodies, malformed JSON, size budgets and request failures are bounded, specific fallbacks', async () => {
@@ -171,9 +177,9 @@ test('HTTP errors, empty bodies, malformed JSON, size budgets and request failur
   ];
   for (const [transport, code] of transports) {
     const result = await evaluateAdaptiveTopology(snapshot(), { apiKey: 'fixture-key' }, { fetchImpl: async () => transport() });
-    assert.equal(result.providerStatus, 'unavailable'); assert.equal(result.targetWorkers, 2);
+    assert.equal(result.providerStatus, 'unavailable'); assert.equal(result.targetWorkers, 0);
     assert.equal(result.error, code); assert.equal(result.model, null); assert.equal(result.inputTokens, null);
-    assert.equal(result.reason, 'provider_unavailable_preserve_current');
+    assert.equal(result.reason, 'provider_unavailable');
     assert.doesNotMatch(JSON.stringify(result), /private diagnostic/);
   }
   for (const timeoutMs of [0, -1, 10_001, 1.5]) {
@@ -189,8 +195,7 @@ test('HTTP errors, empty bodies, malformed JSON, size budgets and request failur
   let called = false;
   const tooBig = await evaluateAdaptiveTopology(big, { apiKey: 'fixture-key' }, { fetchImpl: async () => { called = true; throw new Error('must not call'); } });
   assert.equal(called, false); assert.equal(tooBig.providerStatus, 'unavailable'); assert.equal(tooBig.error, 'request_too_large');
-  const initial = snapshot(); initial.current = null;
-  const failed = await evaluateAdaptiveTopology(initial, { apiKey: 'fixture-key' }, { fetchImpl: async () => { throw new Error('secret-fixture'); } });
+  const failed = await evaluateAdaptiveTopology(snapshot(), { apiKey: 'fixture-key' }, { fetchImpl: async () => { throw new Error('secret-fixture'); } });
   assert.equal(failed.targetTopology, 'single'); assert.equal(failed.targetWorkers, 0); assert.equal(failed.error, 'network');
   assert.doesNotMatch(JSON.stringify(failed), /secret-fixture/);
   const broken = await evaluateAdaptiveTopology(snapshot(), { apiKey: 'fixture-key' }, {

@@ -1,59 +1,97 @@
-import { useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { useId, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import type { Agent } from "../src/shared/types.ts";
-import type { SendLockScope, SendRoutingMode } from "./api.ts";
-import { topologyLabel } from "./AdaptiveRoutingPanel.tsx";
 
+/** The `@name` fragment being typed at the end of the draft, if any. */
+const MENTION_TAIL = /@[^\s@]*$/;
+
+/**
+ * Message input. The draft lives here, not in App, so typing re-renders only the
+ * composer. `onSend` resolves true once the message is committed; on false the
+ * draft and attachments stay put so the same send can be retried.
+ */
 export function Composer({
   agents,
-  value,
-  onChange,
   onSend,
   placeholder,
-  routing,
 }: {
   agents: Agent[];
-  value: string;
-  onChange: (v: string) => void;
-  onSend: (files?: File[]) => void;
+  onSend: (body: string, files: File[]) => Promise<boolean>;
   placeholder: string;
-  routing?: {
-    value: SendRoutingMode;
-    onChange: (mode: SendRoutingMode) => void;
-    lockScope: SendLockScope;
-    onLockScopeChange: (scope: SendLockScope) => void;
-  };
 }) {
+  const [value, setValue] = useState("");
   const [hint, setHint] = useState<Agent[]>([]);
+  const [active, setActive] = useState(0);
   const [files, setFiles] = useState<File[]>([]);
+  const [sending, setSending] = useState(false);
+  const sendingRef = useRef(false);
   const names = useMemo(() => agents.filter((a) => a.role !== "bot"), [agents]);
   const pick = useRef<HTMLInputElement>(null);
+  const listId = useId();
 
   const addFiles = (list: FileList | File[]) => {
     const next = [...files, ...Array.from(list)].slice(0, 4);
     setFiles(next);
   };
 
-  const flush = () => {
-    onSend(files);
-    setFiles([]);
+  const flush = async () => {
+    if (sendingRef.current || (!value.trim() && files.length === 0)) return;
+    const body = value, sent = files;
+    sendingRef.current = true;
+    setSending(true);
+    try {
+      if (!await onSend(body, sent)) return;
+      // Keep anything typed or attached while the send was in flight.
+      setValue((current) => current === body ? "" : current);
+      setFiles((current) => current.filter((file) => !sent.includes(file)));
+    } finally {
+      sendingRef.current = false;
+      setSending(false);
+    }
+  };
+
+  const insert = (agent: Agent) => {
+    setValue((current) => current.replace(MENTION_TAIL, `@${agent.name} `));
+    setHint([]);
   };
 
   const onKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    // Enter confirms an IME composition (e.g. Japanese, Chinese); it must not send or pick.
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+    if (hint.length > 0) {
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        const step = e.key === "ArrowDown" ? 1 : -1;
+        setActive((i) => (i + step + hint.length) % hint.length);
+        return;
+      }
+      if ((e.key === "Enter" || e.key === "Tab") && !e.shiftKey) {
+        e.preventDefault();
+        insert(hint[Math.min(active, hint.length - 1)]!);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setHint([]);
+        return;
+      }
+    }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      flush();
+      void flush();
     }
   };
 
   const onInput = (v: string) => {
-    onChange(v);
+    setValue(v);
     const at = v.split(/\s/).pop() ?? "";
     if (at.startsWith("@") && at.length > 1) {
       const q = at.slice(1).toLowerCase();
       setHint(names.filter((a) => a.name.toLowerCase().startsWith(q)).slice(0, 6));
     } else setHint([]);
+    setActive(0);
   };
 
+  const open = hint.length > 0;
   return (
     <div
       className="composer"
@@ -63,16 +101,16 @@ export function Composer({
         if (e.dataTransfer.files.length) addFiles(e.dataTransfer.files);
       }}
     >
-      {hint.length > 0 && (
-        <ul className="hints">
-          {hint.map((a) => (
-            <li key={a.id}>
+      {open && (
+        <ul className="hints" id={listId} role="listbox" aria-label="Mention">
+          {hint.map((a, i) => (
+            <li key={a.id} role="option" id={`${listId}-${i}`} aria-selected={i === active}>
               <button
                 type="button"
-                onClick={() => {
-                  onChange(value.replace(/@\w*$/, `@${a.name} `));
-                  setHint([]);
-                }}
+                tabIndex={-1}
+                className={i === active ? "active" : undefined}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => insert(a)}
               >
                 @{a.name}
                 <small>{a.role}</small>
@@ -86,59 +124,13 @@ export function Composer({
           {files.map((f, i) => (
             <li key={`${f.name}-${i}`}>
               {f.name}
-              <button type="button" onClick={() => setFiles(files.filter((_, j) => j !== i))}>
+              <button type="button" disabled={sending} aria-label={`Remove ${f.name}`} onClick={() => setFiles(files.filter((_, j) => j !== i))}>
                 ×
               </button>
             </li>
           ))}
         </ul>
       )}
-        {routing && (
-          <details className="composer-routing">
-            <summary title="Choose how agents handle this message" aria-label="Message routing options">
-              <svg className="routing-icon" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M3 6h13m-3-3 3 3-3 3M17 14H4m3-3-3 3 3 3" /></svg>
-              <span>{routing.value === "auto" ? "Auto · Jev" : routing.value === "orchestrated_auto" ? "Orchestrated Auto" : topologyLabel(routing.value)}</span>
-              {routing.lockScope !== "none" && <span className="routing-scope">{routing.lockScope} lock</span>}
-              <svg className="routing-chevron" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="m4 6 4 4 4-4" /></svg>
-            </summary>
-            <div className="composer-routing-fields">
-            <label>Team
-            <select
-              className="routing-mode"
-              aria-label="Execution mode"
-              title="Execution mode for this request"
-              value={routing.value}
-              onChange={(e) => {
-                const mode = e.target.value as SendRoutingMode;
-                routing.onChange(mode);
-                if (mode === "auto" || mode === "orchestrated_auto") routing.onLockScopeChange("none");
-              }}
-            >
-              <option value="auto">Auto · Jev</option>
-              <option value="single">Single</option>
-              <option value="brain_one_worker">Brain + 1</option>
-              <option value="brain_multi_dm">Multi-DM</option>
-              <option value="brain_multi_room">Room</option>
-              <option value="orchestrated_auto">Orchestrated Auto</option>
-            </select>
-            </label>
-            <label>Apply to
-            <select
-              className="routing-lock-mode"
-              aria-label="Routing lock scope"
-              title="Apply an explicit topology once, to this task, or to this conversation"
-              value={routing.lockScope}
-              disabled={routing.value === "auto" || routing.value === "orchestrated_auto"}
-              onChange={(e) => routing.onLockScopeChange(e.target.value as SendLockScope)}
-            >
-              <option value="none">One request</option>
-              <option value="task">Lock task</option>
-              <option value="conversation">Lock conversation</option>
-            </select>
-            </label>
-            </div>
-          </details>
-        )}
       <div className="composer-box">
         <input
           ref={pick}
@@ -151,13 +143,17 @@ export function Composer({
             e.target.value = "";
           }}
         />
-        <button type="button" className="clip" title="Attach" onClick={() => pick.current?.click()}>
-          📎
+        <button type="button" className="clip" title="Attach" aria-label="Attach files" onClick={() => pick.current?.click()}>
+          <span aria-hidden="true">📎</span>
         </button>
         <textarea
           rows={2}
           value={value}
           placeholder={placeholder}
+          aria-label={placeholder}
+          aria-autocomplete="list"
+          aria-controls={open ? listId : undefined}
+          aria-activedescendant={open ? `${listId}-${Math.min(active, hint.length - 1)}` : undefined}
           onChange={(e) => onInput(e.target.value)}
           onKeyDown={onKey}
           onPaste={(e) => {
@@ -171,7 +167,8 @@ export function Composer({
             }
           }}
         />
-        <button type="button" className="send" onClick={flush} disabled={!value.trim() && files.length === 0}>
+        <button type="button" className="send" onClick={() => void flush()}
+          disabled={sending || (!value.trim() && files.length === 0)} aria-busy={sending}>
           Send
         </button>
       </div>

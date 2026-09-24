@@ -16,6 +16,16 @@ const pane = (messages = [message(1)], snapshotSeq = 1): ChannelPayload => ({
 });
 const thread = (id: string, status: Thread["status"] = "blocked"): Thread => ({ id, channelId: "c", status });
 
+test("the New messages divider stays where it was when the channel opened, across refreshes of that channel", () => {
+  const opened = reconcileChannelSnapshot(null, { ...pane([message(1), message(2)], 2), firstUnreadSeq: 2 }, beginChannelJournal("c"))!;
+  assert.equal(opened.firstUnreadSeq, 2);
+  // Receipts made the refreshed page read; the divider must not vanish under the Human's eyes.
+  const refreshed = reconcileChannelSnapshot(opened, { ...pane([message(1), message(2)], 2), firstUnreadSeq: null }, beginChannelJournal("c"))!;
+  assert.equal(refreshed.firstUnreadSeq, 2);
+  const other = { ...pane([message(1)], 1), channel: { id: "d" } as ChannelPayload["channel"], firstUnreadSeq: 1 };
+  assert.equal(reconcileChannelSnapshot(opened, other, beginChannelJournal("d"))!.firstUnreadSeq, 1);
+});
+
 test('an unread jump retains its target before trimming a full live arrival window', () => {
   const journal = beginChannelJournal('c');
   for (let seq = 2; seq <= LIVE_MESSAGE_WINDOW + 1; seq++) recordChannelMessage(journal, message(seq));
@@ -138,4 +148,24 @@ test("refresh prunes invisible root metadata, restores server truth and isolates
   const legacy = { ...pane(), snapshotSeq: undefined, replyCounts: { m1: 3 } };
   recordChannelMessage(journal, message(3, "m1"));
   assert.equal(reconcileChannelSnapshot(current, legacy, journal)!.replyCounts.m1, 9);
+});
+
+test("window-scoped aggregates: an older page keeps the counts and statuses of the roots already shown", () => {
+  // The server returns thread aggregates only for the roots of the page it serves (#217).
+  const newest = { ...pane([message(10), message(11)], 20), replyCounts: { m10: 2 }, threads: [thread("m10", "open")] };
+  const current = reconcileChannelSnapshot(null, newest, beginChannelJournal("c"))!;
+  const live = applyChannelMessage(current, message(21, "m10"))!;
+  assert.equal(live.replyCounts.m10, 3);
+  const olderPage = { ...pane([message(5)], 20), replyCounts: { m5: 1 }, threads: [thread("m5", "blocked")], cursors: { before: 5 } };
+  const journal = beginChannelJournal("c");
+  // A reply seen live while the request was pending is not counted twice for a carried root.
+  recordChannelMessage(journal, message(21, "m10"));
+  const merged = reconcileChannelSnapshot(live, olderPage, journal, true)!;
+  assert.deepEqual(merged.messages.map(m => m.id), ["m5", "m10", "m11"]);
+  assert.deepEqual(merged.replyCounts, { m5: 1, m10: 3 });
+  assert.deepEqual(merged.threads.map(t => [t.id, t.status]).sort(), [["m10", "open"], ["m5", "blocked"]]);
+  // A plain refresh replaces the window and its aggregates with server truth.
+  const refreshed = reconcileChannelSnapshot(merged, { ...pane([message(11)], 22), replyCounts: {}, threads: [] }, beginChannelJournal("c"))!;
+  assert.deepEqual(refreshed.replyCounts, {});
+  assert.deepEqual(refreshed.threads, []);
 });

@@ -3,26 +3,20 @@ import type { EvidenceCollectorHealth } from '../src/shared/evidence-health.ts';
 import type { RoutingRequest, RoutingSuggestions } from '../src/shared/routing.ts';
 import type { TelegramHealth } from "./telegram-health.ts";
 import type { Agent, BotCredentialView, AttachmentMeta, Channel, Message, Project, SearchHit, Thread, ThreadStatus, InboxStatus } from "../src/shared/types.ts";
-import type { MentionPage, ReadSnapshot } from "../src/shared/read-state.ts";
+import type { ActivityPage, ActivityReason, MentionPage, ReadSnapshot } from "../src/shared/read-state.ts";
 import { resolveUploadMime } from "../src/shared/mime.ts";
 import type { LaunchContext } from "../src/shared/launch-prompt.ts";
 import type { ProjectPluginView, SettingsValues } from "../src/shared/plugin-settings.ts";
 import { humanSession, connectHumanWs } from "./human-session.ts";
-import type { TaskSnapshot } from '../src/shared/tasks.ts';
+import type { AgentWork, ChannelTaskPage, TaskSnapshot } from '../src/shared/tasks.ts';
 import type { RoomView, Room } from '../src/shared/rooms.ts';
 import type { DecisionPage, DecisionView } from '../src/shared/decisions.ts';
 import type { TimelineExport, TimelineView } from '../src/shared/timeline.ts';
-import type {
-  AdaptiveExecutionState,
-  AdaptiveLockScope,
-  AdaptiveRoutingMode,
-  AdaptiveRoutingView,
-  AdaptiveTopology,
-  AdaptiveTopologyDecision,
-} from '../src/shared/adaptive-topology.ts';
+import type { AdaptiveRoutingView } from '../src/shared/adaptive-topology.ts';
 
 export class ApiError extends Error {
-  constructor(readonly status: number, message: string) { super(message); }
+  /** `body` is the parsed error response, for errors that carry more than a message (e.g. a thread's real channel). */
+  constructor(readonly status: number, message: string, readonly body?: Record<string, unknown>) { super(message); }
 }
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
@@ -31,12 +25,9 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
     headers: { "content-type": "application/json", ...init?.headers },
   });
   const data = await res.json();
-  if (!res.ok) throw new ApiError(res.status, data.error || `HTTP ${res.status}`);
+  if (!res.ok) throw new ApiError(res.status, data.error || `HTTP ${res.status}`, data);
   return data as T;
 }
-
-export type SendRoutingMode = AdaptiveRoutingMode;
-export type SendLockScope = AdaptiveLockScope;
 
 export type Snapshot = ReadSnapshot & {
   you: Agent;
@@ -50,6 +41,14 @@ export type Snapshot = ReadSnapshot & {
   telegram?: { running: boolean; configured: boolean } & TelegramHealth;
 };
 
+/** Sidebar badges and roster status lines. */
+export type NavStatus = {
+  /** Awaiting decisions per project slug. */
+  awaitingDecisions: Record<string, number>;
+  /** Open work per agent id; agents without any are omitted. */
+  agentWork: Record<string, AgentWork>;
+};
+
 export type AdaptiveRoutingSettings = {
   enabled: boolean;
   apiKeySet: boolean;
@@ -59,8 +58,6 @@ export type AdaptiveRoutingSettings = {
   /** The provider alias used when nothing is pinned. */
   defaultModel: string;
   modelPinned: boolean;
-  fallback: "single" | "orchestrated";
-  topologyFallback: Exclude<AdaptiveTopology, "single">;
 };
 
 export type TelegramSettings = TelegramHealth & {
@@ -85,6 +82,8 @@ export type ChannelPayload = {
   /** Client-only reading window. Live arrivals must not evict selected/older text. */
   historyThrough?: number;
   deferredLive?: boolean;
+  /** Oldest unread root when the channel was opened (or marked unread): where "New messages" starts. */
+  firstUnreadSeq?: number | null;
   task?: TaskSnapshot;
   decision?: DecisionView;
   decisions?: DecisionView[];
@@ -103,8 +102,6 @@ export const api = {
   saveAdaptiveRouting: (body: {
     enabled: boolean;
     apiKey?: string | null;
-    fallback: "single" | "orchestrated";
-    topologyFallback: Exclude<AdaptiveTopology, "single">;
     /** A bounded identifier to pin, or null for the default alias. */
     model?: string | null;
   }) =>
@@ -114,11 +111,6 @@ export const api = {
     }),
   adaptiveRoutingView: (channelId: string, signal?: AbortSignal) =>
     req<AdaptiveRoutingView>(`/api/ui/channels/${encodeURIComponent(channelId)}/adaptive-routing`, { signal }),
-  setAdaptiveRoutingLock: (channelId: string, body: { scope: AdaptiveLockScope; topology?: AdaptiveTopology | null; expectedExecutionId?: string; expectedRevision?: number }) =>
-    req<AdaptiveRoutingView>(`/api/ui/channels/${encodeURIComponent(channelId)}/adaptive-routing/lock`, {
-      method: "PUT",
-      body: JSON.stringify(body),
-    }),
   taskTimeline: (id: string, signal?: AbortSignal) =>
     req<{ timeline: TimelineView }>(`/api/ui/tasks/${encodeURIComponent(id)}/timeline`, { signal }),
   exportTaskTimeline: (id: string, signal?: AbortSignal) =>
@@ -141,6 +133,8 @@ export const api = {
   changeBotCredential: (project: string, bot: string, action: 'rotate' | 'revoke', expectedRevision: number) =>
     req<BotCredentialView & { token?: string }>(`/api/ui/projects/${encodeURIComponent(project)}/bots/${encodeURIComponent(bot)}/credential`,
       { method: 'POST', body: JSON.stringify({ action, expectedRevision }) }),
+  channelTasks: (channel: string, signal?: AbortSignal) =>
+    req<ChannelTaskPage>(`/api/ui/channels/${encodeURIComponent(channel)}/tasks`, { signal }),
   room: (channel: string) => req<RoomView>(`/api/ui/channels/${encodeURIComponent(channel)}/room`),
   roomHistory: (channel: string, before?: number) => req<{ history: Room[] }>(`/api/ui/channels/${encodeURIComponent(channel)}/room/history?before=${before ?? Number.MAX_SAFE_INTEGER}`),
   roomEvent: (channel: string, body: unknown) => req<RoomView>(`/api/ui/channels/${encodeURIComponent(channel)}/room`, { method: 'POST', body: JSON.stringify(body) }),
@@ -157,16 +151,19 @@ export const api = {
   ),
   snapshot: (signal?: AbortSignal) => req<Snapshot>("/api/ui/snapshot", { signal }),
   readState: (signal?: AbortSignal) => req<ReadSnapshot>("/api/ui/read-state", { signal }),
+  navStatus: (signal?: AbortSignal) => req<NavStatus>("/api/ui/nav-status", { signal }),
   markMessagesSeen: (channelId: string, threadId: string | null, messageSeqs: number[], signal?: AbortSignal) =>
     req<ReadSnapshot>("/api/ui/read", {
       method: "POST", body: JSON.stringify({ channelId, threadId, messageSeqs }), signal,
     }),
-  mentions: (beforeSeq?: number, project?: string, signal?: AbortSignal) => {
-    const q = new URLSearchParams();
-    if (beforeSeq) q.set("beforeSeq", String(beforeSeq));
-    if (project) q.set("project", project);
-    const suffix = q.toString() ? `?${q}` : "";
-    return req<MentionPage>(`/api/ui/mentions${suffix}`, { signal });
+  markUnread: (channelId: string, fromSeq: number) =>
+    req<ReadSnapshot>("/api/ui/unread", { method: "POST", body: JSON.stringify({ channelId, fromSeq }) }),
+  activity: (view: { project: string; unreadOnly: boolean; reasons: readonly ActivityReason[]; beforeSeq?: number },
+    signal?: AbortSignal) => {
+    const q = new URLSearchParams({ project: view.project, unread: view.unreadOnly ? "1" : "0" });
+    if (view.reasons.length) q.set("reason", view.reasons.join(","));
+    if (view.beforeSeq) q.set("beforeSeq", String(view.beforeSeq));
+    return req<ActivityPage>(`/api/ui/activity?${q}`, { signal });
   },
   markMentionsSeen: (project?: string) =>
     req<MentionPage & { unread: Record<string, number>; readState: ReadSnapshot }>("/api/ui/mentions/seen", {
@@ -214,18 +211,11 @@ export const api = {
     const suffix = q.toString() ? `?${q}` : "";
     return req<ChannelPayload>(`/api/ui/channels/${encodeURIComponent(id)}/messages${suffix}`, { signal });
   },
-  send: (id: string, body: string, threadId?: string | null, attachmentIds?: string[], requestId?: string,
-    routing: AdaptiveRoutingMode = "auto", lockScope: AdaptiveLockScope = "none") =>
-    req<{
-      message: Message;
-      routing: AdaptiveTopologyDecision | null;
-      routingMessage?: Message;
-      routingMessages?: Message[];
-      adaptiveState?: AdaptiveExecutionState | null;
-      adaptiveStates?: AdaptiveExecutionState[];
-    }>(`/api/ui/channels/${encodeURIComponent(id)}/messages`, {
+  /** Returns once the message is committed; Jev never delays a send, its advice arrives over realtime (#214). */
+  send: (id: string, body: string, threadId?: string | null, attachmentIds?: string[], requestId?: string) =>
+    req<{ message: Message }>(`/api/ui/channels/${encodeURIComponent(id)}/messages`, {
       method: "POST",
-      body: JSON.stringify({ body, threadId: threadId ?? null, attachmentIds, requestId, routing, lockScope }),
+      body: JSON.stringify({ body, threadId: threadId ?? null, attachmentIds, requestId }),
     }),
   upload: async (file: File): Promise<AttachmentMeta> => {
     const res = await humanSession.request("/api/ui/files", {

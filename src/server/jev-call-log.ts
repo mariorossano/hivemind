@@ -1,9 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import type { AdaptiveRoutingEvent, AdaptiveTopologyDecision } from '../shared/adaptive-topology.ts';
+import type { AdaptiveTopologyDecision } from '../shared/adaptive-topology.ts';
 import { encodeJevCallCursor, type JevCallCursor } from '../shared/jev-calls.ts';
 import type { JevCall, JevCallLogView, JevCallOutcome, JevCallSummary, JevCallTrigger, JevRequestGroup } from '../shared/jev-calls.ts';
 import { HiveError } from '../shared/types.ts';
+import { Storage } from './storage.ts';
 
 /** Human-only local history; the oldest calls of a project are pruned beyond this bound. */
 export const JEV_CALLS_PER_PROJECT = 1000;
@@ -34,6 +35,7 @@ export class JevCallLog {
       targetTopology: decision.targetTopology, targetWorkers: decision.targetWorkers, confidence: decision.confidence,
       reason: decision.reason, error: exchange.error, requestedModel: decision.requestedModel ?? null, model: decision.model, latencyMs: decision.latencyMs,
       inputTokens: decision.inputTokens, outputTokens: decision.outputTokens, outcome: null,
+      ...(decision.incoherent ? { incoherent: decision.incoherent } : {}),
     };
     this.db.prepare(`INSERT INTO jev_calls(id,route_id,project_id,channel_id,execution_id,created_at,summary,sent,received)
       VALUES(?,?,?,?,?,?,?,?,?)`).run(summary.id, summary.routeId, summary.projectId, summary.channelId, summary.executionId,
@@ -45,15 +47,15 @@ export class JevCallLog {
     return summary;
   }
 
-  /** Called with the routing audit event that consumed a Jev answer. */
-  settle(event: AdaptiveRoutingEvent): JevCallSummary | null {
-    if (!event.routeId) return null;
-    const outcome: JevCallOutcome = { kind: event.kind, applied: event.applied, appliedTopology: event.appliedTopology,
-      appliedWorkers: event.appliedWorkers, warning: event.warning };
-    const changed = this.db.prepare('UPDATE jev_calls SET outcome=? WHERE route_id=?').run(JSON.stringify(outcome), event.routeId).changes;
-    if (!changed) return null;
-    const row = this.db.prepare('SELECT summary,outcome FROM jev_calls WHERE route_id=?').get(event.routeId);
-    return row ? this.summaryOf(row) : null;
+  /** Retention: drops calls recorded before `cutoff`, in bounded batches. */
+  prune(cutoff: number, batch = 1000): number {
+    let removed = 0;
+    for (;;) {
+      const changes = Number(Storage.for(this.db).transaction(() => this.db.prepare(`DELETE FROM jev_calls WHERE rowid IN
+        (SELECT rowid FROM jev_calls WHERE created_at < ? LIMIT ?)`).run(cutoff, batch).changes));
+      removed += changes;
+      if (changes < batch) return removed;
+    }
   }
 
   private summaryOf(row: Record<string, unknown>): JevCallSummary {

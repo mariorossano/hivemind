@@ -74,6 +74,20 @@ test("workers cannot see or post in #brains", () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+test("channel references accept a display #name everywhere the server resolves them (#218)", () => {
+  const { hive, dir } = tempHive();
+  const brain = hive.identity.join({ role: "brain" });
+  const worker = hive.identity.join({ role: "worker", seniority: "mid" });
+  const general = hive.channels.getChannel("general", brain.agent.projectId);
+  assert.equal(hive.channels.getChannel("#general", brain.agent.projectId).id, general.id);
+  assert.equal(hive.channels.getChannel(" #General ").id, general.id);
+  const room = hive.channels.createChannel(brain.agent, { name: "ops", type: "private" });
+  hive.channels.invite(brain.agent, "#ops", [worker.agent.name]);
+  assert.ok(hive.channels.getChannel(room.id).memberIds.includes(worker.agent.id));
+  assert.equal(hive.messages.postMessage(brain.agent, { channel: "#ops", body: "hi" }).channelId, room.id);
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test("role is sticky and offline work waits", async () => {
   const { hive, dir } = tempHive();
   const first = hive.identity.join({ role: "worker", seniority: "junior", focus: "frontend" });
@@ -609,5 +623,15 @@ test("Human can delete an idle project but not one with online or waiting agents
   assert.equal(hive.projects.listProjects().length, 0);
   const again = hive.projects.createProject(human, { name: "Nuovo", slug: "nuovo" });
   assert.equal(again.slug, "nuovo");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("the picker's extra reactions are accepted; anything else is still rejected (#221)", () => {
+  const { hive, dir } = tempHive();
+  const human = hive.identity.getAgent("human");
+  const msg = hive.messages.postMessage(human, { channel: "general", body: "ship it" });
+  assert.equal(hive.messages.setReaction(human, msg.seq, "🎉", true).added, true);
+  assert.equal(hive.messages.setReaction(human, msg.seq, "❤️", true).message.reactions?.some((r) => r.emoji === "❤️"), true);
+  assert.throws(() => hive.messages.setReaction(human, msg.seq, "🦄", true), /Invalid reaction/);
   rmSync(dir, { recursive: true, force: true });
 });

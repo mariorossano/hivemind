@@ -1,8 +1,11 @@
 import { useEffect, useRef, useState } from "react";
+import type { AgentWork } from "../src/shared/tasks.ts";
 import type { Agent, InboxStatus } from "../src/shared/types.ts";
 import { Avatar } from "./Avatar.tsx";
 import { InboxReceipt, QueueBadge } from "./InboxReceipt.tsx";
 import { seniorityBars } from "./labels.ts";
+import { focusFirstMenuItem, menuKeyDown } from "./menu-keys.ts";
+import { agentStatusLine } from "./nav-model.ts";
 
 export function AgentList({
   agents,
@@ -12,6 +15,7 @@ export function AgentList({
   onLaunch,
   queued,
   inbox = {},
+  work = {},
   onOpen,
   onAskClear,
   onAskRemove,
@@ -24,6 +28,8 @@ export function AgentList({
   onLaunch?: () => void;
   queued: Record<string, number>;
   inbox?: Record<string, InboxStatus>;
+  /** Open work per agent id, shown as each brain's and worker's status line. */
+  work?: Record<string, AgentWork>;
   onOpen: (a: Agent) => void;
   onAskClear: (name: string) => void;
   onAskRemove: (name: string) => void;
@@ -52,6 +58,7 @@ export function AgentList({
           agent={a}
           queued={queued[a.id] ?? 0}
           inbox={inbox[a.id]}
+          status={agentStatusLine(a, work[a.id])}
           onOpen={() => onOpen(a)}
           menuOpen={menu === a.name}
           onMenu={() => setMenu(menu === a.name ? null : a.name)}
@@ -69,6 +76,7 @@ export function AgentList({
           agent={a}
           queued={queued[a.id] ?? 0}
           inbox={inbox[a.id]}
+          status={agentStatusLine(a, work[a.id])}
           onOpen={() => onOpen(a)}
           menuOpen={menu === a.name}
           onMenu={() => setMenu(menu === a.name ? null : a.name)}
@@ -83,8 +91,8 @@ export function AgentList({
           }}
         />
       ))}
-      <div className="subh bot-h">
-        <span>bot · context only</span>
+      <div className="subh bot-h" title="Integrations that post updates into channels. Bots never take tasks.">
+        <span>Bots · post updates, no tasks</span>
         <button type="button" className="plus" title={`Create bot in ${projectName}`}
           aria-label={`Create bot in ${projectName}`} onClick={onCreateBot}>+</button>
       </div>
@@ -104,6 +112,7 @@ function PersonRow({
   agent,
   queued,
   inbox,
+  status,
   onOpen,
   self,
   menuOpen,
@@ -116,6 +125,8 @@ function PersonRow({
   agent: Agent;
   queued?: number;
   inbox?: InboxStatus;
+  /** What the agent is doing, e.g. "blocked: API contract". */
+  status?: string | null;
   onOpen: () => void;
   self?: boolean;
   menuOpen?: boolean;
@@ -129,7 +140,7 @@ function PersonRow({
   const bars = seniorityBars(agent);
 
   useEffect(() => {
-    if (menuOpen) menuRef.current?.querySelector<HTMLButtonElement>('[role="menuitem"]')?.focus();
+    if (menuOpen) focusFirstMenuItem(menuRef.current);
   }, [menuOpen]);
 
   useEffect(() => {
@@ -163,6 +174,7 @@ function PersonRow({
               {agent.focus && <span className="focus" title={agent.focus}>{agent.focus}</span>}
             </span>
           )}
+          {status && <span className={`person-status ${status.startsWith("blocked:") ? "blocked" : ""}`} title={status}>{status}</span>}
           <InboxReceipt status={inbox} />
         </span>
       </button>
@@ -182,23 +194,7 @@ function PersonRow({
       )}
       {menuOpen && (
         <div className="person-menu" role="menu" aria-label={`Actions for ${agent.name}`}
-          onKeyDown={(event) => {
-            if (event.key === "Escape") {
-              event.preventDefault();
-              onCloseMenu?.();
-              actionRef.current?.focus();
-            } else if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
-              event.preventDefault();
-              const items = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'));
-              const index = items.indexOf(document.activeElement as HTMLButtonElement);
-              const next = event.key === "Home" ? 0 : event.key === "End" ? items.length - 1
-                : (index + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
-              items[next]?.focus();
-            } else if (event.key === "Tab") {
-              actionRef.current?.focus();
-              onCloseMenu?.();
-            }
-          }}>
+          onKeyDown={(event) => menuKeyDown(event, actionRef, () => onCloseMenu?.())}>
           {onManageCredential && (
             <button type="button" role="menuitem" aria-label={`Manage credentials for ${agent.name}`}
               onClick={() => { onCloseMenu?.(); onManageCredential(); }}>

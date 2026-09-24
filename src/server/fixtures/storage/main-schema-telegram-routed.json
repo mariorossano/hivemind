@@ -31,27 +31,9 @@
  },
  {
   "type": "index",
-  "name": "idx_adaptive_message_execution",
-  "tbl": "adaptive_topology_messages",
-  "sql": "CREATE INDEX idx_adaptive_message_execution ON adaptive_topology_messages(execution_id)"
- },
- {
-  "type": "index",
-  "name": "idx_adaptive_message_worker",
-  "tbl": "adaptive_topology_messages",
-  "sql": "CREATE INDEX idx_adaptive_message_worker ON adaptive_topology_messages(worker_id)"
- },
- {
-  "type": "index",
   "name": "idx_adaptive_topology_brain",
   "tbl": "adaptive_topology_executions",
   "sql": "CREATE INDEX idx_adaptive_topology_brain ON adaptive_topology_executions(brain_id,project_id)"
- },
- {
-  "type": "index",
-  "name": "idx_adaptive_topology_current",
-  "tbl": "adaptive_topology_executions",
-  "sql": "CREATE UNIQUE INDEX idx_adaptive_topology_current ON adaptive_topology_executions(channel_id,brain_id) WHERE current=1"
  },
  {
   "type": "index",
@@ -64,12 +46,6 @@
   "name": "idx_adaptive_topology_root",
   "tbl": "adaptive_topology_executions",
   "sql": "CREATE INDEX idx_adaptive_topology_root ON adaptive_topology_executions(root_message_id)"
- },
- {
-  "type": "index",
-  "name": "idx_adaptive_topology_tasks_execution",
-  "tbl": "adaptive_topology_tasks",
-  "sql": "CREATE INDEX idx_adaptive_topology_tasks_execution ON adaptive_topology_tasks(execution_id)"
  },
  {
   "type": "index",
@@ -88,6 +64,12 @@
   "name": "idx_attachments_message",
   "tbl": "attachments",
   "sql": "CREATE INDEX idx_attachments_message ON attachments(message_id)"
+ },
+ {
+  "type": "index",
+  "name": "idx_attachments_sha256",
+  "tbl": "attachments",
+  "sql": "CREATE INDEX idx_attachments_sha256 ON attachments(sha256)"
  },
  {
   "type": "index",
@@ -133,6 +115,12 @@
  },
  {
   "type": "index",
+  "name": "idx_room_events_channel_revision",
+  "tbl": "room_events",
+  "sql": "CREATE INDEX idx_room_events_channel_revision ON room_events(channel_id, revision)"
+ },
+ {
+  "type": "index",
   "name": "idx_telegram_failures_open",
   "tbl": "telegram_failures",
   "sql": "CREATE INDEX idx_telegram_failures_open ON telegram_failures(resolved_at, created_at)"
@@ -160,6 +148,12 @@
   "name": "idx_telegram_update_retry",
   "tbl": "telegram_update_failures",
   "sql": "CREATE INDEX idx_telegram_update_retry ON telegram_update_failures(bot_key, state, retry_at)"
+ },
+ {
+  "type": "index",
+  "name": "idx_threads_channel",
+  "tbl": "threads",
+  "sql": "CREATE INDEX idx_threads_channel ON threads(channel_id)"
  },
  {
   "type": "index",
@@ -277,12 +271,6 @@
  },
  {
   "type": "table",
-  "name": "adaptive_topology_evaluated",
-  "tbl": "adaptive_topology_evaluated",
-  "sql": "CREATE TABLE adaptive_topology_evaluated (execution_id TEXT NOT NULL, event_id TEXT NOT NULL, PRIMARY KEY(execution_id,event_id))"
- },
- {
-  "type": "table",
   "name": "adaptive_topology_events",
   "tbl": "adaptive_topology_events",
   "sql": "CREATE TABLE adaptive_topology_events ( id TEXT PRIMARY KEY, execution_id TEXT NOT NULL, channel_id TEXT NOT NULL, project_id TEXT NOT NULL, created_at INTEGER NOT NULL, snapshot TEXT NOT NULL)"
@@ -291,31 +279,13 @@
   "type": "table",
   "name": "adaptive_topology_executions",
   "tbl": "adaptive_topology_executions",
-  "sql": "CREATE TABLE adaptive_topology_executions ( execution_id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, brain_id TEXT NOT NULL, project_id TEXT NOT NULL, root_message_id TEXT NOT NULL, snapshot TEXT NOT NULL, current INTEGER NOT NULL DEFAULT 1)"
- },
- {
-  "type": "table",
-  "name": "adaptive_topology_locks",
-  "tbl": "adaptive_topology_locks",
-  "sql": "CREATE TABLE adaptive_topology_locks (channel_id TEXT NOT NULL, brain_id TEXT NOT NULL, topology TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(channel_id,brain_id))"
- },
- {
-  "type": "table",
-  "name": "adaptive_topology_messages",
-  "tbl": "adaptive_topology_messages",
-  "sql": "CREATE TABLE adaptive_topology_messages ( root_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE, worker_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE, execution_id TEXT NOT NULL, project_id TEXT NOT NULL, PRIMARY KEY(root_id,worker_id))"
- },
- {
-  "type": "table",
-  "name": "adaptive_topology_tasks",
-  "tbl": "adaptive_topology_tasks",
-  "sql": "CREATE TABLE adaptive_topology_tasks ( task_id TEXT PRIMARY KEY REFERENCES task_records(id) ON DELETE CASCADE, execution_id TEXT NOT NULL)"
+  "sql": "CREATE TABLE \"adaptive_topology_executions\" (execution_id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, brain_id TEXT NOT NULL, project_id TEXT NOT NULL, root_message_id TEXT NOT NULL, snapshot TEXT NOT NULL, UNIQUE(channel_id,brain_id))"
  },
  {
   "type": "table",
   "name": "agents",
   "tbl": "agents",
-  "sql": "CREATE TABLE agents ( id TEXT PRIMARY KEY, name TEXT UNIQUE NOT NULL, role TEXT NOT NULL, seniority TEXT, focus TEXT, token_hash TEXT NOT NULL, online INTEGER NOT NULL DEFAULT 0, last_seen_at INTEGER NOT NULL, created_at INTEGER NOT NULL, inbox_cursor INTEGER NOT NULL DEFAULT 0 , project_id TEXT)"
+  "sql": "CREATE TABLE agents ( id TEXT PRIMARY KEY, name TEXT UNIQUE NOT NULL, role TEXT NOT NULL, seniority TEXT, focus TEXT, token_hash TEXT NOT NULL, online INTEGER NOT NULL DEFAULT 0, last_seen_at INTEGER NOT NULL, created_at INTEGER NOT NULL, inbox_cursor INTEGER NOT NULL DEFAULT 0 , project_id TEXT, removed_at INTEGER)"
  },
  {
   "type": "table",
@@ -376,6 +346,12 @@
   "name": "inbox_receipt_totals",
   "tbl": "inbox_receipt_totals",
   "sql": "CREATE TABLE inbox_receipt_totals ( agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE, acknowledged_messages INTEGER NOT NULL, last_acknowledged_at INTEGER NOT NULL )"
+ },
+ {
+  "type": "table",
+  "name": "inbox_receipts",
+  "tbl": "inbox_receipts",
+  "sql": "CREATE TABLE inbox_receipts ( agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE, seq INTEGER NOT NULL, acknowledged_at INTEGER, PRIMARY KEY(agent_id, seq) )"
  },
  {
   "type": "table",
@@ -603,7 +579,19 @@
   "type": "trigger",
   "name": "adaptive_channel_deleted",
   "tbl": "channels",
-  "sql": "CREATE TRIGGER adaptive_channel_deleted AFTER DELETE ON channels BEGIN DELETE FROM adaptive_topology_evaluated WHERE execution_id IN (SELECT execution_id FROM adaptive_topology_executions WHERE channel_id=OLD.id); DELETE FROM adaptive_topology_events WHERE channel_id=OLD.id; DELETE FROM adaptive_topology_locks WHERE channel_id=OLD.id; DELETE FROM adaptive_topology_executions WHERE channel_id=OLD.id; END"
+  "sql": "CREATE TRIGGER adaptive_channel_deleted AFTER DELETE ON channels BEGIN DELETE FROM adaptive_topology_events WHERE channel_id=OLD.id; DELETE FROM adaptive_topology_executions WHERE channel_id=OLD.id; END"
+ },
+ {
+  "type": "trigger",
+  "name": "inbox_receipts_acknowledge",
+  "tbl": "inbox_deliveries",
+  "sql": "CREATE TRIGGER inbox_receipts_acknowledge AFTER UPDATE OF acknowledged_at ON inbox_deliveries WHEN NEW.acknowledged_at IS NOT NULL BEGIN UPDATE inbox_receipts SET acknowledged_at = NEW.acknowledged_at WHERE agent_id = NEW.agent_id AND acknowledged_at IS NULL AND seq IN (SELECT CAST(value AS INTEGER) FROM json_each(NEW.seqs)); END"
+ },
+ {
+  "type": "trigger",
+  "name": "inbox_receipts_offer",
+  "tbl": "inbox_deliveries",
+  "sql": "CREATE TRIGGER inbox_receipts_offer AFTER INSERT ON inbox_deliveries BEGIN INSERT OR IGNORE INTO inbox_receipts(agent_id, seq, acknowledged_at) SELECT NEW.agent_id, CAST(value AS INTEGER), NEW.acknowledged_at FROM json_each(NEW.seqs); UPDATE inbox_receipts SET acknowledged_at = NEW.acknowledged_at WHERE NEW.acknowledged_at IS NOT NULL AND agent_id = NEW.agent_id AND acknowledged_at IS NULL AND seq IN (SELECT CAST(value AS INTEGER) FROM json_each(NEW.seqs)); END"
  },
  {
   "type": "trigger",
@@ -663,18 +651,18 @@
   "type": "trigger",
   "name": "upload_usage_change",
   "tbl": "attachments",
-  "sql": "CREATE TRIGGER upload_usage_change AFTER UPDATE OF bytes ON attachments BEGIN UPDATE upload_usage SET bytes = bytes + NEW.bytes - OLD.bytes WHERE singleton = 1; END"
+  "sql": "CREATE TRIGGER upload_usage_change AFTER UPDATE OF bytes, sha256 ON attachments BEGIN UPDATE upload_usage SET bytes = (SELECT COALESCE(SUM(b), 0) FROM (SELECT MAX(bytes) AS b FROM attachments GROUP BY sha256)) WHERE singleton = 1; END"
  },
  {
   "type": "trigger",
   "name": "upload_usage_delete",
   "tbl": "attachments",
-  "sql": "CREATE TRIGGER upload_usage_delete AFTER DELETE ON attachments BEGIN UPDATE upload_usage SET bytes = bytes - OLD.bytes WHERE singleton = 1; END"
+  "sql": "CREATE TRIGGER upload_usage_delete AFTER DELETE ON attachments WHEN NOT EXISTS (SELECT 1 FROM attachments WHERE sha256 = OLD.sha256) BEGIN UPDATE upload_usage SET bytes = bytes - OLD.bytes WHERE singleton = 1; END"
  },
  {
   "type": "trigger",
   "name": "upload_usage_insert",
   "tbl": "attachments",
-  "sql": "CREATE TRIGGER upload_usage_insert AFTER INSERT ON attachments BEGIN UPDATE upload_usage SET bytes = bytes + NEW.bytes WHERE singleton = 1; END"
+  "sql": "CREATE TRIGGER upload_usage_insert AFTER INSERT ON attachments WHEN (SELECT COUNT(*) FROM attachments WHERE sha256 = NEW.sha256) = 1 BEGIN UPDATE upload_usage SET bytes = bytes + NEW.bytes WHERE singleton = 1; END"
  }
 ]

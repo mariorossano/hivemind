@@ -7,7 +7,7 @@ and replies beyond the initial page. The destination is briefly highlighted and
 receives keyboard focus. Clicking the conversation name keeps normal navigation.
 
 The jump loads a bounded historical page ending at the destination; it does not
-load the whole conversation. Use Return to live or Refresh thread to resume live
+load the whole conversation. Use Jump to recent or Refresh thread to resume live
 navigation. New messages cannot displace the destination while viewing history.
 Repeat the badge action to reach remaining unread messages. If another window
 already read them, the UI reports that none remain and refreshes the counts.
@@ -44,6 +44,13 @@ No schema migration, agent restart, permission change or monitor change is
 required by this feature. Deploy the UI and server endpoint together; a frontend
 asset refresh alone cannot add the endpoint to an already-running server.
 
+The split navigation/badge buttons retain the active page's accessibility marker
+and work in both the project sidebar and the mobile DM list. The existing
+"New messages" divider, message grouping, long-press toolbar, system rows and
+archived-channel disclosure remain intact.
+A jump also reveals Messages when Tasks, Contract or Decisions was selected,
+without discarding the composer's draft. Those tabs remain selectable afterwards.
+
 ## Verification
 
 Regression coverage includes ordinary roots, old-thread replies, sparse and
@@ -56,4 +63,6 @@ destination lookups (success, empty and failure) are tested against explicit
 live navigation and a subsequent badge click. Further coverage checks completed
 anchors through automatic refresh and late reflow, paging during lookup, and
 empty/failed replacement lookups after pending/failed target loads. Tests use
-isolated fixtures, not real Human receipts.
+isolated fixtures, not real Human receipts. Mobile DM tests cover roots, replies
+and system messages; tab-switch tests cover repeated root and reply jumps from
+Tasks, Contract and Decisions while preserving drafts.

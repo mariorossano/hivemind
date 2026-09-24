@@ -31,7 +31,7 @@ class BrowserSocket {
   close() { this.closed = true; this.onclose?.(); }
 }
 
-test('a delayed room refresh preserves a newer live channel and its selection', async t => {
+test('a room event archives from its payload without a snapshot refetch and keeps a newer live channel selected', async t => {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'archived-navigation-'));
   const hive = new Hive(path.join(dir, 'hive.db'));
   const human = hive.identity.getAgent('human'), brain = hive.identity.join({ role: 'brain' }).agent;
@@ -42,17 +42,11 @@ test('a delayed room refresh preserves a newer live channel and its selection', 
       completion: ['Human archives'], originTaskId: null } } });
   window.happyDOM.setURL(`http://localhost/#/c/${room.id}`);
   const app = createApp(hive);
-  let hold = false;
-  let signalStarted!: () => void, release!: () => void;
-  const started = new Promise<void>(resolve => { signalStarted = resolve; });
-  const pending = new Promise<void>(resolve => { release = resolve; });
+  let snapshots = 0;
   t.mock.method(globalThis, 'fetch', async (url: string, init?: RequestInit) => {
     if (url === '/api/ui/session') return Response.json({ ok: true });
-    const response = await app.request(url, init);
-    if (hold && url === '/api/ui/snapshot') {
-      hold = false; signalStarted(); await pending;
-    }
-    return response;
+    if (url === '/api/ui/snapshot') snapshots++;
+    return app.request(url, init);
   });
   const originalSocket = globalThis.WebSocket;
   globalThis.WebSocket = BrowserSocket as unknown as typeof WebSocket;
@@ -64,27 +58,31 @@ test('a delayed room refresh preserves a newer live channel and its selection', 
     hive.bus.on(type, listener); return listener;
   });
   t.after(async () => {
-    release();
     await act(async () => root.unmount());
     events.forEach((type, i) => hive.bus.off(type, listeners[i]!));
     globalThis.WebSocket = originalSocket; host.remove(); hive.db.close(); rmSync(dir, { recursive: true, force: true });
   });
   await act(async () => root.render(<App />));
-  hold = true;
+  const before = snapshots;
   await act(async () => {
     hive.rooms.event(human, room.id, { requestId: 'archive', expectedRevision: 1, action: { type: 'archive', reason: 'Done' } });
-    await started;
   });
+  assert.equal(snapshots, before, 'the room event carries the archive state; no snapshot refetch');
+  assert.ok(host.querySelector('.archived-channels'), 'archive metadata updates live');
   let newer!: ReturnType<typeof hive.channels.createChannel>;
   await act(async () => { newer = hive.channels.createChannel(brain, { name: 'new-live-channel', type: 'public' }); });
   const find = () => [...host.querySelectorAll('button')].find(button => button.textContent?.includes('# new-live-channel'));
   assert.ok(find(), 'new channel arrived over WebSocket');
   await act(async () => find()!.click());
   assert.equal(window.location.hash, `#/c/${newer.id}`);
-  await act(async () => release());
-  assert.ok(find(), 'the late room response must not erase the newer live channel');
-  assert.equal(window.location.hash, `#/c/${newer.id}`, 'the late room response must not navigate away');
-  assert.ok(host.querySelector('.archived-channels'), 'archive metadata still updates');
+  assert.ok(host.querySelector('.archived-channels'), 'a newer channel does not undo the archive state');
+  const archived = () => host.querySelector<HTMLDetailsElement>('.archived-channels')!;
+  const archivedButton = [...archived().querySelectorAll('button')].find(button => button.textContent?.includes('# existing-room'))!;
+  await act(async () => archivedButton.click());
+  assert.equal(archived().open, true, 'selecting an archived room reveals the section');
+  await act(async () => find()!.click());
+  assert.equal(window.location.hash, `#/c/${newer.id}`);
+  assert.equal(archived().open, true, 'leaving an archived room must not collapse the section');
 });
 
 test('mounted Human App follows task review and contract history without offering generic task status edits', async t => {
@@ -126,18 +124,21 @@ test('mounted Human App follows task review and contract history without offerin
   const thread = () => host.querySelector('aside.thread');
   assert.ok(thread(), 'the URL opens the persisted task thread');
   assert.match(thread()!.textContent!, /Review the mounted fixture/);
+  const contractTab = [...host.querySelectorAll<HTMLButtonElement>('[role=tab]')].find(tab => tab.textContent === 'Contract');
+  assert.ok(contractTab, 'rooms show their contract in a tab');
+  await act(async () => contractTab.click());
   assert.match(host.textContent!, /A visible shared contract/);
-  assert.equal(thread()!.querySelector('.thread-tools select'), null, 'Human cannot use generic status to accept-complete a task');
+  assert.equal(thread()!.querySelector('.thread-tools [data-thread-status]'), null, 'Human cannot use generic status to accept-complete a task');
   const event = async (requestId: string, action: unknown, actor = worker) => {
     await act(async () => { hive.tasks.event(actor, initial.id, { requestId,
       expectedRevision: hive.tasks.get(actor, initial.id).revision, action }); });
   };
   await event('app-accept', { type: 'accept' });
-  assert.match(thread()!.querySelector('.st')!.textContent!, /^accepted$/);
+  assert.match(thread()!.querySelector('.thread-tools .task-chip')!.textContent!, /^accepted$/);
   await event('app-result', { type: 'result', result: { summary: 'Fixture inspected', artifacts: [], checks: [], gaps: [], evidenceSeqs: [] } });
-  assert.match(thread()!.querySelector('.st')!.textContent!, /result submitted/);
+  assert.match(thread()!.querySelector('.thread-tools .task-chip')!.textContent!, /result submitted/);
   await event('app-review', { type: 'review', decision: 'accepted', summary: 'Independent brain review', evidenceSeqs: [] }, brain);
-  assert.match(thread()!.querySelector('.st')!.textContent!, /accepted complete/);
+  assert.match(thread()!.querySelector('.thread-tools .task-chip')!.textContent!, /accepted complete/);
   assert.match(thread()!.textContent!, /Independent brain review/);
   const history = [...host.querySelectorAll('button')].find(button => button.textContent === 'Show recent contract history');
   assert.ok(history);
@@ -146,7 +147,7 @@ test('mounted Human App follows task review and contract history without offerin
   assert.ok(requests.some(url => new URL(url, 'http://localhost').pathname.endsWith('/room/history')));
   // A hello/reconnect must reconcile from current HTTP state, not reset review.
   await act(async () => BrowserSocket.current.event('hello', {}));
-  assert.match(thread()!.querySelector('.st')!.textContent!, /accepted complete/);
+  assert.match(thread()!.querySelector('.thread-tools .task-chip')!.textContent!, /accepted complete/);
   assert.equal(hive.rooms.peek(channel.id)!.state, 'active');
 
   // Completing a structured task must not break normal Human replies/reactions,
@@ -173,6 +174,8 @@ test('mounted Human App follows task review and contract history without offerin
   assert.ok(close);
   await act(async () => close.click());
   assert.equal(thread(), null);
+  const messagesTab = [...host.querySelectorAll<HTMLButtonElement>('[role=tab]')].find(tab => tab.textContent === 'Messages')!;
+  await act(async () => messagesTab.click());
   await type('main.desk textarea', 'Ordinary channel chat still works.');
   const ordinary = hive.messageQueries.listMessages(human, channel.id).messages.find(message => message.body === 'Ordinary channel chat still works.');
   assert.ok(ordinary); assert.equal(hive.tasks.has(ordinary.id), false);
@@ -180,6 +183,6 @@ test('mounted Human App follows task review and contract history without offerin
   const reopen = rootMessage?.querySelector<HTMLButtonElement>('button.replies');
   assert.ok(reopen);
   await act(async () => reopen.click());
-  assert.match(thread()!.querySelector('.st')!.textContent!, /accepted complete/);
-  assert.equal(thread()!.querySelector('.thread-tools select'), null);
+  assert.match(thread()!.querySelector('.thread-tools .task-chip')!.textContent!, /accepted complete/);
+  assert.equal(thread()!.querySelector('.thread-tools [data-thread-status]'), null);
 });

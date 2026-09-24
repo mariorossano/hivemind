@@ -46,7 +46,7 @@ const OWNERSHIP: Record<string, { modules: string[]; tables: string[] }> = {
     modules: ["inbox-delivery.ts", "inbox-reader.ts", "read-state.ts", "send-requests.ts", "upload-budget.ts"],
     tables: ["projects", "agents", "channels", "channel_members", "messages", "threads", "reactions", "reads",
       "message_reads", "ui_read_revision", "attachments", "bot_credentials", "bot_events", "inbox_sessions",
-      "inbox_deliveries", "inbox_early_receipts", "inbox_receipt_totals", "send_requests", "upload_reservations", "upload_usage"],
+      "inbox_deliveries", "inbox_receipts", "inbox_early_receipts", "inbox_receipt_totals", "send_requests", "upload_reservations", "upload_usage"],
   },
   // Structured tasks, advisory claims, rooms, Human decisions and routing evidence.
   coordination: {
@@ -73,6 +73,9 @@ const OWNERSHIP: Record<string, { modules: string[]; tables: string[] }> = {
 const CROSS_DOMAIN_EXCEPTIONS: Record<string, string> = {
   // The latency-sensitive inbox scan flags structured-task mail in the same statement it pages with.
   "inbox-reader.ts task_events": "task flag and bounded envelope of delivered task messages",
+  // The For you predicate classifies decision threads and addressed task events in the statement it pages and counts with.
+  "read-state.ts decision_requests": "For you: messages in a Human decision request's thread",
+  "read-state.ts task_events": "For you: structured task events addressed to the reader",
   // The evidence store also runs standalone (evidence export); it guards the channel foreign key itself.
   "adaptive-evidence.ts channels": "existence guard before recording gap evidence for a deleted channel",
 };

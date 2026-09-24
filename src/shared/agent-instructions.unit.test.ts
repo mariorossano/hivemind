@@ -8,7 +8,6 @@ import { standingOrders } from "./standing-orders.ts";
 import { WAIT_NEXT, type Agent } from "./types.ts";
 import { assignTaskSchema, taskEventSchema } from "./tasks.ts";
 import { roomEventSchema } from "./rooms.ts";
-import { executionIdSchema } from "./mutation.ts";
 import { JOIN_SESSION, PARAM_DESCRIPTIONS, SEARCH_NEXT, TOOL_DESCRIPTIONS, joinNext, type ToolName } from "../mcp/tool-text.ts";
 
 const agent = (role: AgentRole): Agent => ({
@@ -40,7 +39,7 @@ function schemaDescriptions(): string[] {
       else walk(value);
     }
   };
-  for (const schema of [assignTaskSchema, taskEventSchema, roomEventSchema, executionIdSchema]) {
+  for (const schema of [assignTaskSchema, taskEventSchema, roomEventSchema]) {
     walk(z.toJSONSchema(schema, { unrepresentable: "any" }));
   }
   return [...found];
@@ -64,14 +63,14 @@ const COVERAGE: Record<AgentRuleId, readonly Evidence[]> = {
   "session.real-join": [{ where: "launch", phrase: "Use a real tool call; never simulate a tool result or invent an agent name." },
     { where: "launch", phrase: "use the host's available tool discovery to load Hivemind's tools first" },
     { where: "launch", phrase: "If join is unavailable or fails, report the startup failure and stop." }],
-  "session.read-orders": [{ where: "launch", phrase: "read your standing orders (a first join returns them; otherwise call standing_orders) and follow them" },
-    { where: "join", phrase: "if they are not in your context, call standing_orders" }],
+  "session.read-orders": [{ where: "launch", phrase: "read your standing orders (a first join returns them; otherwise call whoami with orders=true) and follow them" },
+    { where: "join", phrase: "if they are not in your context, call whoami with orders=true" }],
   "session.identity-fixed": [{ where: "orders", phrase: "Your identity is fixed: never change role or seniority." }],
   "session.resume-by-name": [{ where: "join", phrase: "resume=<your name> returns to your identity without credentials, superseding its older session" }],
   "session.same-process-join": [{ where: "join", phrase: "Repeated join keeps this process's identity; another identity needs a new MCP process." }],
   "session.resume-state": [{ where: "orders", phrase: "After a resume or replacement, reread get_handoffs, contracts and task state before acting (saved reports may be stale)." },
     { where: "orders", phrase: "Never silently take over another brain's tasks or replay old observations." },
-    { where: "get_handoff", phrase: "it restores no model context and authorizes no scope change" }],
+    { where: "get_handoffs", phrase: "it restores no model context and authorizes no scope change" }],
   "wait.idle-first": [{ where: "orders", phrase: "Do not read the repo or run git until mail says what to do." },
     { where: "launch", phrase: "Do not explore the repo until mail says what to do." }],
   "wait.once-no-args": [{ where: "orders", phrase: "Call wait once with no arguments and no timeout." },
@@ -104,11 +103,11 @@ const COVERAGE: Record<AgentRuleId, readonly Evidence[]> = {
   "delivery.wake-defaults": [{ where: "orders", phrase: "wait wakes you for DMs, @mentions, control messages and your private channels" },
     { where: "orders", phrase: ", plus #brains;", roles: ["brain"] },
     { where: "orders", phrase: "public channels only when you are addressed or subscribed" }],
-  "delivery.subscriptions": [{ where: "set_subscription", phrase: "[] mutes non-directed traffic; thread rules beat channel rules; direct recipients, @mentions and control always arrive." },
-    { where: "set_subscription", phrase: "Filters match types, not content, apply to mail not yet offered, and never grant access or replay history." },
-    { where: "reset_subscription", phrase: "Not a mute: use set_subscription with []." }],
-  "delivery.task-event-wake": [{ where: "reset_subscription", phrase: "task participants wake" },
-    { where: "set_subscription", phrase: "observers follow tasks this way" }],
+  "delivery.subscriptions": [{ where: "subscriptions", phrase: "[] mutes non-directed traffic; thread rules beat channel rules; direct recipients, @mentions and control always arrive." },
+    { where: "subscriptions", phrase: "Filters match types, not content, apply to mail not yet offered, and never grant access or replay history." },
+    { where: "subscriptions", phrase: "Not a mute: use mode=set with eventTypes []." }],
+  "delivery.task-event-wake": [{ where: "subscriptions", phrase: "task participants wake" },
+    { where: "subscriptions", phrase: "observers follow tasks this way" }],
   "msg.address": [{ where: "orders", phrase: "Address people as @Name." }],
   "msg.short": [{ where: "orders", phrase: "Keep messages short: one idea, cite seq numbers, relative worktree and branch. No absolute home paths, pasted AGENTS.md or diffs (the diff is in git)." }],
   "msg.recipients": [{ where: "orders", phrase: "Use recipients to wake only the intended people." }, { where: "param", phrase: "Grants no access." }],
@@ -159,8 +158,8 @@ const COVERAGE: Record<AgentRuleId, readonly Evidence[]> = {
   "worker.room-ack": [{ where: "orders", phrase: "In a room, read get_task/get_room and room_event acknowledge the current contractVersion before continuing (concurrent acknowledgements are safe)." }],
   "worker.peer-clarify": [{ where: "orders", phrase: "Clarify directly with addressed peers, but replying to a peer does not finish your own assigned task: continue it and submit its result before idling." }],
   "worker.stop-request": [{ where: "orders", phrase: "On a room stop request, stop incompatible activity and send room_event stopped, not a result. Hivemind cannot interrupt external tools for you." }],
-  "brain.coordinate": [{ where: "orders", phrase: "Coordinate and delegate to workers; when Hivemind's adaptive topology directive says SINGLE, do the work yourself." },
-    { where: "launch", phrase: "Coordinate and delegate to workers; when Hivemind's adaptive topology directive says SINGLE, do the work yourself." }],
+  "brain.coordinate": [{ where: "orders", phrase: "Coordinate and delegate to workers, or do the work yourself when that serves the request better: you decide." },
+    { where: "launch", phrase: "Coordinate and delegate to workers, or do the work yourself when that serves the request better: you decide." }],
   "brain.talk": [{ where: "orders", phrase: "Talk with Human, brains (#brains) and workers; post progress publicly when the hive should see it." }],
   "brain.assign": [{ where: "orders", phrase: "Delegate by choosing a specific worker (you pick seniority) in a DM thread or an authorized scoped room: one task = one thread." }],
   "brain.offline-worker": [{ where: "orders", phrase: "If the worker is offline, leave the message there; do not try to wake it." }],
@@ -173,19 +172,9 @@ const COVERAGE: Record<AgentRuleId, readonly Evidence[]> = {
     { where: "set_thread_status", phrase: "Set an optional status on a free-form thread" }],
   "brain.clear-context": [{ where: "orders", phrase: "Send clear_context only to a worker stuck in a long session, never automatically at done or after a report." }],
   "brain.human-admin": [{ where: "orders", phrase: "Human (admin) sees every conversation; treat DMs as private from workers' point of view." }],
-  "topology.directive": [{ where: "orders", phrase: "Its \"[Hivemind adaptive topology · ...]\" directive is the server-enforced mode for that one request and never changes your permanent brain role." }],
-  "topology.jev-routing": [{ where: "orders", phrase: "Jev routes every Human message addressed to you, in any channel or thread; workers never go through Jev." }],
-  "topology.concurrent": [{ where: "orders", phrase: "Several requests may run at once, each with its own executionId" }],
-  "topology.execution-id": [{ where: "orders", phrase: "pass it on every coordination action for that request. Delegation (send/attach to a worker, assign_task, task_event revise, room_event configure/staff) without it is rejected while you have an active execution. Never reuse or invent one." },
-    { where: "param", phrase: "Brain: the served request's executionId (standing orders)." }],
-  "topology.single": [{ where: "orders", phrase: "SINGLE: do the work yourself in this session; do not delegate." }],
-  "topology.brain-plus-one": [{ where: "orders", phrase: "BRAIN+1: at most one active worker." }],
-  "topology.multi-dm": [{ where: "orders", phrase: "MULTI-DM: separate structured tasks/DMs within the worker budget; no new room work." }],
-  "topology.room": [{ where: "orders", phrase: "ROOM: new delegated work only through the scoped room contract, within the worker budget. Older DM tasks may finish, but start no new or replacement DM work." }],
-  "topology.revalidation": [{ where: "orders", phrase: "Hivemind revalidates Jev at coordination boundaries and may switch mode, even between non-adjacent modes." }],
-  "topology.409": [{ where: "orders", phrase: "Never bypass a 409 adaptive-routing rejection: retry only after the routing state or a Human lock changes." }],
-  "topology.de-escalation": [{ where: "orders", phrase: "A pending de-escalation means: finish or reconcile useful running work, start no new delegation." }],
-  "topology.locks": [{ where: "orders", phrase: "Human task/conversation locks override automatic changes; Jev recommendations stay advisory until the lock is removed." }],
+  "jev.advice": [{ where: "orders", phrase: "When Jev is enabled it advises you on the Human requests you own, after they are posted: your next action in the request's thread or channel (send, attach, assign_task, task_event, room_event, set_thread_status), or a wait delivering its mail, carries the suggestion as jevAdvice. Otherwise the field is absent. Workers never get Jev advice." }],
+  "jev.advisory": [{ where: "orders", phrase: "jevAdvice is advisory only: decide the plan yourself from the task. Human instructions always override it, and Hivemind never blocks or reshapes an action because of it." }],
+  "jev.not-enforced": [{ where: "orders", phrase: "SINGLE, BRAIN+1, MULTI-DM and ROOM are suggestions, not enforced modes: there is no worker budget, lock or executionId. Treat an uncertain, incoherent, unavailable or rejected jevAdvice as no advice." }],
   "task.optional": [{ where: "orders", phrase: "Tasks are optional; free-form chat never changes task state." },
     { where: "set_thread_status", phrase: "Structured tasks change state only through task_event." }],
   "task.revision": [{ where: "orders", phrase: "get_task is authoritative: pass its revision as expectedRevision." },
@@ -215,11 +204,11 @@ const COVERAGE: Record<AgentRuleId, readonly Evidence[]> = {
   "room.reconcile": [{ where: "orders", phrase: "After rules or staffing change, reconcile each affected task as continue or stop, and require current rule acknowledgements." }],
   "room.summarize": [{ where: "orders", phrase: "In a finite room, only the coordinating brain summarizes decisions and artifacts back to the originating task, then archives under the agreed completion policy." }],
   "advisory.decision": [{ where: "request_human_decision", phrase: "the recommendation is advisory and never applies on expiry" },
-    { where: "get_task_decisions", phrase: "Stale or expired recommendations never auto-apply." }],
+    { where: "get_decisions", phrase: "Stale or expired recommendations never auto-apply." }],
   "advisory.capabilities": [{ where: "set_capabilities", phrase: "Declarations never permit launching or changing a runtime." },
     { where: "get_worker_capabilities", phrase: "Declarations are not verified." }],
-  "advisory.routing": [{ where: "suggest_workers", phrase: "Never assigns or changes a model" },
-    { where: "record_routing_override", phrase: "Not an assignment or a ranking; ownership, claims and running terminals stay unchanged." }],
+  "advisory.routing": [{ where: "worker_match_suggest", phrase: "Never assigns or changes a model" },
+    { where: "worker_match_override", phrase: "Not an assignment or a ranking; ownership, claims and running terminals stay unchanged." }],
 };
 
 function textsFor(where: Where, role: AgentRole): string[] {
@@ -288,6 +277,7 @@ test("no sentence is duplicated between standing orders and MCP text, or within 
 const LENGTH_EXCEPTIONS: Partial<Record<ToolName, string>> = {
   task_event: 'lists every action shape; models omitted action.type without them',
   room_event: 'lists every action shape; models omitted action.type without them',
+  subscriptions: 'merges list/set/reset (#218) and lists every mode shape explicitly (#205)',
 };
 
 test("tool and parameter descriptions stay within their length budgets", () => {
@@ -307,9 +297,10 @@ test("every registered MCP tool takes its description from TOOL_DESCRIPTIONS", (
   assert.deepEqual(registered.map(match => match[1]).sort(), Object.keys(TOOL_DESCRIPTIONS).sort());
 });
 
-test("brain launch prompts carry the SINGLE exception and nothing forbids implementing (#149)", () => {
+test("brain launch prompts let the brain do the work itself and nothing forbids implementing (#149, #211)", () => {
   for (const prompt of launch.brain) {
-    assert.match(prompt, /when Hivemind's adaptive topology directive says SINGLE, do the work yourself/);
+    assert.match(prompt, /or do the work yourself when that serves the request better: you decide/);
+    assert.doesNotMatch(prompt, /executionId|adaptive topology directive/);
   }
   for (const text of [...launch.brain, ...launch.worker, orders.brain, orders.worker, ...Object.values(TOOL_DESCRIPTIONS), ...params, WAIT_NEXT]) {
     assert.doesNotMatch(text, /do not implement|don't implement|never implement/i);
@@ -325,4 +316,17 @@ test("action tool descriptions list every action type of their schema", async ()
   for (const type of types(taskActionSchema as never)) assert.ok(TOOL_DESCRIPTIONS.task_event.includes(`{type:"${type}"`), `task_event lacks ${type}`);
   for (const type of types(roomActionSchema as never)) assert.ok(TOOL_DESCRIPTIONS.room_event.includes(`{type:"${type}"`), `room_event lacks ${type}`);
   assert.ok(TOOL_DESCRIPTIONS.decision_event.includes('{type:"withdraw"'));
+  const { SUBSCRIPTION_MODES } = await import("../mcp/index.ts");
+  for (const mode of SUBSCRIPTION_MODES) assert.ok(TOOL_DESCRIPTIONS.subscriptions.includes(`{mode:"${mode}"`), `subscriptions lacks ${mode}`);
+});
+
+test("merged tools keep one name per concept and capability matching never reads as Jev routing (#218)", () => {
+  const names = Object.keys(TOOL_DESCRIPTIONS);
+  for (const gone of ["standing_orders", "get_handoff", "export_task_timeline", "get_decision", "get_task_decisions",
+    "set_subscription", "reset_subscription", "suggest_workers", "record_routing_outcome", "record_routing_override"])
+    assert.ok(!names.includes(gone), `${gone} should be merged or renamed`);
+  for (const name of names.filter(name => name.startsWith("worker_match_")))
+    assert.match(TOOL_DESCRIPTIONS[name as ToolName], /^Capability matching \((?:unrelated to|not) Jev/);
+  const texts = [...launch.brain, ...launch.worker, orders.brain, orders.worker, ...Object.values(TOOL_DESCRIPTIONS), ...joinTexts, WAIT_NEXT];
+  for (const text of texts) assert.doesNotMatch(text, /\b(?:standing_orders|get_handoff|export_task_timeline|get_task_decisions|set_subscription|reset_subscription|suggest_workers|record_routing_\w+)\b/);
 });

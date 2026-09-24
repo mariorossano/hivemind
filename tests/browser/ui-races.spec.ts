@@ -135,19 +135,23 @@ async function installSnapshot(page: Page, current: () => Snapshot) {
   });
   await page.route("**/api/ui/snapshot", async route => fulfillJson(route, reads()));
   await page.route("**/api/ui/read-state", async route => fulfillJson(route, reads()));
+  await page.route("**/api/ui/nav-status", async route => fulfillJson(route, { awaitingDecisions: {}, agentWork: {} }));
   await page.route("**/api/ui/read", async route => {
     const receipt = route.request().postDataJSON() as { messageSeqs: number[] };
     harness.receipts.push(receipt.messageSeqs);
     harness.revision++;
     await fulfillJson(route, reads());
   });
-  await page.route("**/api/ui/mentions?*", async route => fulfillJson(route, {
+  await page.route("**/api/ui/activity?*", async route => fulfillJson(route, {
     readInstance: "browser-fixture", readRevision: harness.revision, readSeq: harness.seq,
-    messages: [], hasMore: false,
+    items: [], hasMore: false,
   }));
   const room: RoomView = { room: null, tasks: [], activeTaskCount: 0, tasksHasMore: false,
     nextTaskCursor: null, links: [], unmanagedBots: [] };
   await page.route("**/api/ui/channels/*/room", async route => fulfillJson(route, room));
+  // The channel tabs count the channel's tasks and decisions.
+  await page.route("**/api/ui/channels/*/tasks", async route => fulfillJson(route, { items: [], hasMore: false }));
+  await page.route("**/api/ui/decisions?*", async route => fulfillJson(route, { items: [], awaiting: 0, warning: "" }));
 }
 
 async function installMessages(
@@ -224,6 +228,39 @@ for (const inThread of [false, true]) for (const alreadyOpen of [false, true]) {
     // Repeated activation works even when the channel/thread selection is identical.
     await scope.locator('.stream').evaluate(el => { el.scrollTop = 0; });
     await badge.click(); await expect(row).toBeInViewport();
+  });
+}
+
+for (const tab of ['Tasks', 'Contract', 'Decisions']) for (const inThread of [false, true]) {
+  test(`unread badge reveals Messages from ${tab} (thread=${inThread})`, async ({ page }) => {
+    const p = project('alpha', 'Alpha Hive'), a = channel('a', 'Alpha', p);
+    const snap = { ...snapshot([p], [a]), unread: { a: 1 } };
+    const threadId = inThread ? 'root' : null;
+    await installSnapshot(page, () => snap); await installSocketHarness(page);
+    await page.route('**/api/ui/channels/a/last-unread', route =>
+      fulfillJson(route, { target: { channelId: a.id, threadId, seq: 240 } }));
+    await installMessages(page, async (route, _, requestedThread) => {
+      const targeted = new URL(route.request().url()).searchParams.get('beforeSeq') === '241';
+      const messages = targeted ? [message('target', 240, a.id, 'Unread destination', requestedThread,
+        { authorId: 'worker', authorName: 'Worker', authorRole: 'worker' })] : [];
+      await fulfillJson(route, { ...payload(a, messages), threadId: requestedThread, hasNewer: targeted });
+    });
+    await page.goto('/#/c/a');
+    await page.getByRole('textbox', { name: 'Message #Alpha', exact: true }).fill('Keep my draft');
+    const view = page.getByRole('tab', { name: tab, exact: true });
+    const badge = page.getByRole('button', { name: 'Jump to last unread message in Alpha (1 unread)' });
+    for (let repeat = 0; repeat < 2; repeat++) {
+      await view.click();
+      await expect(page.locator('#channel-panel-messages')).toBeHidden();
+      await badge.click();
+      await expect(page.getByRole('tab', { name: 'Messages', exact: true })).toHaveAttribute('aria-selected', 'true');
+      const row = page.locator(inThread ? 'aside.thread' : 'main.desk').locator('[data-message-seq="240"]');
+      await expect(row).toBeVisible(); await expect(row).toBeFocused();
+      await expect(row).toHaveClass(/unread-target/);
+      await expect(page.locator('main.desk').getByRole('textbox', { name: 'Message #Alpha', exact: true })).toHaveValue('Keep my draft');
+    }
+    await view.click();
+    await expect(view).toHaveAttribute('aria-selected', 'true');
   });
 }
 
@@ -315,7 +352,7 @@ test(`unread anchor releases on explicit live navigation (thread=${inThread}, ke
   await page.getByRole('button', { name: 'Jump to last unread message in Alpha (1 unread)' }).click();
   const scope = page.locator(inThread ? 'aside.thread' : 'main.desk');
   await expect(scope.locator('[data-message-seq="240"]')).toHaveClass(/unread-target/);
-  const live = scope.getByRole('button', { name: inThread ? 'New replies — refresh thread' : 'New messages — return to live', exact: true });
+  const live = scope.getByRole('button', { name: inThread ? 'New replies — refresh thread' : 'New messages — jump to recent', exact: true });
   if (keyboard) { await live.focus(); await page.keyboard.press('Enter'); } else await live.click();
   await expect(scope.locator('[data-message-seq="260"]')).toBeInViewport();
 });
@@ -423,7 +460,7 @@ for (const inThread of [false, true]) {
     const scope = page.locator(inThread ? 'aside.thread' : 'main.desk');
     await badge.click(); await expect(scope.locator('[data-message-seq="240"]')).toHaveClass(/unread-target/);
     await badge.click(); await blocked.promise;
-    await scope.getByRole('button', { name: inThread ? 'New replies — refresh thread' : 'New messages — return to live', exact: true }).click();
+    await scope.getByRole('button', { name: inThread ? 'New replies — refresh thread' : 'New messages — jump to recent', exact: true }).click();
     await expect(scope.locator('[data-message-seq="1000"]')).toBeVisible();
     release.resolve(); await lookupDone.promise;
     // Wait for any lookup callback's React/paint work without arbitrary wall time.
@@ -704,7 +741,7 @@ test("slow channel A cannot overwrite channel B after navigation", async ({ page
   await expect(page.getByRole("button", { name: "# Beta" }).locator('..')).toHaveClass(/active/);
 });
 
-test("archived channels are consultable, searchable and project-scoped without marking them read on expansion", async ({ page }, testInfo) => {
+test("archived channels are consultable, reachable from the switcher and project-scoped without marking them read on expansion", async ({ page }, testInfo) => {
   const alpha = project("alpha", "Alpha Hive"), beta = project("beta", "Beta Hive");
   const a = channel("a", "General", alpha), old = channel("old", "review-closed", alpha);
   const other = channel("other", "other-closed", beta);
@@ -733,6 +770,9 @@ test("archived channels are consultable, searchable and project-scoped without m
     await section.screenshot({ path: testInfo.outputPath(`archived-${dark ? "dark" : "light"}.png`) });
   }
   await page.setViewportSize({ width: 390, height: 700 });
+  // Phones show the channel full screen; its back arrow leads to Home, where the navigation lives.
+  await page.getByRole("button", { name: "Back", exact: true }).click();
+  await expect(page).toHaveURL(/#\/home\/alpha$/);
   await summary.scrollIntoViewIfNeeded();
   const bounds = await summary.boundingBox();
   expect(bounds!.x).toBeGreaterThanOrEqual(0);
@@ -741,34 +781,40 @@ test("archived channels are consultable, searchable and project-scoped without m
   await page.setViewportSize({ width: 1280, height: 900 });
   await summary.click();
   await expect(oldRow).toBeHidden();
-  await page.getByRole("textbox", { name: "Search projects and messages" }).fill("review-closed");
-  await expect(oldRow).toBeVisible();
-  await oldRow.click();
+  // Message search opens its own view and leaves the sidebar untouched.
+  await page.getByRole("textbox", { name: "Search messages" }).fill("review-closed");
+  await expect(page.getByRole("heading", { name: "Search", exact: true })).toBeVisible();
+  await expect(oldRow).toBeHidden();
+  await page.getByRole("textbox", { name: "Search messages" }).fill("");
+  await page.keyboard.press("ControlOrMeta+k");
+  const jump = page.getByRole("combobox", { name: "Jump to a channel, conversation, agent or project" });
+  await jump.fill("review-closed");
+  await expect(page.getByRole("option")).toHaveText([/# review-closed.*Alpha Hive · archived/]);
+  await jump.press("Enter");
   await expect(page).toHaveURL(/#\/c\/old$/);
+  await expect(oldRow).toBeVisible();
   await page.reload();
   await expect(oldRow).toBeVisible();
   await expect(oldRow.locator('..')).toHaveClass(/active/);
   expect(harnesses.get(page)!.receipts).toEqual([]);
 });
 
-for (const scenario of ["selected-search", "new-search", "direct-link", "remount"] as const) {
+for (const scenario of ["switcher", "direct-link", "remount"] as const) {
   test(`archived navigation reveals a new target after manual collapse (${scenario})`, async ({ page }) => {
-    const alpha = project("alpha", "Alpha Hive"), a = channel("a", "General", alpha);
-    const first = channel("first", "review-one", alpha), second = channel("second", "review-two", alpha);
-    const channels = [a, first, second];
-    const snap = { ...snapshot([alpha], channels), archivedChannelIds: [first.id, second.id], unread: { first: 7, second: 9 } };
+    const alpha = project("alpha", "Alpha Hive"), beta = project("beta", "Beta Hive"), a = channel("a", "General", alpha);
+    const first = channel("first", "review-one", alpha), second = channel("second", "review-two", alpha), b = channel("b", "Elsewhere", beta);
+    const channels = [a, first, second, b];
+    const snap = { ...snapshot([alpha, beta], channels), archivedChannelIds: [first.id, second.id], unread: { first: 7, second: 9 } };
     await installSnapshot(page, () => snap);
     const sockets = await installSocketHarness(page);
     await installMessages(page, (route, id) => fulfillJson(route, payload(channels.find(ch => ch.id === id)!, [])));
     await page.route("**/api/ui/search?*", route => fulfillJson(route, { hits: [], hasMore: false }));
-    await page.goto(scenario === "new-search" ? "/#/c/a" : "/#/c/first");
+    await page.goto("/#/c/first");
     const archived = page.locator(".archived-channels");
-    const search = page.getByRole("textbox", { name: "Search projects and messages" });
-    if (scenario === "new-search") await search.fill("review");
     await expect(archived).toHaveAttribute("open", "");
     const summary = archived.locator("summary");
     await summary.focus();
-    await page.keyboard.press(scenario === "new-search" ? "Space" : "Enter");
+    await page.keyboard.press("Enter");
     await expect(archived).not.toHaveAttribute("open", "");
     // Roster traffic must not override a deliberate collapse of this target.
     await expect.poll(() => sockets.length).toBe(1);
@@ -776,12 +822,16 @@ for (const scenario of ["selected-search", "new-search", "direct-link", "remount
     await expect(archived).not.toHaveAttribute("open", "");
     if (scenario === "direct-link") await page.evaluate(() => { location.hash = "#/c/second"; });
     else if (scenario === "remount") {
-      const projectToggle = page.locator(".project-sec .twist");
-      await projectToggle.click();
+      // Switching project on the rail unmounts this sidebar; switching back returns to the last view.
+      await page.getByRole("button", { name: /^Beta Hive/ }).click();
       await expect(archived).toHaveCount(0);
-      await projectToggle.click();
-    } else await search.fill(scenario === "selected-search" ? "review-one" : "review-two");
-    const target = scenario === "selected-search" || scenario === "remount" ? "# review-one" : "# review-two";
+      await page.getByRole("button", { name: /^Alpha Hive/ }).click();
+    } else {
+      await page.keyboard.press("ControlOrMeta+k");
+      await page.getByRole("combobox", { name: "Jump to a channel, conversation, agent or project" }).fill("review-two");
+      await page.keyboard.press("Enter");
+    }
+    const target = scenario === "remount" ? "# review-one" : "# review-two";
     await expect(archived.getByRole("button", { name: target, exact: true })).toBeVisible();
     if (scenario === "direct-link") await expect(archived.getByRole("button", { name: target, exact: true }).locator('..')).toHaveClass(/active/);
     expect(harnesses.get(page)!.receipts).toEqual([]);
@@ -909,7 +959,7 @@ test("slow thread response cannot overwrite a newer thread selection", async ({ 
   releaseFirstThread.resolve();
   await expect(page.getByText("current thread two reply", { exact: true })).toBeVisible();
   await expect(page.getByText("stale thread one reply", { exact: true })).toHaveCount(0);
-  await expect(page.locator("aside.thread select")).toHaveValue("in_progress");
+  await expect(page.locator("aside.thread [data-thread-status]")).toHaveAttribute("data-thread-status", "in_progress");
 });
 
 test("reconnect converges open channel and thread after missed message reaction and status events", async ({ page }) => {
@@ -949,7 +999,7 @@ test("reconnect converges open channel and thread after missed message reaction 
       payload: { id: root.id, channelId: "a", status: "blocked" },
     }),
   );
-  await expect(page.locator("aside.thread select")).toHaveValue("blocked");
+  await expect(page.locator("aside.thread [data-thread-status]")).toHaveAttribute("data-thread-status", "blocked");
 
   const updatedRoot = { ...root, reactions: [{ emoji: "✅", count: 1 }] };
   const missed = message("missed", 3, "a", "missed while websocket was down");
@@ -989,7 +1039,7 @@ test("reconnect converges open channel and thread after missed message reaction 
   await expect(page.getByText("missed while websocket was down", { exact: true })).toBeVisible();
   await expect(page.getByText("live during reconnect refresh", { exact: true })).toBeVisible();
   await expect(page.getByText("thread reply missed while disconnected", { exact: true })).toBeVisible();
-  await expect(page.locator("aside.thread select")).toHaveValue("done");
+  await expect(page.locator("aside.thread [data-thread-status]")).toHaveAttribute("data-thread-status", "done");
   await expect(page.locator("aside.thread .react").filter({ hasText: "✅" })).toHaveCount(1);
 });
 
@@ -1136,7 +1186,7 @@ test("live status survives a delayed first thread snapshot and ignores another t
   await expect(page.locator("main .st")).toHaveText("blocked");
   release.resolve();
   await expect(page.getByText("loaded thread reply", { exact: true })).toBeVisible();
-  await expect(page.locator("aside.thread select")).toHaveValue("blocked");
+  await expect(page.locator("aside.thread [data-thread-status]")).toHaveAttribute("data-thread-status", "blocked");
 });
 
 for (const inThread of [false, true]) {
@@ -1178,7 +1228,7 @@ for (const inThread of [false, true]) {
     await page.clock.runFor(20);
     through = 582;
     for (const seq of [581, 581, 582]) sockets[0]!.send(JSON.stringify({ type: "message", payload: row(seq) }));
-    const refresh = scope.getByRole("button", { name: inThread ? "New replies — refresh thread" : "New messages — return to live", exact: true });
+    const refresh = scope.getByRole("button", { name: inThread ? "New replies — refresh thread" : "New messages — jump to recent", exact: true });
     await expect(refresh).toBeVisible();
     await expect(scope.locator(".msg-b")).toHaveCount(580);
     expect(await handle!.evaluate(el => el.isConnected && window.getSelection()?.toString() === el.textContent)).toBe(true);
@@ -1260,7 +1310,7 @@ test("settings stay inside the viewport and backdrop dismissal requires a comple
   await installSocketHarness(page);
   await installMessages(page, async route => fulfillJson(route, payload(a, [])));
   await page.route("**/api/ui/adaptive-routing", route => fulfillJson(route, {
-    enabled: false, apiKeySet: false, apiKeyHint: null, model: "jev-latest", defaultModel: "jev-latest", modelPinned: false, fallback: "orchestrated", topologyFallback: "brain_one_worker",
+    enabled: false, apiKeySet: false, apiKeyHint: null, model: "jev-latest", defaultModel: "jev-latest", modelPinned: false,
   }));
   await page.route("**/api/ui/telegram", route => fulfillJson(route, {
     configured: false, running: false, tokenSet: false, tokenHint: null, allowUserIds: [], projects: {},
@@ -1305,7 +1355,7 @@ test("settings stay inside the viewport and backdrop dismissal requires a comple
   }
 });
 
-test("direct conversations, inbox receipts and compact routing remain independent", async ({ page }, testInfo) => {
+test("direct conversations, inbox receipts and the Jev advice strip remain independent", async ({ page }, testInfo) => {
   const alpha = project("alpha", "Example Hive");
   const dm = { ...channel("dm", "Human · Beacon", alpha), type: "dm" as const, memberIds: ["human", "brain"] };
   const peers = { ...channel("peers", "Beacon · Helper", alpha), type: "dm" as const, memberIds: ["brain", "worker"] };
@@ -1315,33 +1365,40 @@ test("direct conversations, inbox receipts and compact routing remain independen
   const mentioned = message("mention", 2, peers.id, "An update mentioning @Human.", null, { authorId: "brain", authorName: "Beacon", authorRole: "brain", mentions: ["human"] });
   snap.mentions = [mentioned, direct]; snap.mentionCounts = { alpha: 2 }; snap.unread = { dm: 1, peers: 1 };
   await installSnapshot(page, () => snap);
-  await installSocketHarness(page);
+  const sockets = await installSocketHarness(page);
   await installMessages(page, async (route, id) => fulfillJson(route, payload(id === "dm" ? dm : peers, [id === "dm" ? direct : mentioned])));
-  await page.route("**/api/ui/mentions?*", route => fulfillJson(route, {
-    readInstance: "browser-fixture", readRevision: harnesses.get(page)!.revision, readSeq: 2,
-    messages: [mentioned, direct].filter(m => !harnesses.get(page)!.receipts.flat().includes(m.seq)), hasMore: false,
-  }));
-  await page.route("**/api/ui/channels/*/adaptive-routing", route => fulfillJson(route, { state: null, events: [] }));
+  const activityRequests: string[] = [];
+  await page.route("**/api/ui/activity?*", route => {
+    const query = new URL(route.request().url()).searchParams, reasons = query.get("reason")?.split(",") ?? [];
+    activityRequests.push(query.toString());
+    const read = harnesses.get(page)!.receipts.flat();
+    const items = ([[mentioned, "mention"], [direct, "direct"]] as const)
+      .map(([m, reason]) => ({ message: m, reason, project: alpha.slug, read: read.includes(m.seq) }))
+      .filter(item => (!reasons.length || reasons.includes(item.reason)) && (query.get("unread") !== "1" || !item.read));
+    return fulfillJson(route, { readInstance: "browser-fixture", readRevision: harnesses.get(page)!.revision, readSeq: 2, items, hasMore: false });
+  });
+  const advised = { executionId: "run", channelId: dm.id, projectId: alpha.id, brainId: "brain", rootMessageId: "direct", updatedAt: 1,
+    revision: 1, completedAt: null, monitoring: "active", recommendation: { routeId: "r", contractVersion: "adaptive-routing-v3",
+      targetTopology: "brain_multi_dm", targetWorkers: 2, confidence: 0.72, reason: "parallel_workstreams", providerStatus: "ok",
+      model: "fixture", latencyMs: 1, inputTokens: 1, outputTokens: 1, singleSufficient: false, needsOrchestration: true } };
+  await page.route("**/api/ui/channels/*/adaptive-routing", route => fulfillJson(route,
+    route.request().url().includes(`/channels/${dm.id}/`) ? { state: advised, executions: [advised], events: [] } : { state: null, events: [] }));
   await page.goto("/#/c/dm");
   await expect(page.locator(".with-human")).toBeVisible();
   await expect(page.locator(".between-agents")).not.toBeVisible();
-  const routing = page.getByLabel("Message routing options");
-  await expect(routing).toHaveText("Auto · Jev");
-  await page.locator(".composer").screenshot({ path: testInfo.outputPath("composer-auto.png") });
-  const pill = await routing.boundingBox(); expect(pill!.height).toBeLessThan(40);
-  await routing.click();
-  await page.getByLabel("Execution mode", { exact: true }).selectOption("brain_one_worker");
-  await page.getByLabel("Routing lock scope", { exact: true }).selectOption("task");
-  await routing.click();
-  await expect(routing).toContainText("Brain + 1");
-  await expect(routing).toContainText("task lock");
+  // #211: the composer has no mode or lock selector; an informational strip shows Jev's latest advice.
+  await expect(page.locator(".routing-strip button")).toHaveText("Jev suggests: Multi-DM · 2 workers (72%)");
+  await expect(page.locator(".routing-strip span")).toHaveText("Advisory only · the brain decides");
+  await expect(page.getByLabel("Message routing options")).toHaveCount(0);
+  await expect(page.locator(".composer select")).toHaveCount(0);
+  const strip = await page.locator(".routing-strip").boundingBox(); expect(strip!.height).toBeLessThan(60);
   await page.locator(".composer").screenshot({ path: testInfo.outputPath("composer.png") });
   await page.getByRole("button", { name: /^For you/ }).click();
   // Channel reading already acknowledged the direct message; test only the remaining mention.
   await expect(page.locator(".inbox-card")).toHaveCount(1);
   await page.getByRole("button", { name: "Direct messages", exact: true }).click();
   await expect(page.locator(".inbox-card")).toHaveCount(0);
-  await page.getByRole("button", { name: "Mentions elsewhere", exact: true }).click();
+  await page.getByRole("button", { name: "Mentions", exact: true }).click();
   await expect(page.locator(".inbox-card")).toHaveCount(1);
   await page.getByRole("button", { name: "Expand", exact: true }).click();
   await expect(page.locator(".inbox-card")).toHaveClass(/expanded/);
@@ -1349,6 +1406,20 @@ test("direct conversations, inbox receipts and compact routing remain independen
   await page.getByRole("button", { name: "Mark read", exact: true }).click();
   await expect(page.locator(".inbox-card")).toHaveCount(0);
   expect(harnesses.get(page)!.receipts.some(receipt => receipt.length === 1 && receipt[0] === 2)).toBe(true);
+  // #225: Activity is served by the server with read state, and new entries arrive in realtime.
+  await page.getByRole("button", { name: "Everything", exact: true }).click();
+  await page.getByRole("button", { name: "Activity", exact: true }).click();
+  await expect(page).toHaveURL(/#\/inbox\/alpha\/all$/);
+  await expect(page.locator(".inbox-card")).toHaveCount(2);
+  await expect(page.locator(".inbox-card.unread")).toHaveCount(0);
+  expect(activityRequests.at(-1)).toBe("project=alpha&unread=0");
+  const requests = activityRequests.length;
+  const fresh = message("fresh", 3, dm.id, "A fresh direct update.", null, { authorId: "brain", authorName: "Beacon", authorRole: "brain", mentions: [] });
+  sockets[0]!.send(JSON.stringify({ type: "activity", payload: { message: fresh, reason: "direct", project: alpha.slug, read: false } }));
+  await expect(page.locator(".inbox-card")).toHaveCount(3);
+  await expect(page.locator(".inbox-card").first()).toContainText("A fresh direct update.");
+  await expect(page.locator(".inbox-card.unread")).toHaveCount(1);
+  expect(activityRequests.length).toBe(requests);
 });
 
 for (const inThread of [false, true]) {
@@ -1379,7 +1450,7 @@ for (const inThread of [false, true]) {
     await expect(scope.locator(".msg")).toHaveCount(40);
     const stream = scope.locator(".stream");
     await stream.evaluate(element => { element.scrollTop = 0; });
-    await expect(scope.getByRole("button", { name: inThread ? "Refresh thread" : "Return to live", exact: true })).toBeVisible();
+    await expect(scope.getByRole("button", { name: inThread ? "Refresh thread" : "Jump to recent", exact: true })).toBeVisible();
     const composer = scope.locator(".composer textarea");
     await composer.fill("My confirmed message");
     await composer.press("Enter");
@@ -1409,7 +1480,7 @@ for (const reading of ["live", "held-bottom", "held-middle"] as const) {
     await expect.poll(() => stream.evaluate(el => el.scrollHeight - el.clientHeight - el.scrollTop)).toBeLessThan(3);
     if (reading !== "live") {
       await stream.evaluate(el => { el.scrollTop = 0; });
-      await expect(page.locator("main").getByRole("button", { name: "Return to live", exact: true })).toBeVisible();
+      await expect(page.locator("main").getByRole("button", { name: "Jump to recent", exact: true })).toBeVisible();
       if (reading === "held-bottom") await stream.evaluate(el => { el.scrollTop = el.scrollHeight; });
     }
     const reply = page.locator("main .msg").filter({ has: page.getByText(last.body, { exact: true }) }).getByRole("button", { name: "1 reply", exact: true });
@@ -1425,7 +1496,7 @@ for (const reading of ["live", "held-bottom", "held-middle"] as const) {
     } else {
       await expect.poll(() => stream.evaluate(el => el.scrollHeight - el.clientHeight - el.scrollTop)).toBeLessThan(3);
     }
-    await expect(page.locator("main").getByRole("button", { name: "Return to live", exact: true })).toHaveCount(reading === "live" ? 0 : 1);
+    await expect(page.locator("main").getByRole("button", { name: "Jump to recent", exact: true })).toHaveCount(reading === "live" ? 0 : 1);
   });
 }
 
@@ -1449,7 +1520,7 @@ test("opening a side thread keeps the main chat anchored when web fonts swap in 
   const stream = page.locator("main .stream");
   await expect(page.locator("main .msg")).toHaveCount(20);
   await stream.evaluate(el => { el.scrollTop = 0; });
-  await expect(page.locator("main").getByRole("button", { name: "Return to live", exact: true })).toBeVisible();
+  await expect(page.locator("main").getByRole("button", { name: "Jump to recent", exact: true })).toBeVisible();
   const reply = page.locator("main .msg").filter({ has: page.getByText(last.body, { exact: true }) }).getByRole("button", { name: "1 reply", exact: true });
   await reply.evaluate(el => el.scrollIntoView({ block: "center" }));
   const replyBottom = await reply.evaluate(el => el.getBoundingClientRect().bottom);

@@ -25,7 +25,7 @@ export type DeliveryServiceDeps = Core & {
   readonly inbox: InboxDeliveryStore;
   /** Classifies and pages an agent's unseen mail. */
   readonly inboxReader: InboxReader;
-  readonly tasks: Pick<TaskStore, "recordReceipt" | "get">;
+  readonly tasks: Pick<TaskStore, "recordReceipt" | "view">;
   readonly timeline: Pick<TimelineStore, "recordAcknowledgement" | "recordOffer">;
   readonly waiters: Waiters;
 };
@@ -51,7 +51,7 @@ export class DeliveryService {
     const result = this.deps.inbox.acknowledge(actor.id, sessionId, deliveryId,
       (seqs, at) => { changed = this.deps.tasks.recordReceipt(actor.id, seqs, at); });
     this.deps.timeline.recordAcknowledgement(actor, deliveryId, result.acknowledgedAt);
-    for (const id of changed) this.deps.bus.emit('task', this.deps.tasks.get(this.deps.identity.getAgent(HUMAN_ID), id));
+    for (const id of changed) this.deps.bus.emit('task', this.deps.tasks.view(this.deps.identity.getAgent(HUMAN_ID), id));
     this.emitQueued(actor.id);
     return result;
   }
@@ -62,6 +62,12 @@ export class DeliveryService {
         .filter((agent) => agent.role === "brain" || agent.role === "worker")
         .map((agent) => [agent.id, { ...this.deps.inbox.status(agent.id), queued: this.deps.inboxReader.estimate(agent) }]),
     );
+  }
+
+  /** Receipt status and queue estimate of every agent, estimating each inbox once (the UI snapshot). */
+  queueSnapshot(): { queued: Record<string, number>; inbox: Record<string, InboxStatus> } {
+    const inbox = this.inboxStatuses();
+    return { inbox, queued: Object.fromEntries(Object.entries(inbox).map(([id, status]) => [id, status.queued?.atLeast ?? 0])) };
   }
 
   private takeUnseen(actor: Agent, sessionId: string, compact: boolean, scanLimit: number): WaitResult {

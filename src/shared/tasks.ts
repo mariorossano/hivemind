@@ -1,6 +1,5 @@
 import { z } from "zod";
 import { roomTaskSchema, type RoomTask } from './rooms.ts';
-import { executionIdSchema } from './mutation.ts';
 import { claimActions, isClaimAction, type TaskClaim, type TaskCoordinationView } from './task-claims.ts';
 
 const text = z.string().trim().min(1).max(700)
@@ -78,18 +77,18 @@ export const assignTaskSchema = z.object({
   channel: z.string().min(1).max(200).optional().describe('Existing channel UUID or name; omit for the default task DM.'),
   contract: taskContractSchema.describe('Contract object, never a string.'),
   room: roomTaskSchema.optional().describe('Only in a channel with a room contract: current contractVersion from get_room and a stable actionKey.'),
-  executionId: executionIdSchema.optional(),
 }).strict();
 export const taskEventSchema = z.object({
   requestId: requestId.describe('Idempotency key: reuse the same key and payload on retry.'),
   expectedRevision: z.number().int().positive().safe().describe('Current task.revision from get_task or the latest task event.'),
   action: taskActionSchema,
-  executionId: executionIdSchema.optional(),
 }).strict();
 export type TaskContract = z.infer<typeof taskContractSchema>;
 export type TaskResult = z.infer<typeof taskResultSchema>;
 export type TaskAction = z.infer<typeof taskActionSchema>;
-export type TaskState = 'sent' | 'delivered' | 'accepted' | 'rejected' | 'blocked' | 'result_submitted' | 'changes_requested' | 'accepted_complete';
+export type TaskState = 'sent' | 'delivered' | 'accepted' | 'rejected' | 'blocked' | 'result_submitted' | 'changes_requested' | 'accepted_complete'
+  /** Closed by Hivemind because the assigned worker was removed (#215); a revise reassigns it. */
+  | 'cancelled';
 export type TaskEnvelope = {
   taskId: string; channelId: string; revision: number; contractVersion: number;
   actorId: string; actorRole: 'brain' | 'worker'; assignerId: string; workerId: string;
@@ -103,11 +102,30 @@ export type TaskSnapshot = {
   checkpoint?: TaskCheckpoint;
   claim?: TaskClaim;
   coordination?: TaskCoordinationView;
+  /** Why the task was cancelled; cleared when it is revised. */
+  cancellation?: { reason: string; at: number };
   id: string; channelId: string; assignerId: string; assignerName: string; workerId: string; workerName: string;
   revision: number; contractVersion: number; state: TaskState; contract: TaskContract;
   dispatchSeq: number; receivedAt: number | null; lastEventSeq: number; updatedAt: number;
   result: TaskResult | null; review: { reviewerId: string; decision: 'accepted' | 'changes_requested'; summary: string } | null;
 };
+
+/** What an agent is doing right now, for the Human roster status line. */
+export type AgentWork = {
+  /** The most recently updated unfinished task this agent works on, if any. */
+  task: { id: string; channelId: string; state: TaskState; objective: string; needed: string | null } | null;
+  /** Unfinished tasks assigned to this agent. */
+  assigned: number;
+  /** Unfinished tasks this agent assigned to others. */
+  delegated: number;
+  /** Submitted results waiting for this agent's review. */
+  toReview: number;
+};
+/** One row of a channel's task list (the Human UI Tasks tab); the thread holds the full snapshot. */
+export type TaskSummary = Pick<TaskSnapshot, 'id' | 'channelId' | 'state' | 'workerName' | 'assignerName' | 'revision' | 'updatedAt'> & {
+  objective: string;
+};
+export type ChannelTaskPage = { items: TaskSummary[]; hasMore: boolean };
 
 /** Human-readable chat stays the primary record; metadata is authenticated by the server. */
 export function taskBody(envelope: TaskEnvelope): string {
