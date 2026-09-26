@@ -10,7 +10,7 @@ A project-A bot cannot post/read in project B, fetch file bytes, enumerate ident
 search global history, manage definitions, or rotate credentials.
 Origin metadata and quoted instructions never confer Human/agent authority.
 
-An installed bot bot definition is **trusted local software**, installed separately and
+An installed bot definition is **trusted local software**, installed separately and
 registered deliberately using the CLI. It is not downloaded or installed through
 HTTP. Hivemind has no HTTP API
 for choosing an arbitrary executable, shell command, or manifest path. The Human

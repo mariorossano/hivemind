@@ -17,7 +17,7 @@ Open **Bots** from the roster's `+` button, a bot's **Manage bot** menu, or proj
 - **Add bot → registered service**: install a trusted external bot and register its manifest with `hivemind bots add /absolute/package/hivemind-bot.json --home /absolute/hive`, then refresh Bots. For GitLab, configure the host and local reader, enable the service, then create and connect its identity. Credentials go directly to its private profile. No polling starts during setup.
 - **Add bot → Custom bot**: create a publishing identity and copy its one-time token into your service. Open its settings to enable Receive and choose channels explicitly.
 - **Manage bot**: edit access, inspect the tool catalog, change service settings, or explicitly check/start/stop its monitor. A configured service is not proof of a running process. Status is checked on demand; stop requests must be verified with another status check.
-- **Advanced**: rotate/revoke credentials or reconnect an bot definition. Reconnect replaces the bot token; stop the monitor first. Other clients using the previous token lose authentication. An uncertain connection result preserves the identity: inspect/reconnect it instead of creating another bot.
+- **Advanced**: rotate/revoke credentials or reconnect a bot definition. Reconnect replaces the bot token; stop the monitor first. Other clients using the previous token lose authentication. An uncertain connection result preserves the identity: inspect/reconnect it instead of creating another bot.
 
 Settings, access and credential updates are revision-fenced. Changing grants blocks future requests, not work already dispatched. Disabling a service hides tools and prevents starts; it does not stop a running monitor. Stop is always an explicit action.
 
@@ -40,7 +40,7 @@ automatically retries the operation against a different revision.
 
 Hivemind supplies the generic capability protocol, tool executor and Bots UI.
 GitLab's implementation, provider readers, monitor and tests stay in the separate
-`hivemind-gitlab` repository/package. Hivemind neither builds nor ships that code
+GitLab bot repository/package. Hivemind neither builds nor ships that code
 and has no implicit provider bots. Install/update the bot independently and
 register its manifest explicitly. Listing the catalog never runs package code.
 Authentication stays in the native `glab` client. Tokens, provider databases and
@@ -116,7 +116,7 @@ hivemind bots bind DEFINITION_ID --project SLUG --config-home /private/profile -
 The external catalog is `bot-definitions.json`; project profiles are bound in
 `project-bots.json`. Every bot definition, including GitLab, resolves to its explicitly
 registered external manifest path. There are no reserved built-in provider IDs.
-Unregistering an bot definition does not stop its monitor, revoke credentials or erase
+Unregistering a bot definition does not stop its monitor, revoke credentials or erase
 profiles. Register the new manifest path explicitly if an installation moves.
 Private profile paths and configuration remain local to Human; brain tool discovery
 returns only bot IDs/names and tool schemas.

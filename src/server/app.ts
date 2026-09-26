@@ -167,7 +167,7 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
     const current = hive.bots.botCredential(human, c.req.param('id'), c.req.param('botId'));
     const access = hive.bots.access(current.bot);
     if (access.revision !== input.expectedAccessRevision) throw new HiveError(409, 'Bot access changed; refresh before reconnecting');
-    if (!access.definitionId) throw new HiveError(409, 'Select and save an definition first');
+    if (!access.definitionId) throw new HiveError(409, 'Select and save a definition first');
     const { project, definition } = botDefinition(current.bot.projectId!, access.definitionId);
     if (!definition.configured) throw new HiveError(409, 'Configure the definition first');
     const rotated = hive.bots.changeBotCredential(human, project.id, current.bot.id, { action: 'rotate', expectedRevision: input?.expectedRevision });
@@ -604,8 +604,16 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
   });
   bot.get('/channels/:id/messages', c => c.json(hive.bots.receive(c.get('me'), c.req.param('id'), Number(c.req.query('afterSeq') ?? 0), Number(c.req.query('limit') ?? 50))));
   bot.get('/channels/:id/links', c => c.json({ links: hive.rooms.botLinks(c.get('me'), c.req.param('id')) }));
-  bot.post('/channels/:id/links', async c => c.json({ link: hive.rooms.registerLink(c.get('me'), c.req.param('id'), await requestJson(c.req.raw)) }));
-  bot.post('/channels/:id/links/:link/status', async c => c.json({ link: hive.rooms.reportLink(c.get('me'), c.req.param('id'), c.req.param('link'), await requestJson(c.req.raw)) }));
+  bot.post('/channels/:id/links', async c => {
+    const body = await requestJson(c.req.raw);
+    const actor = hive.identity.agentByToken(c.get('token'));
+    return c.json({ link: hive.rooms.registerLink(actor, c.req.param('id'), body) });
+  });
+  bot.post('/channels/:id/links/:link/status', async c => {
+    const body = await requestJson(c.req.raw);
+    const actor = hive.identity.agentByToken(c.get('token'));
+    return c.json({ link: hive.rooms.reportLink(actor, c.req.param('id'), c.req.param('link'), body) });
+  });
   bot.post('/files', async c => {
     hive.bots.requireCapability(c.get('me'), 'publish');
     const name = c.req.header('x-file-name') || 'file';

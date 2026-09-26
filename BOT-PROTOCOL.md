@@ -6,6 +6,10 @@ Publish, Receive and Tools are independent grants. This observation protocol req
 Publish; Receive has a separate subscribed, read-only polling API described in BOTS.md.
 Hivemind delivers observations through messages, threads, history, search and MCP wait.
 Source reading and monitor lifecycle belong to the bot's implementation, not this API.
+The bot's own source-link metadata and lifecycle acknowledgements remain accessible
+without Publish, so a monitor can confirm it stopped after that grant is revoked.
+Lifecycle reports only create channel messages and wake the coordinator while
+Publish is enabled; a valid credential and channel invitation are always required.
 
 ## Create and invite
 
