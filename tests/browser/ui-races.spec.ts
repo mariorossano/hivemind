@@ -168,7 +168,7 @@ async function installMessages(
 type FixtureSocket = Pick<WebSocketRoute, "close"> & { send: (data: string) => void };
 
 test('composable bots have one accessible panel, scoped Receive and explicit monitor controls', async ({ page }, testInfo) => {
-  const p = project('bots', 'Marble'), ch = channel('bot-channel', 'review-updates', p);
+  const p = project('bots', 'Example'), ch = channel('bot-channel', 'review-updates', p);
   const custom: Agent = { ...human, id: 'feed', name: 'BuildFeed', role: 'bot', projectId: p.id, project: p.slug };
   const gitlab: Agent = { ...custom, id: 'gitlab', name: 'GitLab' };
   ch.memberIds.push(custom.id, gitlab.id);
@@ -195,8 +195,8 @@ test('composable bots have one accessible panel, scoped Receive and explicit mon
     controls.push(route.request().postDataJSON().action); await fulfillJson(route, { result: { monitorRunning: false } });
   });
   await page.goto(`/#/c/${ch.id}`);
-  await page.getByRole('button', { name: 'Manage bots in Marble', exact: true }).click();
-  const panel = page.getByRole('dialog', { name: 'Bots for Marble', exact: true });
+  await page.getByRole('button', { name: 'Manage bots in Example', exact: true }).click();
+  const panel = page.getByRole('dialog', { name: 'Bots for Example', exact: true });
   await expect(panel.getByRole('button', { name: 'Add bot', exact: true })).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath('bots-overview.png') });
   await panel.getByRole('button', { name: /^BuildFeed/ }).click();
