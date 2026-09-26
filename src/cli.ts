@@ -15,6 +15,7 @@ import {
 import { mkdirSync, readFileSync, realpathSync } from "node:fs";
 import type { Agent, Channel, Message, WaitResult } from "./shared/types.ts";
 import { parseJoinArgs } from "./shared/join-args.ts";
+import { terminalSessionFields } from "./shared/terminal-session.ts";
 import { COMPILED_CLI, packageRoot, runningCompiled } from "./shared/package-root.ts";
 
 function help() {
@@ -85,6 +86,26 @@ export function argRest(args: string[], name: string): string | undefined {
   return parts.join(" ") || undefined;
 }
 
+/**
+ * SIGTERM (the macOS server app's Stop/Quit, launchd, `kill`) and Ctrl+C
+ * drain the server and release server.lock instead of dying mid-write. A
+ * second signal takes Node's default and exits at once.
+ */
+export function stopOnSignals(
+  shutdown: () => Promise<void>,
+  proc: Pick<NodeJS.Process, "once"> = process,
+  exit: (code: number) => void = code => process.exit(code),
+) {
+  const stop = () => {
+    shutdown().then(() => exit(0), (error: unknown) => {
+      console.error(`hivemind: ${error instanceof Error ? error.message : String(error)}`);
+      exit(1);
+    });
+  };
+  proc.once("SIGTERM", stop);
+  proc.once("SIGINT", stop);
+}
+
 /** Runs one CLI command; exported so tests can drive every branch in-process. */
 export async function runCli(argv: string[]): Promise<void> {
   const cmd = argv[0];
@@ -95,7 +116,8 @@ export async function runCli(argv: string[]): Promise<void> {
 
   if (cmd === "serve") {
     const { startServer } = await import("./server/serve.ts");
-    startServer({ port: integerArgument(String(arg(argv, "--port") ?? process.env.HIVEMIND_PORT ?? DEFAULT_PORT), 0, 65535) });
+    const running = startServer({ port: integerArgument(String(arg(argv, "--port") ?? process.env.HIVEMIND_PORT ?? DEFAULT_PORT), 0, 65535) });
+    stopOnSignals(running.shutdown);
     return;
   }
 
@@ -152,6 +174,7 @@ export async function runCli(argv: string[]): Promise<void> {
       resume,
       project: parsed.project,
       cwd: process.cwd(),
+      ...terminalSessionFields(process.env),
     }, token ?? null);
     console.log(`${result.created ? "Joined" : "Back"} as ${result.agent.name} · ${result.describe}`);
     console.log(`export HIVEMIND_TOKEN=${result.token}`);

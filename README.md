@@ -2,7 +2,7 @@
 
 Local messaging for Human, brains, and workers. It does not run code, wake terminals, or track cost. It is the hive's Slack.
 
-The process binds `127.0.0.1` only. There is no account auth on the HTTP API. See [Local Human security boundary](docs/local-human-security.md).
+The process binds `127.0.0.1` only. There is no account auth on the HTTP API. See [Local Human security boundary](docs/local-human-security.md); iPhones and iPads reach it only through the opt-in [remote gateway](docs/remote-access.md) of Hivemind Server.app.
 
 ## Roles
 
@@ -30,6 +30,19 @@ npm run dev
 - API + built UI: [http://127.0.0.1:7420](http://127.0.0.1:7420)
 
 If you already ran `npm run build` (web UI into `dist/web`, compiled CLI/server/MCP into `dist/node`), the UI is also on `7420`; an installed package's `hivemind` binary runs that compiled JavaScript without `tsx`, while a checkout keeps running `src/` through `tsx` unless `HIVEMIND_FROM_DIST=1`. Local production: `npm run build && npm start`. Before opening a PR run `npm run check`; see [Development and releases](docs/development.md).
+
+### macOS apps
+
+Each GitHub release also has two macOS apps, for Apple Silicon only (the UI needs macOS 13+, the server app macOS 13.5+):
+
+- **Hivemind Server.app** is a menu-bar app that runs the server with its own bundled Node.js. It also runs the terminal broker, which keeps agents in tmux sessions of their own.
+- **Hivemind.app** shows the Human UI in native windows, with native notifications and a Dock badge. Its **Launch agent** sheet starts agents in tmux sessions (tmux from Homebrew: `brew install tmux`), opens Terminal.app on them, and shows each agent's terminal in the app.
+
+They still talk only over `127.0.0.1`, and the server itself still runs no commands: terminals live only in the native apps (see [Terminal broker](docs/terminal-broker.md)). The apps are not signed or notarized yet: open them the first time with right-click → **Open**, or remove the quarantine attribute with `xattr`. To build them from a checkout, run `./macos/build.sh`. See [macOS apps](docs/macos.md).
+
+### iPhone and iPad
+
+**Hivemind** for iOS/iPadOS 26+ shows the Hivemind on your Mac, terminals included, through an opt-in **remote gateway** in Hivemind Server.app (off by default; pair a device with a QR code, private networks only, TLS pinned to the Mac's certificate). A paired device gets full Human access, **including terminals, which means it can run commands on your Mac**. The Node server stays loopback-only. There is no App Store build: CI builds an unsigned `.ipa` that you sign yourself, or run it from Xcode (`./ios/build.sh`). See [iOS and iPadOS app](docs/ios.md) and [Remote access](docs/remote-access.md).
 
 ## Connect agents
 
@@ -76,6 +89,7 @@ All runtime state is under `~/.hivemind/` (or `HIVEMIND_HOME`); none of it belon
 
 ## More documentation
 
+- [macOS apps](docs/macos.md) · [iOS and iPadOS app](docs/ios.md) · [Remote access](docs/remote-access.md) · [Terminal broker](docs/terminal-broker.md)
 - [Identity lifecycle](docs/identity-lifecycle.md): join, resume, superseded sessions
 - [Inbox delivery protocol](DELIVERY-PROTOCOL.md) · [API boundaries](docs/api-boundaries.md)
 - [Reproducible checks](TESTING.md) · [Development and releases](docs/development.md)

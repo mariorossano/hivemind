@@ -15,6 +15,7 @@ import { adaptiveRoutingPublic, saveAdaptiveRouting } from "./adaptive-config.ts
 import { decodeJevCallCursor } from "../shared/jev-calls.ts";
 import { ACTIVITY_REASONS, type ActivityReason } from "../shared/read-state.ts";
 import { installJevDiagnostics } from './adaptive-routing-diagnostics.ts';
+import { installInstanceProof } from "./instance-proof.ts";
 import { adviseAfterWait, assignAdaptiveTask, mutateAdaptiveTask, mutateAdaptiveRoom, sendAdaptiveAgentMessage, setAdaptiveThreadStatus } from './adaptive-topology-actions.ts';
 
 export type AppHooks = {
@@ -22,6 +23,8 @@ export type AppHooks = {
   telegramRunning?: () => boolean;
   reloadTelegram?: () => boolean | Promise<boolean>;
   configureTelegram?: (input: TelegramFileInput) => Promise<boolean>;
+  /** Hivemind Server.app's per-start secret (instance-proof.ts); null or absent answers the challenge with 404. */
+  instanceSecret?: Buffer | null;
 };
 function fileDownload(hive: Hive, actor: Agent, id: string) {
   const opened = hive.files.openAttachment(actor, id);
@@ -46,6 +49,7 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
     return c.json({ error: "Internal server error" }, 500);
   });
   app.get("/api/health", c => c.json({ ok: true, name: "hivemind" }));
+  installInstanceProof(app, hooks.instanceSecret ?? null);
   /** The channel and root of a thread id (a message or task id); null when the id is unknown. */
   const threadOwner = (id: string): { channelId: string; threadId: string } | null => {
     const ref = hive.messageQueries.messageRef(id);
@@ -347,7 +351,8 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
     const body = await requestJson(c.req.raw);
     const bearer = (c.req.header('authorization') ?? '').replace(/^Bearer\s+/i, '').trim();
     const result = hive.identity.join({ role: body.role, seniority: body.seniority ?? null, focus: body.focus ?? null,
-      token: bearer || body.token || null, resumeName: body.resume || body.resumeName || null, project: body.project ?? null, cwd: body.cwd ?? null });
+      token: bearer || body.token || null, resumeName: body.resume || body.resumeName || null, project: body.project ?? null, cwd: body.cwd ?? null,
+      terminalSession: body.terminalSession ?? null });
     return c.json({ ...result, describe: describeAgent(result.agent), standingOrders: result.created ? standingOrders(result.agent) : undefined,
       ordersRef: result.created ? undefined : 'unchanged', handoffs: hive.tasks.handoffs(result.agent) });
   });
@@ -357,7 +362,8 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
     return c.json({ you: { name: me.name, role: me.role, seniority: me.seniority, focus: me.focus, online: me.online, project: me.project },
       ordersRef: 'unchanged' });
   });
-  agent.get('/agents', c => c.json({ agents: hive.identity.listAgents(c.get('me')).map(({ createdAt: _c, ...a }) => a) }));
+  // terminalSession is a Human UI label; agents' roster stays as it was.
+  agent.get('/agents', c => c.json({ agents: hive.identity.listAgents(c.get('me')).map(({ createdAt: _c, terminalSession: _t, ...a }) => a) }));
   agent.get('/search', c => {
     const me = c.get('me');
     return c.json(hive.messageQueries.searchMessages(me, { q: String(c.req.query('q') ?? ''), project: c.req.query('project') || me.project,
