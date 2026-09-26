@@ -36,7 +36,7 @@ its effective scope:
   from server integration shards.
 - Cross-platform shell argument contracts run with bash on Linux; zsh-only syntax
   validation remains in the focused native macOS job, avoiding repeated package-manager setup on ephemeral Linux runners.
-- One focused native macOS job runs the launch/plugin shell contracts with the real
+- One focused native macOS job runs the launch/bot shell contracts with the real
   macOS zsh environment. `Tests / Node 24` requires that job as well as every Node 24 shard.
 - npm's download cache is used; `node_modules` is not cached.
 

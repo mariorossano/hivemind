@@ -204,7 +204,7 @@ test('archive with finish allows completion but not new assignments or revised w
   assert.throws(() => f.taskEvent(task.id, { type: 'revise', reason: 'More work', worker: f.a.agent.name, contract: f.taskContract }, f.brain.agent), /archived/);
 });
 
-test('plugin suspension is channel-scoped, restart-safe and generation-checked; unsupported is explicit', t => {
+test('bot suspension is channel-scoped, restart-safe and generation-checked; unsupported is explicit', t => {
   const f = fixture(t); f.configure();
   const bot = f.hive.bots.createBot(f.human, f.channel.projectId, { name: 'FixtureFeed' }).bot;
   const second = f.hive.channels.createChannel(f.brain.agent, { name: 'other-feed', type: 'private', memberNames: [bot.name] });

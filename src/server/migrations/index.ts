@@ -5,6 +5,7 @@ import * as features from "./baseline-features.ts";
 import * as telegram from "./baseline-telegram.ts";
 import { agentTombstones } from "./agent-tombstones.ts";
 import { dropDecisionRequests } from "./drop-decision-requests.ts";
+import { botCapabilities } from './bot-capabilities.ts';
 import { jevAdvisory } from "./jev-advisory.ts";
 import { performanceRetention } from "./performance-retention.ts";
 import { schemaShape, validateCoreStorage, validateSchema, type SchemaShape } from "./validate.ts";
@@ -61,6 +62,7 @@ export const MIGRATIONS: readonly Migration[] = [
   { version: 28, name: "performance_retention", up: performanceRetention },
   { version: 29, name: "agent_tombstones", up: agentTombstones },
   { version: 30, name: "drop_decision_requests", up: dropDecisionRequests },
+  { version: 31, name: "bot_capabilities", up: botCapabilities },
 ];
 
 /** The last idempotent baseline migration; later migrations may assume its schema. */

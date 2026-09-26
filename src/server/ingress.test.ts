@@ -139,7 +139,7 @@ test("HTTP rejects malformed/oversized ingress, unknown fields and credential UR
   const url = `http://localhost/api/bot/channels/${f.channelA.id}/messages`;
   const before = countRows(f.hive, "messages");
   for (const body of ["{", JSON.stringify({ eventId: "too-large", body: "x".repeat(BOT_JSON_BYTES) }),
-    JSON.stringify({ eventId: "wrong-plugin", body: "test", pluginId: "unknown" }),
+    JSON.stringify({ eventId: "wrong-bot", body: "test", definitionId: "unknown" }),
     JSON.stringify({ eventId: "wrong-type", body: "test", type: "execute" })]) {
     const response = await app.request(url, { method: "POST", body, headers: { authorization: `Bearer ${f.botA.token}` } });
     assert.ok([400, 413].includes(response.status));
@@ -199,9 +199,9 @@ test("parallel retries publish one event, retry conflicts do not poison the next
   assert.throws(() => f.hive.identity.agentByToken(f.botA.token), status(401));
 });
 
-test("bot HTTP credentials cannot enumerate another project, use Human/plugin settings, or cross-route events", async t => {
+test("bot HTTP credentials cannot enumerate another project, use Human/bot settings, or cross-route events", async t => {
   const f = fixture(t), app = createApp(f.hive);
-  for (const route of ["/api/ui/snapshot", "/api/ui/launch-context?project=other", `/api/ui/projects/${f.b.slug}/plugins`,
+  for (const route of ["/api/ui/snapshot", "/api/ui/launch-context?project=other", `/api/ui/projects/${f.b.slug}/bots/catalog`,
     `/api/ui/projects/${f.b.id}/bots/${f.botB.bot.id}/credential`, "/api/agent/agents", "/api/agent/search?q=private"]) {
     const response = await app.request(route, { headers: { authorization: `Bearer ${f.botA.token}` } });
     assert.equal(response.status, 403, route);
