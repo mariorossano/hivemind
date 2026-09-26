@@ -9,6 +9,9 @@ final class ServerMenuModel: ObservableObject {
   /// The terminal broker: tmux sessions and the PTYs attached to them. It
   /// runs for the life of the app, whether or not the server does.
   let terminals: TerminalBrokerService
+  /// Remote access for paired iPhones and iPads (off by default). It
+  /// forwards to this app's server and terminal broker.
+  let remote: RemoteAccessService
   private let loginItem: any LoginItemControlling
   private let installer: CommandLineInstaller
 
@@ -22,9 +25,21 @@ final class ServerMenuModel: ObservableObject {
       log: RotatingLog(file: paths.serverLog), dependencies: .live())
     loginItem = MainAppLoginItem()
     installer = CommandLineInstaller(paths: paths)
-    terminals = TerminalBrokerService(paths: paths)
+    let terminals = TerminalBrokerService(paths: paths)
+    self.terminals = terminals
+    let controller = self.controller
+    remote = RemoteAccessService(
+      paths: paths,
+      // Only a server this app runs and that is up, with its secret: the
+      // gateway never forwards to whatever else might listen on the port.
+      server: { controller.gatewayUpstream },
+      brokerRunning: { terminals.isRunning })
+    // The moment the supervisor sees the server exit or stop being ready,
+    // the gateway stops forwarding to it (docs/remote-access.md#verified-server).
+    controller.onStateChange = { [weak self] _ in self?.remote.serverChanged() }
     controller.onChange = { [weak self] in self?.objectWillChange.send() }
     terminals.onChange = { [weak self] in self?.objectWillChange.send() }
+    remote.onChange = { [weak self] in self?.objectWillChange.send() }
   }
 
   private var paths: HivemindPaths { controller.paths }

@@ -38,6 +38,9 @@ public final class ServerAppController {
       self.stopTimeout = stopTimeout
     }
 
+    // The live launcher wraps Foundation.Process, which iOS lacks; the iOS
+    // app builds HivemindKit but never runs a server.
+    #if os(macOS)
     @MainActor public static func live() -> Dependencies {
       Dependencies(
         launcher: FoundationProcessLauncher(), scheduler: MainQueueScheduler(), probe: LoopbackPortProbe(),
@@ -45,6 +48,7 @@ public final class ServerAppController {
         processStart: ProcessLiveness.startDate, signal: { _ = Darwin.kill($0, $1) },
         baseEnvironment: ProcessInfo.processInfo.environment)
     }
+    #endif
   }
 
   public let paths: HivemindPaths
@@ -52,6 +56,12 @@ public final class ServerAppController {
   public let version: String
   public private(set) var settings: ServerAppSettings
   public var onChange: (@MainActor () -> Void)?
+  /// Every supervisor state change, the moment the supervisor makes it (a
+  /// child exited, became ready, is being stopped), once `state`,
+  /// `instanceSecret` and `gatewayUpstream` already reflect it. The remote
+  /// gateway reacts here, without polling: it stops forwarding to a server
+  /// that is gone (docs/remote-access.md#verified-server).
+  public var onStateChange: (@MainActor (SupervisorState) -> Void)?
 
   private let store: ServerAppSettingsStore
   private let deps: Dependencies
@@ -127,6 +137,23 @@ public final class ServerAppController {
   }
 
   public var dataHome: URL { settings.launchSettings(paths: paths).dataHome }
+
+  /// The secret the running child was started with (InstanceProof), in
+  /// memory: the remote gateway checks the server with it before it
+  /// forwards anything (docs/remote-access.md#verified-server). Nil while no
+  /// child runs. Never logged.
+  public var instanceSecret: InstanceSecret? { state.pid == nil ? nil : activeSecret }
+
+  /// The server the remote gateway may forward to: only this app's child,
+  /// and only while it is `.running` (never while it starts, stops or
+  /// restarts), with the secret to check it by: from memory, or else from
+  /// the server.json this app wrote for the same pid and port.
+  public var gatewayUpstream: GatewayUpstreamServer? {
+    guard case .running(let pid, _) = state else { return nil }
+    let port = endpoint.port
+    let secret = instanceSecret ?? discovery.read().flatMap { $0.pid == pid && $0.port == port ? $0.instanceSecret : nil }
+    return GatewayUpstreamServer(port: port.value, secret: secret)
+  }
 
   // MARK: Lifecycle
 
@@ -316,6 +343,7 @@ public final class ServerAppController {
       log.append("[app] \(message)")
       flushReadyWaiters()
     }
+    onStateChange?(state)
     changed()
   }
 

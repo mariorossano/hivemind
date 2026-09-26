@@ -18,11 +18,12 @@ Object.assign(globalThis, { window, document: window.document, localStorage: win
   requestAnimationFrame: (callback: () => void) => setTimeout(callback, 0), cancelAnimationFrame: (id: number) => clearTimeout(id) });
 window.HTMLElement.prototype.getClientRects = function () { return [{}] as unknown as DOMRectList; } as never;
 const { createRoot } = await import("react-dom/client");
-const { TERMINAL_EVENT, BROKER_UNAVAILABLE_HINT, SERVER_UNVERIFIED_HINT, TMUX_INSTALL_HINT, appLinks } = await import("./native-bridge.ts");
+const { TERMINAL_EVENT, BROKER_UNAVAILABLE_HINT, SERVER_UNVERIFIED_HINT, TMUX_INSTALL_HINT, REMOTE_BROKER_UNAVAILABLE_HINT,
+  REMOTE_TMUX_INSTALL_HINT, appLinks, parseTerminalEvent, resetNativePlatform, runNativeCommand } = await import("./native-bridge.ts");
 const opened: string[] = [];
 appLinks.open = url => { opened.push(url); };
 const terminal = await import("./use-terminal.ts");
-const { createTerminalHub, resetTerminalHub, terminalBlocker, touchKey, withControl, agentTerminalSession, liveSession, rgbColor,
+const { createTerminalHub, resetTerminalHub, terminalBlocker, HELD_INPUT_BYTES, touchKey, withControl, agentTerminalSession, liveSession, rgbColor,
   TerminalRequestError } = terminal;
 const { TerminalView, TerminalPanel } = await import("./TerminalView.tsx");
 const { SessionsSheet, sessionOwner } = await import("./SessionsSheet.tsx");
@@ -42,7 +43,11 @@ const sent = <T extends NativeMessage["type"]>(type: T) => posted.filter((m): m 
 /** An event from the app, dispatched as the app evaluates it (HivemindKit BridgeTerminalEvent.javaScript). */
 const fromApp = (detail: object) => act(async () => { window.dispatchEvent(new window.CustomEvent(TERMINAL_EVENT, { detail })); });
 const connected = { type: "terminal-status", tmux: "available", broker: "connected" } as const;
+const onIosStatus = { ...connected, platform: "ios" } as const;
 const flush = () => act(async () => { await new Promise(resolve => setTimeout(resolve, 5)); });
+/** Past a test's reconnectDelays of [QUICK]. */
+const QUICK = 15;
+const settle = () => act(async () => { await new Promise(resolve => setTimeout(resolve, QUICK * 3)); });
 const bytes = (text: string) => [...new TextEncoder().encode(text)];
 const base64 = (text: string) => Buffer.from(text).toString("base64");
 const decode = (data: string) => Buffer.from(data, "base64").toString();
@@ -59,6 +64,7 @@ beforeEach(() => {
   posted = [];
   delete win.webkit;
   resetTerminalHub();
+  resetNativePlatform();
   document.documentElement.className = "";
 });
 afterEach(() => {
@@ -131,7 +137,7 @@ test("the session list is subscribed while anyone watches it, and follows the ap
   assert.deepEqual(posted.slice(1), [{ type: "sessions-unsubscribe" }]);
 
   const state = () => h.state;
-  assert.deepEqual(state(), { native: true, tmux: null, broker: null, sessions: null, lastError: null });
+  assert.deepEqual(state(), { native: true, platform: "macos", tmux: null, broker: null, sessions: null, lastError: null });
   await fromApp(connected);
   await fromApp({ type: "sessions", items: [session("hm-acme-atlas")] });
   assert.equal(state().sessions?.[0]?.name, "hm-acme-atlas");
@@ -174,18 +180,23 @@ test("a stream carries keys and sizes to the broker and its output back, until i
   });
   const [attach] = sent("terminal-attach");
   assert.deepEqual(attach, { type: "terminal-attach", id: attach!.id, session: "hm-acme-atlas", cols: 1000, rows: 1 }, "clamped");
-  assert.equal(stream.input("early"), false, "keys before the stream exists are dropped");
+  assert.equal(stream.input("ec"), true, "keys before the stream exists are held");
+  assert.equal(stream.input(new Uint8Array(bytes("ho\r"))), true);
   stream.resize(120, 40);
   assert.equal(sent("terminal-resize").length, 0, "held until attached");
+  assert.equal(sent("terminal-input").length, 0, "held until attached");
 
   await fromApp({ type: "terminal-attached", id: attach!.id, stream: 3, session: "hm-acme-atlas" });
   assert.equal(stream.stream, 3);
   assert.deepEqual(sent("terminal-resize"), [{ type: "terminal-resize", stream: 3, cols: 120, rows: 40 }]);
+  assert.deepEqual(posted.filter(m => m.type === "terminal-resize" || m.type === "terminal-input").map(m => m.type),
+    ["terminal-resize", "terminal-input", "terminal-input"], "the size first, then the held keys");
+  assert.deepEqual(sent("terminal-input").map(m => [m.stream, decode(m.data)]), [[3, "ec"], [3, "ho\r"]], "in order, once");
   stream.resize(120, 40);
   assert.equal(sent("terminal-resize").length, 1, "an unchanged size is not sent again");
 
   assert.equal(stream.input("ls\r"), true);
-  assert.deepEqual(sent("terminal-input").map(m => [m.stream, decode(m.data)]), [[3, "ls\r"]]);
+  assert.deepEqual(sent("terminal-input").map(m => [m.stream, decode(m.data)]), [[3, "ec"], [3, "ho\r"], [3, "ls\r"]]);
   await fromApp({ type: "terminal-output", stream: 3, data: base64("héllo") });
   await fromApp({ type: "terminal-output", stream: 9, data: base64("not mine") });
   assert.deepEqual(output, bytes("héllo"));
@@ -196,6 +207,54 @@ test("a stream carries keys and sizes to the broker and its output back, until i
   assert.equal(stream.input("x"), false);
   stream.detach();
   assert.equal(sent("terminal-detach").length, 0, "an ended stream needs no detach");
+});
+
+test("keys held before the stream is attached are bounded, oldest dropped first, and discarded when the attach fails", async () => {
+  const h = hub();
+  await fromApp(connected);
+  const handlers = { output() {}, exit() {}, error() {}, lost() {} };
+  const heldInput = () => sent("terminal-input").map(m => decode(m.data)).join("");
+  const attachAs = (stream: number) =>
+    fromApp({ type: "terminal-attached", id: sent("terminal-attach").at(-1)!.id, stream, session: "hm-acme-atlas" });
+
+  // Past the bound, whole oldest chunks go; what is left is sent in order, split into the bridge's 64 KiB chunks.
+  const bounded = h.attach("hm-acme-atlas", 80, 24, handlers);
+  bounded.input("a".repeat(40 * 1024));
+  bounded.input("b".repeat(30 * 1024));
+  bounded.input("c");
+  await attachAs(1);
+  assert.equal(heldInput(), "b".repeat(30 * 1024) + "c", "the oldest chunk is dropped past 64 KiB");
+
+  // One paste larger than the bound keeps its end.
+  posted = [];
+  const pasted = h.attach("hm-acme-atlas", 80, 24, handlers);
+  pasted.input("x".repeat(10) + "y".repeat(HELD_INPUT_BYTES));
+  await attachAs(2);
+  assert.equal(heldInput(), "y".repeat(HELD_INPUT_BYTES));
+  assert.equal(sent("terminal-input").length, 1);
+
+  // Held keys never outlive their attach: refused, unanswered, lost with the broker, or left by the viewer.
+  posted = [];
+  const refused = h.attach("hm-acme-gone", 80, 24, handlers);
+  refused.input("rm -rf nothing\r");
+  await fromApp({ type: "terminal-error", id: sent("terminal-attach").at(-1)!.id, code: "no-such-session", message: "gone", stream: null });
+  assert.equal(refused.input("more"), false, "a failed attach takes no more keys");
+  const unanswered = h.attach("hm-acme-atlas", 80, 24, handlers);
+  unanswered.input("late\r");
+  await flush(); await flush(); await flush(); await flush(); await flush(); await flush(); await flush(); await flush(); await flush();
+  await attachAs(5);
+  const lost = h.attach("hm-acme-atlas", 80, 24, handlers);
+  lost.input("lost\r");
+  await fromApp({ type: "terminal-status", tmux: "unknown", broker: "connecting" });
+  await fromApp(connected);
+  await attachAs(6);
+  const left = h.attach("hm-acme-atlas", 80, 24, handlers);
+  left.input("left\r");
+  left.detach();
+  assert.equal(left.input("x"), false);
+  await attachAs(7);
+  assert.equal(sent("terminal-input").length, 0, "nothing held is sent for an attach that failed or was left");
+  assert.deepEqual(sent("terminal-detach").map(m => m.stream), [5, 7], "late answers are detached (one from a lost broker is not its own)");
 });
 
 test("a viewer that leaves before the answer detaches the stream it gets; refusals and lost brokers end streams", async () => {
@@ -232,7 +291,26 @@ test("a viewer that leaves before the answer detaches the stream it gets; refusa
   await fromApp({ type: "terminal-error", id: null, code: "bad-message", message: "input", stream: 4 });
   assert.equal(stream.stream, 4, "a refused input does not end the stream");
   await fromApp({ type: "terminal-status", tmux: "unknown", broker: "unavailable" });
-  assert.deepEqual(live, ["exit null"], "the broker's streams end with its connection");
+  assert.deepEqual(live, ["exit null"], "the broker's streams end with its connection (exit null without a lost handler)");
+
+  // With a lost handler: a stream (or an attach on its way) that goes with the connection is lost, not ended.
+  await fromApp(connected);
+  const events: string[] = [];
+  const withLost = () => ({ ...handlers(events), lost: () => events.push("lost") });
+  h.attach("hm-acme-atlas", 80, 24, withLost());
+  await fromApp({ type: "terminal-attached", id: sent("terminal-attach").at(-1)!.id, stream: 8, session: "hm-acme-atlas" });
+  h.attach("hm-acme-atlas", 80, 24, withLost());
+  await fromApp({ type: "terminal-status", tmux: "unknown", broker: "connecting" });
+  assert.deepEqual(events, ["lost", "lost"]);
+  await fromApp(connected);
+  h.attach("hm-acme-atlas", 80, 24, withLost());
+  await fromApp({ type: "terminal-attached", id: sent("terminal-attach").at(-1)!.id, stream: 9, session: "hm-acme-atlas" });
+  await fromApp({ type: "terminal-exit", stream: 9, status: null });
+  assert.deepEqual(events, ["lost", "lost", "lost"], "an exit without a status the viewer did not ask for");
+  h.attach("hm-acme-atlas", 80, 24, withLost());
+  await fromApp({ type: "terminal-attached", id: sent("terminal-attach").at(-1)!.id, stream: 10, session: "hm-acme-atlas" });
+  await fromApp({ type: "terminal-exit", stream: 10, status: 1 });
+  assert.deepEqual(events, ["lost", "lost", "lost", "exit 1"]);
 });
 
 test("kill is answered with killed and drops the session from the list", async () => {
@@ -253,7 +331,7 @@ test("kill is answered with killed and drops the session from the list", async (
 
 test("helpers: blockers, session mapping, keys and colors", () => {
   const state = (patch: Partial<ReturnType<typeof createTerminalHub>["state"]>) =>
-    ({ native: true, tmux: null, broker: null, sessions: null, lastError: null, ...patch });
+    ({ native: true, platform: "macos" as const, tmux: null, broker: null, sessions: null, lastError: null, ...patch });
   assert.equal(terminalBlocker({ ...state({}), native: false }), null);
   assert.equal(terminalBlocker(state({}))?.kind, "connecting");
   assert.equal(terminalBlocker(state({ broker: "unavailable", tmux: "unknown" }))?.message, BROKER_UNAVAILABLE_HINT);
@@ -296,6 +374,10 @@ test("the terminal attaches at its size, sends keys, draws output, and detaches 
   const [attach] = sent("terminal-attach");
   assert.deepEqual({ ...attach, id: undefined }, { type: "terminal-attach", id: undefined, session: "hm-acme-atlas", cols: 100, rows: 30 });
   assert.match(view.host.querySelector(".term-note")?.textContent ?? "", /Connecting to hm-acme-atlas/);
+  // Keys typed while it says Connecting to … are held, and sent in order once attached.
+  await fake.type("pw");
+  await fake.type("d\r");
+  assert.equal(sent("terminal-input").length, 0);
   await fromApp({ type: "terminal-attached", id: attach!.id, stream: 2, session: "hm-acme-atlas" });
   assert.equal(view.host.querySelector(".term-note"), null);
   assert.equal(fake.record.focused, 1);
@@ -303,7 +385,7 @@ test("the terminal attaches at its size, sends keys, draws output, and detaches 
   await fake.type("echo hi\r");
   await fake.type("\x03");
   await fake.type(new Uint8Array([0x1b, 0x5b, 0x4d]));
-  assert.deepEqual(sent("terminal-input").map(m => decode(m.data)), ["echo hi\r", "\x03", "\x1b[M"]);
+  assert.deepEqual(sent("terminal-input").map(m => decode(m.data)), ["pw", "d\r", "echo hi\r", "\x03", "\x1b[M"]);
   await fake.resize(90, 20);
   assert.deepEqual(sent("terminal-resize"), [{ type: "terminal-resize", stream: 2, cols: 90, rows: 20 }]);
   await fromApp({ type: "terminal-output", stream: 2, data: base64("\x1b[1mhi\x1b[0m") });
@@ -403,6 +485,153 @@ test("a detached or refused terminal says so and reconnects on request", async (
   assert.equal(fake.record.disposed, 1, "the old screen is gone");
   await fromApp({ type: "terminal-error", id: sent("terminal-attach")[1]!.id, code: "no-such-session", message: "No session hm-acme-atlas", stream: null });
   assert.equal(view.host.querySelector("[role=alert]")?.textContent?.startsWith("No session hm-acme-atlas"), true);
+});
+
+test("a lost stream keeps its screen under Reconnecting… and attaches the same session again once the broker is back", async () => {
+  installBridge();
+  const fake = fakeScreen();
+  const view = await mount(() => <TerminalView session="hm-acme-atlas" loadScreen={fake.load} autoFocus={false} reconnectDelays={[QUICK]} />);
+  await fromApp(connected);
+  await fromApp({ type: "sessions", items: [session("hm-acme-atlas")] });
+  await flush();
+  await fromApp({ type: "terminal-attached", id: sent("terminal-attach")[0]!.id, stream: 1, session: "hm-acme-atlas" });
+  await fromApp({ type: "terminal-output", stream: 1, data: base64("before") });
+  const note = () => view.host.querySelector(".term-note")?.textContent ?? "";
+  const phase = () => view.host.querySelector(".term")?.getAttribute("data-phase");
+
+  // The app's broker connection drops (Hivemind Server restarted, a session expired, the network blinked).
+  await fromApp({ type: "terminal-exit", stream: 1, status: null });
+  await fromApp({ type: "terminal-status", tmux: "unknown", broker: "connecting" });
+  assert.equal(phase(), "reconnecting");
+  assert.equal(note(), "Reconnecting…");
+  assert.equal(view.host.querySelector(".term-note button"), null, "nothing to click: it reconnects by itself");
+  assert.equal(fake.record.disposed, 0, "the screen stays");
+  assert.equal(sent("terminal-attach").length, 1);
+  assert.equal(await fake.type("lost"), undefined);
+  assert.equal(sent("terminal-input").length, 0, "keys go nowhere meanwhile");
+
+  await fromApp(connected);
+  assert.equal(sent("terminal-attach").length, 1, "waits for the session list");
+  await fromApp({ type: "sessions", items: [session("hm-acme-atlas")] });
+  await settle();
+  const again = sent("terminal-attach")[1]!;
+  assert.deepEqual({ ...again, id: undefined }, { type: "terminal-attach", id: undefined, session: "hm-acme-atlas", cols: 100, rows: 30 });
+  assert.equal(note(), "Reconnecting…");
+  await fromApp({ type: "terminal-attached", id: again.id, stream: 5, session: "hm-acme-atlas" });
+  assert.equal(phase(), "live");
+  assert.equal(view.host.querySelector(".term-note"), null);
+  assert.equal(fake.record.created, 1, "the same screen, which tmux redraws");
+  await fromApp({ type: "terminal-output", stream: 5, data: base64(" after") });
+  assert.deepEqual(fake.record.written, bytes("before after"));
+  await fake.type("x");
+  assert.deepEqual(sent("terminal-input").map(m => [m.stream, decode(m.data)]), [[5, "x"]], "keys go to the new stream");
+
+  // Again, now with the broker's own status first (the hub ends the streams), and a stream the broker forgot.
+  await fromApp({ type: "terminal-status", tmux: "unknown", broker: "unavailable" });
+  assert.equal(phase(), "reconnecting");
+  await fromApp(connected);
+  await fromApp({ type: "sessions", items: [session("hm-acme-atlas")] });
+  await settle();
+  await fromApp({ type: "terminal-attached", id: sent("terminal-attach")[2]!.id, stream: 6, session: "hm-acme-atlas" });
+  assert.equal(phase(), "live");
+  await fromApp({ type: "terminal-error", id: null, code: "no-such-stream", message: "no stream 6", stream: 6 });
+  await settle();
+  assert.equal(sent("terminal-attach").length, 4, "the broker is connected and lists it: after the first wait");
+  assert.equal(fake.record.disposed, 0);
+
+  // The broker refuses the attach (not quite back): wait and try again rather than fail.
+  await fromApp({ type: "terminal-error", id: sent("terminal-attach")[3]!.id, code: "internal", message: "not running", stream: null });
+  assert.equal(phase(), "reconnecting");
+  await settle();
+  assert.equal(sent("terminal-attach").length, 5);
+
+  // Leaving while an attach is on its way: the late stream is detached, nothing else is sent.
+  view.unmount();
+  await fromApp({ type: "terminal-attached", id: sent("terminal-attach")[4]!.id, stream: 7, session: "hm-acme-atlas" });
+  assert.deepEqual(sent("terminal-detach"), [{ type: "terminal-detach", stream: 7 }]);
+  assert.equal(fake.record.disposed, 1);
+});
+
+test("a lost stream whose session is gone once the broker is back says the session ended", async () => {
+  installBridge();
+  const fake = fakeScreen();
+  const view = await mount(() => <TerminalView session="hm-acme-atlas" loadScreen={fake.load} autoFocus={false} reconnectDelays={[QUICK]} />);
+  await fromApp(connected);
+  await fromApp({ type: "sessions", items: [session("hm-acme-atlas")] });
+  await flush();
+  await fromApp({ type: "terminal-attached", id: sent("terminal-attach")[0]!.id, stream: 1, session: "hm-acme-atlas" });
+  await fromApp({ type: "terminal-status", tmux: "unknown", broker: "connecting" });
+  await fromApp(connected);
+  await fromApp({ type: "sessions", items: [session("hm-acme-atlas", { alive: false })] });
+  await settle();
+  assert.equal(sent("terminal-attach").length, 1, "nothing to attach to");
+  assert.equal(view.host.querySelector(".term")?.getAttribute("data-phase"), "ended");
+  assert.match(view.host.querySelector(".term-note")?.textContent ?? "", /^Session ended\./);
+  assert.ok(view.host.querySelector(".term-note button"), "Reconnect is offered");
+});
+
+test("an exit with a status says Session ended when the session is gone, Detached while it still runs", async () => {
+  installBridge();
+  const fake = fakeScreen();
+  const view = await mount(() => <TerminalView session="hm-acme-atlas" loadScreen={fake.load} autoFocus={false} reconnectDelays={[QUICK]} />);
+  await fromApp(connected);
+  await fromApp({ type: "sessions", items: [session("hm-acme-atlas")] });
+  await flush();
+  await fromApp({ type: "terminal-attached", id: sent("terminal-attach")[0]!.id, stream: 1, session: "hm-acme-atlas" });
+  const note = () => view.host.querySelector(".term-note")?.textContent ?? "";
+  await fromApp({ type: "terminal-exit", stream: 1, status: 0 });
+  assert.match(note(), /Detached from hm-acme-atlas/, "tmux's detach key: the session runs on");
+  await fromApp({ type: "sessions", items: [] });
+  assert.match(note(), /^Session ended\./, "the session exited");
+  await settle();
+  assert.equal(sent("terminal-attach").length, 1, "an ended session is not attached again by itself");
+});
+
+test("the panel keeps a shown terminal through a broker blip, and replaces it when the session stops", async () => {
+  installBridge();
+  const fake = fakeScreen();
+  const view = await mount(() => <TerminalPanel session="hm-acme-atlas" loadScreen={fake.load} reconnectDelays={[QUICK]} />);
+  await fromApp(connected);
+  await fromApp({ type: "sessions", items: [session("hm-acme-atlas")] });
+  await flush();
+  await fromApp({ type: "terminal-attached", id: sent("terminal-attach")[0]!.id, stream: 1, session: "hm-acme-atlas" });
+  await fromApp({ type: "terminal-status", tmux: "unknown", broker: "unavailable" });
+  assert.ok(view.host.querySelector(".term"), "still the terminal, not the Start Hivemind Server notice");
+  assert.equal(view.host.querySelector(".term-note")?.textContent, "Reconnecting…");
+  await fromApp({ type: "terminal-status", tmux: "unknown", broker: "connecting" });
+  await fromApp(connected);
+  assert.ok(view.host.querySelector(".term"), "the session list is not known yet");
+  await fromApp({ type: "sessions", items: [session("hm-acme-atlas")] });
+  await settle();
+  assert.equal(sent("terminal-attach").length, 2);
+  assert.equal(fake.record.created, 1);
+  assert.equal(fake.record.disposed, 0);
+
+  await fromApp({ type: "sessions", items: [] });
+  assert.match(view.host.textContent ?? "", /hm-acme-atlas is not running/);
+  assert.equal(fake.record.disposed, 1);
+  await fromApp({ type: "terminal-status", tmux: "unknown", broker: "unverified" });
+  assert.match(view.host.textContent ?? "", /couldn't verify/);
+});
+
+test("the Terminal sessions entry shows on phone widths in the iPhone/iPad app only", async () => {
+  const css = readFileSync(new URL("./styles/terminal.css", import.meta.url), "utf8");
+  const phone = css.slice(css.indexOf("@media (max-width: 960px)"));
+  assert.match(phone, /\.rail > \.sessions-cta \{ display: none; \}/);
+  assert.match(phone, /\.rail > \.sessions-cta\[data-platform="ios"\] \{ display: flex;/);
+  const { Sidebar } = await import("./Sidebar.tsx");
+  const render = () => <Sidebar snap={{ projects: [], agents: [], channels: [] } as never} sel={{ kind: "inbox", project: "" } as never}
+    go={() => {}} live unified={false} query="" setQuery={() => {}} onSearchNow={() => {}} onLaunch={() => {}} selectedProject=""
+    onSwitcher={() => {}} onProjectSwitcher={() => {}} inboxBox={"open" as never} projectSheets={{} as never} onNewChannel={() => {}}
+    dms={{} as never} agentActions={{} as never} agentWork={{}} onUnread={() => {}} />;
+  const browser = await mount(render);
+  assert.equal(browser.host.querySelector(".sessions-cta"), null, "no terminals in a browser");
+  browser.unmount();
+  installBridge();
+  const mac = await mount(render);
+  assert.equal(mac.host.querySelector(".sessions-cta")?.getAttribute("data-platform"), "macos");
+  await fromApp(onIosStatus);
+  assert.equal(mac.host.querySelector(".sessions-cta")?.getAttribute("data-platform"), "ios");
 });
 
 test("the panel shows why there is no terminal, and nothing at all in a browser", async () => {
@@ -524,7 +753,120 @@ test("a DM with an agent whose session runs has a Terminal tab, inside the app o
   assert.ok(host.querySelector("#channel-panel-terminal .term"), "the terminal replaces the messages");
   assert.equal((host.querySelector("#channel-panel-messages") as unknown as HTMLElement).hidden, true, "which stay mounted");
 
+  // A broker reconnecting (sessions not known for a moment) keeps the tab and its terminal.
+  await fromApp({ type: "terminal-status", tmux: "unknown", broker: "connecting" });
+  assert.deepEqual(tabs(host), ["Messages", "Tasks", "Terminal"], "the list is only unknown");
+  assert.ok(host.querySelector("#channel-panel-terminal .term"));
+  await fromApp(connected);
+
   await fromApp({ type: "sessions", items: [] });
   assert.deepEqual(tabs(host), ["Messages", "Tasks"], "the session ended");
   assert.equal(host.querySelector("#channel-panel-terminal"), null);
+});
+
+// ---- The iPhone/iPad app ------------------------------------------------------------------------------------------
+// The same bridge, but the broker is the Mac's (docs/remote-access.md): the app says "ios" in every terminal-status,
+// and the page offers nothing that runs on the Mac's desktop (Terminal.app, Start Hivemind Server).
+
+const onIos = { ...connected, platform: "ios" } as const;
+
+test("terminal-status names the platform; Hivemind.app on the Mac, which sends none, is macos", () => {
+  const status = (platform?: unknown) => parseTerminalEvent({ type: "terminal-status", tmux: "available", broker: "connected",
+    ...(platform === undefined ? {} : { platform }) });
+  assert.deepEqual(status(), { type: "terminal-status", tmux: "available", broker: "connected", platform: "macos" });
+  assert.equal((status(null) as { platform: string }).platform, "macos");
+  assert.equal((status("macos") as { platform: string }).platform, "macos");
+  assert.equal((status("ios") as { platform: string }).platform, "ios");
+  // Anything else is not the Mac, so it is offered no Mac desktop action.
+  assert.equal((status("ipados") as { platform: string }).platform, "ios");
+  assert.equal((status(7) as { platform: string }).platform, "ios");
+});
+
+test("the hub takes the platform from the iOS app's answer to ready, before or after it exists", async () => {
+  const handlers = { jump() {}, forYou() {}, newChannel() {}, settings() {}, toggleTheme() {}, navigate() {} };
+  const before = hub();
+  assert.equal(before.state.platform, "macos", "the Mac app never says");
+  runNativeCommand({ command: "ready", platform: "ios" }, handlers);
+  assert.equal(before.state.platform, "ios");
+  const after = hub();
+  assert.equal(after.state.platform, "ios");
+});
+
+test("on iOS the hub never asks for Terminal.app, and says where the broker and tmux are", async () => {
+  const h = hub();
+  await fromApp(onIos);
+  assert.equal(h.state.platform, "ios");
+  const launch = { project: "acme", agent: "Atlas", title: "Acme - Atlas", cwd: null, command: "claude" };
+  void h.launch([launch], true).catch(() => {});
+  assert.equal(sent("terminal-launch")[0]?.openInTerminal, false, "a launch goes without a Terminal.app window");
+  await fromApp({ type: "sessions", items: [session("hm-acme-atlas")] });
+  assert.equal(h.open("hm-acme-atlas"), false);
+  assert.deepEqual(sent("terminal-open"), []);
+
+  const state = (patch: object) => ({ ...h.state, ...patch });
+  const server = terminalBlocker(state({ broker: "unavailable", tmux: "unknown" }));
+  assert.deepEqual(server, { kind: "server", message: REMOTE_BROKER_UNAVAILABLE_HINT, canStart: false });
+  assert.equal(terminalBlocker(state({ tmux: "missing" }))?.message, REMOTE_TMUX_INSTALL_HINT);
+  assert.equal(terminalBlocker(state({ platform: "macos", broker: "unavailable" }))?.canStart, true);
+
+  // A dropped broker ends the page's requests with the device's hint; an attach on its way is lost, to try again.
+  const killed = h.kill("hm-acme-atlas").then(() => "killed", (error: Error) => error.message);
+  const attached = new Promise<string>(resolve => {
+    h.attach("hm-acme-atlas", 80, 24, { output() {}, exit() {}, lost: () => resolve("lost"), error: error => resolve(error.message) });
+  });
+  await fromApp({ ...onIos, broker: "unavailable" });
+  assert.equal(await killed, REMOTE_BROKER_UNAVAILABLE_HINT);
+  assert.equal(await attached, "lost");
+});
+
+test("on iOS the panel explains a missing broker without offering to start it", async () => {
+  installBridge();
+  const fake = fakeScreen();
+  const view = await mount(() => <TerminalPanel session="hm-acme-atlas" loadScreen={fake.load} />);
+  await fromApp({ type: "terminal-status", tmux: "unknown", broker: "unavailable", platform: "ios" });
+  assert.match(view.host.textContent ?? "", /Terminals need Hivemind Server running on your Mac/);
+  assert.equal(view.host.querySelector(".term-notice button"), null, "a device cannot start the Mac's server");
+  await fromApp({ type: "terminal-status", tmux: "missing", broker: "connected", platform: "ios" });
+  await fromApp({ type: "sessions", items: [] });
+  assert.match(view.host.textContent ?? "", /hm-acme-atlas is not running/, "a missing tmux does not hide a panel");
+});
+
+test("on iOS the sessions sheet opens sessions only here, and can open straight on one", async () => {
+  installBridge();
+  const fake = fakeScreen();
+  const atlas = agent("a1", "Atlas", { terminalSession: "hm-acme-atlas" });
+  const view = await mount(() => <SessionsSheet agents={[atlas]} projects={[project]} onClose={() => {}} loadScreen={fake.load}
+    initialSession="hm-acme-atlas" />);
+  await fromApp(onIos);
+  await fromApp({ type: "sessions", items: [session("hm-acme-atlas"), session("hm-acme-new-1")] });
+  await flush();
+  assert.equal(sent("terminal-attach")[0]?.session, "hm-acme-atlas", "the initial session's terminal is shown");
+  assert.match(view.host.querySelector(".sheet-head h2")?.textContent ?? "", /Atlas/);
+  assert.equal(Array.from(view.host.querySelectorAll(".sheet-head button")).some(b => /Open in Terminal/.test(b.textContent ?? "")), false);
+
+  const back = view.host.querySelector('[aria-label="All sessions"]') as unknown as HTMLButtonElement;
+  await act(async () => { back.click(); });
+  assert.equal(view.host.querySelectorAll(".session-list > li").length, 2);
+  assert.ok(view.host.querySelector('[aria-label="Open hm-acme-atlas"]'), "Open stays");
+  assert.equal(view.host.querySelector('[aria-label="Open hm-acme-atlas in Terminal"]'), null, "no Terminal.app on iOS");
+  assert.equal(view.host.querySelector('[aria-label="Terminate hm-acme-atlas"]') !== null, true);
+  assert.match(view.host.textContent ?? "", /tmux sessions on your Mac/);
+});
+
+test("on iOS the touch row always shows, and a key tap keeps the focus in the terminal", async () => {
+  installBridge();
+  const h = terminal.terminalHub()!;
+  await fromApp(onIos);
+  const fake = fakeScreen();
+  const view = await mount(() => <TerminalView session="hm-acme-atlas" hub={h} loadScreen={fake.load} autoFocus={false} />);
+  await flush();
+  assert.equal(view.host.querySelector(".term")?.getAttribute("data-platform"), "ios");
+  const css = readFileSync(new URL("./styles/terminal.css", import.meta.url), "utf8");
+  assert.match(css, /\.term\[data-platform="ios"\] \.term-keys \{ display: flex; \}/);
+  const esc = Array.from(view.host.querySelectorAll(".term-keys button")).find(b => b.textContent === "Esc")!;
+  for (const type of ["pointerdown", "mousedown"]) {
+    const event = new window.Event(type, { bubbles: true, cancelable: true });
+    esc.dispatchEvent(event as unknown as Event);
+    assert.equal(event.defaultPrevented, true, `${type} must not move focus off xterm`);
+  }
 });
