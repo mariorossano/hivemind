@@ -1,5 +1,5 @@
 import { Hash, Lock, Sparkles, UserPlus } from "lucide-react";
-import { useCallback, useLayoutEffect, useMemo, useRef, useState, type MutableRefObject } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MutableRefObject } from "react";
 import type { AdaptiveRoutingView } from "../src/shared/adaptive-topology.ts";
 import type { ChannelTaskPage } from "../src/shared/tasks.ts";
 import type { Agent, Channel, Message, ThreadStatus } from "../src/shared/types.ts";
@@ -21,14 +21,16 @@ import { RoomPanel } from './RoomPanel.tsx';
 import type { Sel } from "./selection.ts";
 import { isOpenTask } from "./task-progress.ts";
 import { TaskChip } from "./TaskCard.tsx";
+import { TerminalPanel } from "./TerminalView.tsx";
 import type { ChannelPane } from "./use-channel-pane.ts";
 import { useChannelWork } from "./use-channel-work.ts";
+import { agentTerminalSession, liveSession, useTerminalState } from "./use-terminal.ts";
 import type { useSend } from "./use-send.ts";
 import type { ThreadOpenAnchor } from "./use-thread-scroll-anchor.ts";
 
 const NO_MESSAGES: Message[] = [];
 
-export type ChannelTab = "messages" | "tasks" | "contract";
+export type ChannelTab = "messages" | "tasks" | "contract" | "terminal";
 
 /**
  * The selected channel: header with its members, tabs (Messages · Tasks · Contract for rooms) and, on
@@ -97,7 +99,22 @@ export function ChannelDesk({ channelId, activeChannel, agents, roomAgents, chan
   const dm = activeChannel?.type === "dm";
   const newUnreadJump = unreadTarget?.channelId === channelId && unreadTarget !== picked.unreadTarget;
   const requested = picked.channelId === channelId && !newUnreadJump ? picked.tab : "messages";
-  const tab = requested === "contract" && !room ? "messages" : requested;
+  // The apps only: a DM with an agent whose tmux session runs (or whose server is down, to say so) has a Terminal tab.
+  // Once it had one, the tab stays while the broker reconnects and the session list is not known yet (TerminalPanel
+  // then keeps the terminal, which attaches again by itself).
+  const terminals = useTerminalState();
+  const dmPeer = dm && activeChannel ? dmPeerOf(activeChannel, agents) : undefined;
+  const peerSession = terminals.native ? agentTerminalSession(dmPeer) : null;
+  const peerLive = peerSession !== null && liveSession(terminals, peerSession) !== null;
+  const listUnknown = terminals.sessions === null && terminals.broker !== "unverified";
+  const [hadTerminal, setHadTerminal] = useState<string | null>(null);
+  useEffect(() => {
+    if (peerLive) setHadTerminal(peerSession);
+    else if (!listUnknown) setHadTerminal(null);
+  }, [peerLive, listUnknown, peerSession]);
+  const terminalSession = peerSession && (peerLive || terminals.broker === "unavailable"
+    || (listUnknown && hadTerminal === peerSession)) ? peerSession : null;
+  const tab = (requested === "contract" && !room) || (requested === "terminal" && !terminalSession) ? "messages" : requested;
   const work = useChannelWork(activeChannel, roomTick);
   // The hidden stream loses its scroll position; coming back to a live pane lands on its newest message.
   useLayoutEffect(() => {
@@ -109,6 +126,7 @@ export function ChannelDesk({ channelId, activeChannel, agents, roomAgents, chan
     { id: "messages", label: "Messages" },
     { id: "tasks", label: "Tasks", count: openTasks },
     ...(room ? [{ id: "contract" as const, label: "Contract" }] : []),
+    ...(terminalSession ? [{ id: "terminal" as const, label: "Terminal" }] : []),
   ];
   return (
     <>
@@ -153,6 +171,10 @@ export function ChannelDesk({ channelId, activeChannel, agents, roomAgents, chan
       ) : tab === "contract" && activeChannel ? (
         <div className="stream channel-panel" role="tabpanel" id="channel-panel-contract" aria-labelledby="channel-tab-contract">
           <RoomPanel key={activeChannel.id} channel={activeChannel} agents={agents} tick={roomTick} />
+        </div>
+      ) : tab === "terminal" && terminalSession ? (
+        <div className="channel-panel terminal-panel" role="tabpanel" id="channel-panel-terminal" aria-labelledby="channel-tab-terminal">
+          <TerminalPanel session={terminalSession} />
         </div>
       ) : null}
       {/* Messages stays mounted while another tab shows, so the composer keeps its draft and the stream its place. */}
@@ -229,8 +251,7 @@ export function ChannelDesk({ channelId, activeChannel, agents, roomAgents, chan
  * agents shows both. The heading keeps the channel name, which is how the DM is listed.
  */
 function DmTitle({ channel, agents, openTasks }: { channel: Channel; agents: Agent[]; openTasks: number }) {
-  const members = channel.memberIds.flatMap((id) => agents.filter((agent) => agent.id === id));
-  const peers = members.some((agent) => agent.id === "human") ? members.filter((agent) => agent.id !== "human") : members;
+  const peers = dmPeers(channel, agents);
   const peer = peers.length === 1 ? peers[0] : undefined;
   const status = peer && [peer.role === "worker" ? peer.seniority : null, peer.focus, peer.removedAt != null ? "removed" : peer.online ? "online" : "offline",
     openTasks > 0 ? `${openTasks} open ${openTasks === 1 ? "task" : "tasks"}` : null].filter(Boolean).join(" · ");
@@ -246,6 +267,18 @@ function DmTitle({ channel, agents, openTasks }: { channel: Channel; agents: Age
       {status && <p>{status}</p>}
     </div>
   );
+}
+
+/** A DM's other side: every member but the Human (both agents in a DM between two). */
+function dmPeers(channel: Channel, agents: Agent[]) {
+  const members = channel.memberIds.flatMap((id) => agents.filter((agent) => agent.id === id));
+  return members.some((agent) => agent.id === "human") ? members.filter((agent) => agent.id !== "human") : members;
+}
+
+/** The one agent a DM with the Human is with; none for a DM between two agents. */
+function dmPeerOf(channel: Channel, agents: Agent[]) {
+  const peers = dmPeers(channel, agents);
+  return channel.memberIds.includes("human") && peers.length === 1 ? peers[0] : undefined;
 }
 
 /** The first few member avatars and the count; the popover lists everyone with role and presence. */
