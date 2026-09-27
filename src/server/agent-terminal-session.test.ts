@@ -120,6 +120,13 @@ test("the label carries no capability: only identity storage and the join/snapsh
   const mentions = (pattern: RegExp) => sources(src).filter(file => pattern.test(readFileSync(path.join(src, file), "utf8"))).sort();
   assert.deepEqual(mentions(/\bterminal_session\b/),
     ["server/migrations/agent-terminal-session.ts", "server/services/identity.ts", "server/services/rows.ts"]);
-  assert.deepEqual(mentions(/terminalSession/), ["cli.ts", "mcp/index.ts", "server/app.ts", "server/services/identity.ts",
+  // Match the identity field and its validation/join helpers, not unrelated names such as
+  // terminalSessionLaunchProblem (which validates a launch, not an agent label).
+  const labelReference = /\bterminalSession(?:Fields|Name)?\b/;
+  assert.equal(labelReference.test("terminalSessionLaunchProblem"), false);
+  assert.equal(labelReference.test("agent.terminalSession"), true);
+  assert.equal(labelReference.test("terminalSessionFields(process.env)"), true);
+  assert.equal(labelReference.test("terminalSessionName(value)"), true);
+  assert.deepEqual(mentions(labelReference), ["cli.ts", "mcp/index.ts", "server/app.ts", "server/services/identity.ts",
     "shared/api-contract.ts", "shared/terminal-session.ts", "shared/types.ts"]);
 });
