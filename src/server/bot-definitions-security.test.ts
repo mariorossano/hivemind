@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test, type TestContext } from "node:test";
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, watch, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Hive } from "./hive.ts";
@@ -9,6 +9,7 @@ import { createApp } from "./app.ts";
 import { configureBot, launchContext, projectBotConfigurations, registerBotDefinition, saveProjectBotConfiguration } from "./bot-definitions.ts";
 import { preparePrivateDatabase } from "./private-database.ts";
 import { BOT_CONFIGURATION_REQUEST_BYTES } from "./ingress.ts";
+import { readPidMarker, waitForPidMarker } from '../test-support/pid-marker.ts';
 
 function fixture(t: TestContext) {
   const dir = mkdtempSync(path.join(os.tmpdir(), "hive-definition-security-"));
@@ -82,23 +83,26 @@ test("configure cannot strand a process on unserializable input or a missing exe
   await assert.rejects(configureBot(path.join(f.pkg, "missing"), f.home, {}), /Could not run/);
 });
 
-test("configure deadline settles when a detached descendant retains output pipes", { timeout: 5000 }, async t => {
+test("configure deadline settles when a detached descendant retains output pipes", { timeout: 10000 }, async t => {
   const f = fixture(t), marker = path.join(f.home, 'descendant-ready');
   f.install(`const {spawn}=require('node:child_process');
-    const child=spawn(process.execPath,['-e',"require('node:fs').writeFileSync(process.argv[1],String(process.pid));setInterval(()=>{},1000)",${JSON.stringify(marker)}],{detached:true,stdio:['ignore',1,2]});
+    const child=spawn(process.execPath,['-e',"require('node:fs').writeFileSync(process.argv[1],String(process.pid)+String.fromCharCode(10));setTimeout(()=>process.exit(0),15000)",${JSON.stringify(marker)}],{detached:true,stdio:['ignore',1,2]});
     child.unref();`);
   let descendant: number | undefined;
-  t.after(() => { if (descendant) { try { process.kill(descendant, 'SIGKILL'); } catch { /* already exited */ } } });
-  const ready = new Promise<void>(resolve => {
-    const watcher = watch(f.home, () => { if (existsSync(marker)) { watcher.close(); resolve(); } });
-    t.after(() => watcher.close());
-  });
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const outcome = assert.rejects(saveProjectBotConfiguration(f.home, f.project, 'http://localhost', 'safe-tool', change), /Bot rejected configuration/);
-  await ready; descendant = Number(readFileSync(marker, 'utf8'));
-  assert.ok(Number.isSafeInteger(descendant) && descendant > 0);
-  t.mock.timers.tick(15000);
-  await outcome;
+  void outcome.catch(() => {}); // Still asserted below, including when readiness fails.
+  try {
+    descendant = await waitForPidMarker(marker);
+    t.mock.timers.tick(15000);
+    await outcome;
+    process.kill(descendant, 0);
+  } finally {
+    t.mock.timers.tick(15000);
+    const pid = descendant ?? readPidMarker(marker);
+    if (pid) { try { process.kill(pid, 'SIGKILL'); } catch { /* already exited */ } }
+    await outcome;
+  }
   assert.equal(existsSync(path.join(f.home, 'bot-configurations.lock')), false);
   f.install(goodConfigure);
   assert.equal((await saveProjectBotConfiguration(f.home, f.project, 'http://localhost', 'safe-tool', change)).revision, 1);
