@@ -215,6 +215,41 @@ running, and with **Install tmux: `brew install tmux`** when tmux is missing.
 There is no launch outside tmux. **Copy** and **Copy all** work as before: the
 pasted text opens plain Terminal windows, not tmux.
 
+When the software is OpenCode (`opencode`, or any name containing it), the sheet
+has an **OpenCode Go API key (optional)** field, a masked input. A key pasted
+there reaches the agents of this launch as `OPENCODE_API_KEY`, which OpenCode's
+`opencode-go` and Zen providers read; left empty, OpenCode uses the key saved
+with `/connect`. It is **not saved** anywhere: not in the sheet's remembered
+settings, not in the copied command (**Copy** never includes it), and it is
+cleared once the launch started and when the sheet closes. The broker hands it
+to the new session through a private file that the session deletes on reading
+it, never on a command line ([Launch secrets](terminal-broker.md#launch-secrets)).
+An employee whose session is still running is reused as it is, so it keeps the
+key it started with; terminate its session to relaunch it with a new one. A
+browser has no such field, since it cannot launch.
+
+**Advanced launch options** have an **Environment variables** field for any
+software: one `NAME=value` per line (for example `OPENCODE_DISABLE_FFF=1` or
+`OPENCODE_CONFIG_CONTENT={"snapshot":false}`), blank lines and `#` comments
+skipped, the value taken literally after the first `=` (one pair of matching
+quotes around it is dropped). A name set twice keeps its last value, with a
+warning under the field. Names the shell, the terminal or Hivemind own (`PATH`,
+`HOME`, `TERM`, `TMUX`, `LD_*`, `DYLD_*`, `HIVEMIND_*` and the rest of the
+[denylist](terminal-broker.md#launch-environment)) and `OPENCODE_API_KEY` (use
+the key field) are refused, as are more than 32 variables, a value over 8 KiB
+or 32 KiB in all; the sheet names the line and the variable, never the value,
+and offers neither Copy nor a launch until it is fixed. The text is remembered
+per software in this browser (the sheet says so under the field, with a
+reminder not to put secrets there) and comes back when that software is chosen
+again. **Copy** puts the variables before the command, each single-quoted
+(`cd -- '<path>' && NAME='value' opencode …`); a launch sends them beside the
+command instead, and the broker hands them to the new session through the same
+private file as the key, loaded before the `cd`, never on a command line or in
+tmux's environment
+([Launch environment](terminal-broker.md#launch-environment)). **Resume same
+employees** gives every employee the same variables; one whose session is still
+running keeps the environment it started with.
+
 Each session is named `hm-<project>-<agent>`, or `hm-<project>-new-<n>` for a
 new agent whose name is not known yet. It starts in the workspace folder and
 runs the same command **Copy** would copy, in a login `zsh`, then stays open in
@@ -226,10 +261,21 @@ join; the UI maps agents to sessions by that label
 **In the app:**
 
 - **Terminal sessions** (above **Launch agent** in the sidebar, with the number
-  running) lists every Hivemind session: the agent it maps to, running or
-  exited, attached clients and start time. **Open** shows the session in an
-  in-app terminal, **Open in Terminal** attaches a Terminal.app window, and
-  **Terminate** ends the session and everything in it after a confirmation.
+  running) opens **Terminals**: one row per tmux session of the current project,
+  with the agent it maps to (avatar, name, role and seniority), the session
+  name, its state (**Running**, **Waiting to join** while no agent has joined
+  from it, **Reconnecting** while Hivemind Server is away, **Ended** when its
+  pane is dead), start time and attached clients. **Open** shows the session in
+  an in-app terminal (the row stays highlighted once you go back),
+  **Terminal.app** attaches a Terminal.app window, and the row's **⋯** menu has
+  **Copy attach command** (`tmux -L hivemind attach -t <name>`) and
+  **Terminate**, which ends the session and everything in it after a
+  confirmation. **Terminate all** ends every session of the current project
+  after one confirmation (other projects' sessions are not touched), and
+  **Launch agent** opens the Launch agent sheet. A session belongs to the
+  project its launch recorded (`@hivemind_project`), else to its agent's; the
+  footer counts the other projects' sessions, and **Show all projects** lists
+  them under their project's name.
 - A DM with an agent whose session is running has a **Terminal** tab with the
   same in-app terminal.
 - Roster rows show a small terminal icon for an agent with a running session.
@@ -276,9 +322,19 @@ trusted as the UI itself is. What limits this:
   bytes, a title of at most 200 characters and an absolute folder (`/…` or
   `~/…`). The broker checks everything again, and refuses a launch whose tmux
   command would pass 15 KiB (tmux itself stops at about 16 KiB).
+- A launch may carry only one secret, `OPENCODE_API_KEY`, of at most 512
+  printable ASCII characters without spaces; any other name drops the message.
+  It never reaches a command line or a log.
+- A launch's environment variables follow the
+  [same rules as the sheet](terminal-broker.md#launch-environment) (at most 32,
+  shell names off the denylist, values of at most 8 KiB without control
+  characters, 32 KiB in all); anything else drops the message. No value
+  reaches a command line or a log.
 - The app takes at most one `terminal-launch`, one `terminal-open` and one
   `terminal-kill` per second per window, each counted on its own, and answers a
-  refused one with an error.
+  refused one with an error. **Terminate all** is one `terminal-kill` naming up
+  to 24 sessions (each checked), which the app kills one after another and
+  counts once, so none is refused or dropped by the throttle.
 - Streams belong to the page that attached them: another page load in the
   window detaches them, and input goes only to a stream the page attached.
 - `.command` scripts are created exclusively in a folder only you can read, and

@@ -14,14 +14,19 @@ public struct TmuxNewSession: Equatable, Sendable {
   public let title: String
   public let project: String
   public let agent: String?
+  /// The file the script loads the launch's environment variables and
+  /// secrets from (LaunchSecretStore). Only its path is in argv; the values
+  /// never are.
+  public let environmentFile: LaunchEnvironmentFile?
 
-  public init(name: SessionName, launch: BrokerLaunch) {
+  public init(name: SessionName, launch: BrokerLaunch, environmentFile: LaunchEnvironmentFile? = nil) {
     self.name = name
     self.cwd = launch.cwd
     self.command = launch.command
     self.title = launch.title
     self.project = launch.project
     self.agent = launch.agent
+    self.environmentFile = environmentFile
   }
 }
 
@@ -64,7 +69,8 @@ public struct TmuxCommand: Equatable, Sendable {
   public var baseArguments: [String] { ["-u", "-L", Self.socketName, "-f", configPath] }
 
   /// Starts the session detached, then records project and agent on it.
-  /// tmux runs `/bin/zsh -lc <script>` directly (argv, no shell of ours).
+  /// tmux runs `/bin/zsh -lic <script>` directly (argv, no shell of ours): a login
+  /// *interactive* shell, so ~/.zshrc (aliases, nvm, rbenv…) applies as in a terminal.
   /// Precondition: has-session said it does not exist, and the broker
   /// checked that `cwd` is a directory.
   ///
@@ -81,7 +87,7 @@ public struct TmuxCommand: Equatable, Sendable {
       "-n", Self.argument(Self.windowName(spec.title)),
       "-e", "\(SessionName.environmentVariable)=\(spec.name.rawValue)",
       "--",
-      Self.shell, "-lc", Self.argument(Self.script(cwd: spec.cwd, command: spec.command)),
+      Self.shell, "-lic", Self.argument(Self.script(cwd: spec.cwd, command: spec.command, environmentFile: spec.environmentFile)),
     ]
     // ";" as its own argument chains tmux commands in one call. set-option
     // takes a pane target, which needs "=name:" (SessionName.windowTarget).
@@ -124,14 +130,44 @@ public struct TmuxCommand: Equatable, Sendable {
     "exec " + ([executable] + attach(name)).map(TerminalScript.shellQuoted).joined(separator: " ")
   }
 
-  /// The script zsh -lc runs: cd to the folder (single-quoted), the command
-  /// as the sheet built it, then an interactive login shell so the session
-  /// outlives the agent. Joined by a blank line, not "; ", so a trailing
-  /// comment or backslash in the command cannot swallow the exec.
-  public static func script(cwd: String, command: String) -> String {
+  /// The script zsh -lic runs: first the launch's variables loaded from its
+  /// file and the file deleted (`environmentLine`), then cd to the folder
+  /// (single-quoted), the command as the sheet built it, then an interactive
+  /// login shell so the session outlives the agent. Joined by a blank line,
+  /// not "; ", so a trailing comment or backslash in the command cannot
+  /// swallow the exec.
+  public static func script(cwd: String, command: String, environmentFile: LaunchEnvironmentFile? = nil) -> String {
     var command = command
     while command.hasSuffix("\n") || command.hasSuffix("\r") { command.removeLast() }
-    return "cd -- \(TerminalScript.shellQuoted(cwd)) || exit 1\n" + command + "\n\nexec \(shell) -l"
+    return (environmentFile.map(environmentLine) ?? "")
+      + "cd -- \(TerminalScript.shellQuoted(cwd)) || exit 1\n" + command + "\n\nexec \(shell) -l"
+  }
+
+  /// The launch's variables, from its file into the shell's environment,
+  /// before anything else runs. The values are never in the script, only the
+  /// file's single-quoted path. Each `NAME=value` line is read raw (`read -r`
+  /// with an empty IFS: no backslash, quote, `$` or space is interpreted, and
+  /// leading and trailing spaces stay) and exported as one quoted word, so
+  /// nothing in a value is ever expanded or run.
+  ///
+  /// zsh parameters of its own that an assignment would abort the whole
+  /// script on (read-only ones such as `status`, arrays and associations
+  /// such as `argv` or `options`, and the user and group ids) are skipped
+  /// with a line on stderr naming them. A file that cannot be read sets
+  /// nothing and the launch goes on. `builtin` and /bin/rm, because ~/.zshrc
+  /// aliases and functions apply in this interactive shell. The two helper
+  /// variables are HIVEMIND_-named in lowercase, which no launch may set, and
+  /// are unset after. The variables live in the shell and what it starts,
+  /// never in tmux's global or session environment.
+  static func environmentLine(_ file: LaunchEnvironmentFile) -> String {
+    let path = TerminalScript.shellQuoted(file.path)
+    return "if builtin test -r \(path); then while IFS= builtin read -r hivemind_env_line; do "
+      + "hivemind_env_name=${hivemind_env_line%%=*}; "
+      + "case ${(tP)hivemind_env_name-}:$hivemind_env_name in "
+      + "*readonly*:*|array*:*|association*:*|*:UID|*:EUID|*:GID|*:EGID) "
+      + "builtin print -ru2 -- \"Hivemind: $hivemind_env_name is a zsh parameter of its own; not set\" ;; "
+      + "*) builtin export -- \"$hivemind_env_line\" ;; esac; "
+      + "done < \(path); fi; builtin unset hivemind_env_line hivemind_env_name; /bin/rm -f -- \(path)\n"
   }
 
   /// A tmux window name: one line without control characters or "#" (a

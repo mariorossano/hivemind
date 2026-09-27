@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { terminalSessionName } from "../src/shared/terminal-session.ts";
+import { launchEnvironmentProblem } from "../src/shared/launch-environment.ts";
 import { hashFor, parseHash, type Sel } from "./selection.ts";
 
 // Hivemind.app on the Mac (macos/) and the iPhone/iPad app (ios/) load this UI
@@ -236,9 +237,33 @@ export const serverUnverifiedHint = (platform: NativePlatform | null) =>
 
 /** The broker's limits (HivemindKit BrokerLimits); the app drops a message that breaks any. */
 export const TERMINAL_BROKER_LIMITS = {
-  launches: 24, commandBytes: 8 * 1024, titleChars: 200, pathBytes: 1024, agentChars: 64, requestIdChars: 64,
+  launches: 24, kills: 24, commandBytes: 8 * 1024, titleChars: 200, pathBytes: 1024, agentChars: 64, requestIdChars: 64,
   inputBytes: 64 * 1024, streams: 16, cols: { min: 2, max: 1000 }, rows: { min: 1, max: 500 },
+  /** One client → broker line (BrokerLimits.maxRequestBytes): the whole launch message has to fit. */
+  requestBytes: 1024 * 1024,
 } as const;
+
+/**
+ * Environment variables a launch hands its agent without argv (HivemindKit LaunchSecrets): today only OpenCode's
+ * OPENCODE_API_KEY, read by its opencode-go and opencode (Zen) providers. Pasted per launch and never saved; see
+ * docs/terminal-broker.md#launch-secrets.
+ */
+export type TerminalLaunchSecrets = { OPENCODE_API_KEY: string };
+
+/** The only secret names the app and the broker take; any other drops the whole message. */
+export const TERMINAL_SECRET_NAMES: readonly (keyof TerminalLaunchSecrets)[] = ["OPENCODE_API_KEY"];
+/** Bytes of one secret value, at most (HivemindKit LaunchSecrets.maxValueBytes). */
+export const TERMINAL_SECRET_MAX_BYTES = 512;
+/** 1–512 printable ASCII characters: no space, tab, newline, NUL or anything outside ASCII. */
+const SECRET_VALUE = /^[\x21-\x7e]{1,512}$/;
+
+export const OPENCODE_API_KEY_PROBLEM =
+  `The OpenCode Go API key must be at most ${TERMINAL_SECRET_MAX_BYTES} printable characters, without spaces or line breaks`;
+
+/** Why the app would refuse this secret value, or null. Never quotes the value. */
+export function terminalSecretProblem(value: string): string | null {
+  return SECRET_VALUE.test(value) ? null : OPENCODE_API_KEY_PROBLEM;
+}
 
 /** One agent session to start, or reuse when it already runs (the same project + agent). */
 export type TerminalSessionLaunch = {
@@ -250,13 +275,23 @@ export type TerminalSessionLaunch = {
   title: string;
   /** Absolute, "~" or "~/…"; null or absent: the home folder. */
   cwd?: string | null;
-  /** Shell text run by /bin/zsh -lc in the folder, as Copy would copy it (without its cd). */
+  /** Shell text run by /bin/zsh -lic in the folder, as Copy would copy it (without its cd). */
   command: string;
   /**
    * The session the agent last reported (agent.terminalSession): the broker reuses it while it runs, so an agent
    * first launched as hm-<project>-new-<n> keeps it on Resume. A hint only; the broker never creates a session by it.
    */
   session?: string | null;
+  /**
+   * Handed to the agent's shell through a private file, never argv, and never saved. Ignored when the launch reuses a
+   * running session (nothing is started). Never part of the copied command.
+   */
+  secrets?: TerminalLaunchSecrets;
+  /**
+   * The sheet's Environment variables (src/shared/launch-environment.ts), handed to the agent's shell through the
+   * same private file as `secrets`, never argv. Ignored when the launch reuses a running session. Absent when none.
+   */
+  environment?: Record<string, string>;
 };
 
 /** Page → app. `id` is the page's own request id (1–64 chars), echoed on the answer. */
@@ -279,13 +314,18 @@ export type TerminalMessage =
   | { type: "terminal-ack"; stream: number; bytes: number }
   /** Answered with terminal-killed. The page confirms with the user first. */
   | { type: "terminal-kill"; id?: string; session: string }
+  /**
+   * Terminate all: 1–24 sessions (TERMINAL_BROKER_LIMITS.kills), killed one after another and counted as one request
+   * against the app's kill throttle. Answered once, with terminal-killed carrying `sessions` and `errors`.
+   */
+  | { type: "terminal-kill"; id?: string; sessions: string[] }
   /** terminal-status and sessions now, then sessions on every change. */
   | { type: "sessions-subscribe" }
   | { type: "sessions-unsubscribe" };
 
 export type TerminalSessionInfo = {
   name: string;
-  /** Project slug and agent name recorded at launch; labels only. Map agents by agent.terminalSession. */
+  /** Project slug and agent name recorded at launch; labels only. Map agents by agent.terminalSession, else these (recordedSession). */
   project: string | null;
   agent: string | null;
   alive: boolean;
@@ -296,6 +336,8 @@ export type TerminalSessionInfo = {
 };
 
 export type TerminalLaunchFailure = { index: number; code: string; message: string };
+/** A session of a batch terminal-kill that did not end; `code` no-such-session when it had already gone. */
+export type TerminalKillFailure = { session: string; code: string; message: string };
 
 /** App → page, as the detail of a TERMINAL_EVENT. */
 export type TerminalEvent =
@@ -310,6 +352,8 @@ export type TerminalEvent =
   | { type: "terminal-output"; stream: number; data: string }
   | { type: "terminal-exit"; stream: number; status: number | null }
   | { type: "terminal-killed"; id: string | null; session: string }
+  /** The answer to a batch terminal-kill: the sessions that ended, in order, and why the others did not. */
+  | { type: "terminal-killed"; id: string | null; sessions: string[]; errors: TerminalKillFailure[] }
   /** `code` is a BrokerErrorCode (bad-message, no-such-session, tmux-missing, …). */
   | { type: "terminal-error"; id: string | null; code: string; message: string; stream: number | null };
 
@@ -368,6 +412,14 @@ export function parseTerminalEvent(detail: unknown): TerminalEvent | null {
       return isStream(detail.stream) && status !== undefined ? { type: "terminal-exit", stream: detail.stream, status } : null;
     }
     case "terminal-killed": {
+      if (detail.sessions !== undefined) {
+        const { sessions, errors } = detail;
+        if (detail.session !== undefined || !Array.isArray(sessions) || !sessions.every(name => terminalSessionName(name))) return null;
+        if (!Array.isArray(errors) || !errors.every(e => isRecord(e) && terminalSessionName(e.session) &&
+            typeof e.code === "string" && typeof e.message === "string")) return null;
+        return { type: "terminal-killed", id, sessions: sessions as string[],
+          errors: (errors as TerminalKillFailure[]).map(({ session, code, message }) => ({ session, code, message })) };
+      }
       const session = terminalSessionName(detail.session);
       return session ? { type: "terminal-killed", id, session } : null;
     }
@@ -445,11 +497,39 @@ export function terminalSessionLaunchProblem(launches: readonly TerminalSessionL
     if (!launch.command.trim() || launch.command.includes("\0")) return "The command is empty";
     if (utf8Length(launch.command) > limits.commandBytes) return "The command is too long to launch; copy it instead";
     if (launch.session != null && !terminalSessionName(launch.session)) return "Not a Hivemind session";
+    if (launch.secrets !== undefined) {
+      const secrets = launch.secrets as unknown;
+      if (!isRecord(secrets)) return "Launch secrets must be an object";
+      const names = Object.keys(secrets);
+      if (names.length === 0 || names.some(name => !(TERMINAL_SECRET_NAMES as readonly string[]).includes(name))) {
+        return "Only an OpenCode Go API key can be passed to a launch";
+      }
+      for (const name of names) {
+        const value = secrets[name];
+        if (typeof value !== "string" || terminalSecretProblem(value)) return OPENCODE_API_KEY_PROBLEM;
+      }
+    }
+    if (launch.environment !== undefined) {
+      const problem = launchEnvironmentProblem(launch.environment);
+      if (problem) return problem;
+    }
     const cwd = launch.cwd;
     if (cwd && (!(cwd.startsWith("/") || cwd === "~" || cwd.startsWith("~/")) || cwd.includes("\0") ||
         utf8Length(cwd) > limits.pathBytes)) {
       return "Launching needs an absolute workspace path (/… or ~/…)";
     }
   }
+  // The app sends the launches to the broker in one line; each launch's variables count once per employee. The
+  // margin covers what the app adds (a home folder for "~", the frame's own keys).
+  if (utf8Length(JSON.stringify(terminalLaunchItems(launches))) + 64 * 1024 > limits.requestBytes) {
+    return "Too much to launch at once: start fewer employees or shorten the environment variables";
+  }
   return null;
+}
+
+/** The launches as a terminal-launch message carries them: absent fields left out. */
+export function terminalLaunchItems(launches: readonly TerminalSessionLaunch[]) {
+  return launches.map(({ project, agent, title, cwd, command, session, secrets, environment }) =>
+    ({ project, agent, title, ...(cwd ? { cwd } : {}), command, ...(session ? { session } : {}), ...(secrets ? { secrets } : {}),
+      ...(environment ? { environment } : {}) }));
 }

@@ -4,11 +4,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { Agent, Project, Seniority } from "../src/shared/types.ts";
 import { modelChoiceGroups, parseChoiceId, selectedChoiceId } from "../src/shared/launch-models.ts";
 import { api } from "./api.ts";
-import { inNativeApp, onMacDesktop, terminalSessionLaunchProblem, type TerminalSessionLaunch } from "./native-bridge.ts";
+import {
+  inNativeApp, onMacDesktop, terminalSecretProblem, terminalSessionLaunchProblem, type TerminalLaunchSecrets, type TerminalSessionLaunch,
+} from "./native-bridge.ts";
 import { SessionsSheet } from "./SessionsSheet.tsx";
 import { TerminalNotice } from "./TerminalNotice.tsx";
 import { agentTerminalSession, terminalBlocker, terminalHub, useTerminalState, type TerminalLaunched } from "./use-terminal.ts";
 import { projectLaunchTools, type LaunchContext } from "../src/shared/launch-prompt.ts";
+import { parseLaunchEnvironment } from "../src/shared/launch-environment.ts";
 import {
   EFFORTS,
   buildLaunchCommand,
@@ -39,6 +42,8 @@ type Saved = {
   resumeName: string;
   allHives: boolean;
   tunes: Record<string, { model: string; effort: string }>;
+  /** The Environment variables field's text per software (the Software field, trimmed). */
+  environments: Record<string, string>;
 };
 
 const defaults: Saved = {
@@ -57,7 +62,15 @@ const defaults: Saved = {
   resumeName: "",
   allHives: false,
   tunes: {},
+  environments: {},
 };
+
+/** Software names whose Environment variables are kept, and the characters of one field's text. */
+const MAX_ENVIRONMENTS = 24;
+const MAX_ENVIRONMENT_TEXT = 64 * 1024;
+
+/** The software an Environment variables text belongs to: the Software field as the launch uses it. */
+const environmentKey = (software: string) => software.trim() || "codex";
 
 function loadSaved(): Saved {
   try {
@@ -90,6 +103,15 @@ function loadSaved(): Saved {
         tunes[name] = { model, effort: seatEffort };
       }
     }
+    const environments: Record<string, string> = {};
+    if (parsed.environments && typeof parsed.environments === "object" && !Array.isArray(parsed.environments)) {
+      for (const [name, text] of Object.entries(parsed.environments).slice(0, MAX_ENVIRONMENTS)) {
+        const key = name.trim();
+        if (key && key !== "__proto__" && typeof text === "string" && text.trim() && text.length <= MAX_ENVIRONMENT_TEXT) {
+          environments[key] = text;
+        }
+      }
+    }
     return {
       ...defaults,
       software: typeof parsed.software === "string" && parsed.software.trim() ? parsed.software.trim() : "codex",
@@ -107,6 +129,7 @@ function loadSaved(): Saved {
       resumeName: typeof parsed.resumeName === "string" ? parsed.resumeName : "",
       allHives: parsed.allHives === true,
       tunes,
+      environments,
     };
   } catch {
     return defaults;
@@ -221,7 +244,18 @@ export function LaunchSheet({
   const [resume, setResume] = useState(initial.resume);
   const [allHives, setAllHives] = useState(initial.allHives);
   const [tunes, setTunes] = useState<Record<string, { model: string; effort: string }>>(initial.tunes);
+  // Kept per software in this browser (never sent anywhere but with a launch); restored when that software is chosen.
+  const [environments, setEnvironments] = useState<Record<string, string>>(initial.environments);
+  const envKey = environmentKey(software);
+  const envText = Object.hasOwn(environments, envKey) ? environments[envKey]! : "";
+  const parsedEnv = useMemo(() => parseLaunchEnvironment(envText), [envText]);
+  const envCount = Object.keys(parsedEnv.environment).length;
+  const envError = parsedEnv.errors.length ? "Fix the environment variables first" : null;
+  const environment = !envError && envCount ? parsedEnv.environment : null;
   const [copied, setCopied] = useState<string | null>(null);
+  // Pasted per launch and sent only to the app with the launch (docs/terminal-broker.md#launch-secrets): never saved,
+  // never in the copied text, cleared after a launch that started and when the sheet closes.
+  const [opencodeKey, setOpencodeKey] = useState("");
   const terminals = useTerminalState();
   // Terminal.app is the Mac's. The iPhone/iPad app starts sessions on the Mac and shows them in the page instead.
   const terminalApp = native && onMacDesktop(terminals.platform);
@@ -299,11 +333,12 @@ export function LaunchSheet({
         focus,
         resume: false,
       });
-      return { ok: true as const, launch, text: launchBlockText(launch) };
+      if (envError) throw new Error(envError);
+      return { ok: true as const, launch, text: launchBlockText(launch, environment) };
     } catch (e) {
       return { ok: false as const, error: String((e as Error).message || e) };
     }
-  }, [software, extraFlags, model, effort, workspacePath, cdWorktree, project, projects, projectSlug, hiveName, passProject, role, seniority, focus, adoptUntrusted, launchContext, contextError]);
+  }, [software, extraFlags, model, effort, workspacePath, cdWorktree, project, projects, projectSlug, hiveName, passProject, role, seniority, focus, adoptUntrusted, launchContext, contextError, environment, envError]);
 
   const resumeBlocks = useMemo(() => {
     return roster.map((agent) => {
@@ -333,12 +368,13 @@ export function LaunchSheet({
           resume: true,
           resumeName: agent.name,
         });
-        return { agent, hive, ok: true as const, launch, text: launchBlockText(launch) };
+        if (envError) throw new Error(envError);
+        return { agent, hive, ok: true as const, launch, text: launchBlockText(launch, environment) };
       } catch (e) {
         return { agent, hive, ok: false as const, error: String((e as Error).message || e), text: "" };
       }
     });
-  }, [roster, projects, project, projectSlug, pathDirty, workspacePath, software, extraFlags, model, effort, tunes, cdWorktree, passProject, adoptUntrusted, contexts, contextErrors]);
+  }, [roster, projects, project, projectSlug, pathDirty, workspacePath, software, extraFlags, model, effort, tunes, cdWorktree, passProject, adoptUntrusted, contexts, contextErrors, environment, envError]);
 
   const remember = (patch: Partial<Saved> = {}) => {
     const next: Saved = {
@@ -357,8 +393,19 @@ export function LaunchSheet({
       resumeName: "",
       allHives: patch.allHives ?? allHives,
       tunes: patch.tunes ?? tunes,
+      environments: patch.environments ?? environments,
     };
     persist(next);
+  };
+
+  const setEnvText = (text: string) => {
+    const next = { ...environments };
+    delete next[envKey];
+    // The software just edited comes first, so the oldest are the ones forgotten past the cap.
+    const kept = text.trim() ? { [envKey]: text, ...next } : next;
+    const trimmed = Object.fromEntries(Object.entries(kept).slice(0, MAX_ENVIRONMENTS));
+    setEnvironments(trimmed);
+    remember({ environments: trimmed });
   };
 
   const setTune = (name: string, patch: Partial<{ model: string; effort: string }>) => {
@@ -407,6 +454,20 @@ export function LaunchSheet({
   );
 
   const canCopyOne = built.ok && projects.length > 0;
+  // Only where the page can launch (the apps) and only for OpenCode, whose opencode-go and Zen providers read it.
+  const showOpencodeKey = native && softwareFamily(software) === "opencode";
+  // Only where launches run in tmux (the apps): without env_vars a Codex agent never reports its session.
+  const showCodexEnvHint = native && softwareFamily(software) === "codex";
+  useEffect(() => { if (!showOpencodeKey) setOpencodeKey(""); }, [showOpencodeKey]);
+  const opencodeKeyValue = showOpencodeKey ? opencodeKey.trim() : "";
+  const opencodeKeyProblem = opencodeKeyValue ? terminalSecretProblem(opencodeKeyValue) : null;
+  const secrets: { secrets?: TerminalLaunchSecrets } = opencodeKeyValue ? { secrets: { OPENCODE_API_KEY: opencodeKeyValue } } : {};
+  // Beside the command, never in it: the app hands them to the session through its private launch file.
+  const launchEnv: { environment?: Record<string, string> } = environment ? { environment } : {};
+  const close = () => {
+    setOpencodeKey("");
+    onClose();
+  };
   const canCopyAll = resume && resumeBlocks.length > 0 && resumeBlocks.every((b) => b.ok);
 
   // Hivemind.app only: the same launches as the copied text, each in its own tmux session (reused when that
@@ -417,8 +478,12 @@ export function LaunchSheet({
         title: seatTitle(b.hive?.name ?? "", b.agent.name), ...b.launch,
         // The session this employee already runs in, even one named hm-<project>-new-<n>, is reused.
         session: agentTerminalSession(b.agent),
+        ...secrets,
+        ...launchEnv,
       }] : []) : [])
-    : (canCopyOne && built.ok ? [{ project: project?.slug ?? projectSlug, agent: null, title: seatTitle(hiveName, `new ${role}`), ...built.launch }] : []);
+    : (canCopyOne && built.ok
+      ? [{ project: project?.slug ?? projectSlug, agent: null, title: seatTitle(hiveName, `new ${role}`), ...built.launch, ...secrets,
+          ...launchEnv }] : []);
   const terminalBlock = native ? terminalBlocker(terminals) : null;
   const terminalProblem = terminalBlock?.message ?? (terminalLaunches.length ? terminalSessionLaunchProblem(terminalLaunches) : null);
   const canLaunchTerminal = native && terminalLaunches.length > 0 && !terminalProblem && !launching;
@@ -450,6 +515,7 @@ export function LaunchSheet({
         const note = describeLaunch(launches, result);
         setLaunchNote(note);
         if (note?.error) return;
+        setOpencodeKey("");
         if (!terminalApp) {
           // One session opens in its terminal; several open the list, each a tap away.
           const names = result.names.filter((name): name is string => name !== null);
@@ -479,14 +545,16 @@ export function LaunchSheet({
     passProject && "pass project",
     adoptUntrusted && "trust hive mail",
     extraFlags.trim() && "extra flags",
+    envCount > 0 && (envCount === 1 ? "1 env variable" : `${envCount} env variables`),
+    parsedEnv.errors.length > 0 && "env variables to fix",
   ].filter(Boolean).join(" · ") || "defaults off";
 
   if (started) {
-    return <SessionsSheet agents={agents} projects={projects} onClose={onClose} initialSession={started.session} />;
+    return <SessionsSheet agents={agents} projects={projects} onClose={close} initialSession={started.session} />;
   }
 
   return (
-    <Modal onClose={onClose}>
+    <Modal onClose={close}>
       <div className="sheet sheet-wide launch-sheet" role="dialog" aria-modal="true" aria-label="Launch agent" onClick={(e) => e.stopPropagation()}>
         <header className="sheet-head">
           <span className="sheet-icon" aria-hidden="true"><Terminal size={18} /></span>
@@ -500,7 +568,7 @@ export function LaunchSheet({
                 : "Choose an agent, then paste its launch command into a new terminal. One terminal = one employee."}
             </p>
           </div>
-          <button type="button" className="icon-btn" aria-label="Close dialog" title="Close" onClick={onClose}>
+          <button type="button" className="icon-btn" aria-label="Close dialog" title="Close" onClick={close}>
             <X size={16} aria-hidden="true" />
           </button>
         </header>
@@ -554,6 +622,13 @@ export function LaunchSheet({
               <option key={name} value={name} />
             ))}
           </datalist>
+          {showCodexEnvHint && (
+            <p className="help-p launch-codex-env">
+              Codex passes <code>HIVEMIND_TMUX_SESSION</code> to MCP servers only if its config lists it. Add{" "}
+              <code>env_vars = ["HIVEMIND_TMUX_SESSION"]</code> under <code>[mcp_servers.hivemind]</code> in each{" "}
+              <code>CODEX_HOME</code>’s <code>config.toml</code> — <code>hivemind mcp-config --codex</code> prints the block.
+            </p>
+          )}
           <ModelSelect
             software={software}
             model={model}
@@ -564,6 +639,33 @@ export function LaunchSheet({
               remember({ model: next.model, effort: next.effort });
             }}
           />
+          {showOpencodeKey && (
+            <>
+              <label className="launch-secret">
+                OpenCode Go API key (optional)
+                <input
+                  className="mono"
+                  type="password"
+                  name="hivemind-launch-opencode-key"
+                  value={opencodeKey}
+                  onChange={(e) => setOpencodeKey(e.target.value)}
+                  autoComplete="off"
+                  autoCapitalize="off"
+                  autoCorrect="off"
+                  spellCheck={false}
+                  data-1p-ignore="true"
+                  data-lpignore="true"
+                  aria-describedby="launch-opencode-key-help"
+                  aria-invalid={opencodeKeyProblem ? true : undefined}
+                />
+              </label>
+              <p id="launch-opencode-key-help" className="help-p">
+                Passed to OpenCode as <code>OPENCODE_API_KEY</code>. Not saved — if empty, OpenCode uses the key from <code>/connect</code>.
+                {resume && " An employee whose session is still running keeps it as it is."}
+              </p>
+              {opencodeKeyProblem && <p className="err" role="alert">{opencodeKeyProblem}</p>}
+            </>
+          )}
           {!resume && (
             <>
               {role === "worker" && (
@@ -625,6 +727,37 @@ export function LaunchSheet({
               autoComplete="off"
             />
           </label>
+          <label className="launch-env">
+            Environment variables
+            <textarea
+              className="mono"
+              rows={3}
+              value={envText}
+              onChange={(e) => setEnvText(e.target.value)}
+              placeholder={"optional — one NAME=value per line, e.g.\nOPENCODE_DISABLE_FFF=1"}
+              autoComplete="off"
+              autoCapitalize="off"
+              autoCorrect="off"
+              spellCheck={false}
+              aria-describedby="launch-env-help"
+              aria-invalid={parsedEnv.errors.length ? true : undefined}
+            />
+          </label>
+          <p id="launch-env-help" className="help-p">
+            One <code>NAME=value</code> per line, taken literally; <code>#</code> starts a comment.{" "}
+            Remembered for {envKey} in this browser. Don't put secrets here — use the API key field.
+            {resume && native && " An employee whose session is still running keeps the variables it started with."}
+          </p>
+          {parsedEnv.errors.length > 0 && (
+            <p className="err launch-env-errors" role="alert">
+              {parsedEnv.errors.map((error, i) => <span key={i}>{i > 0 && <br />}{error}</span>)}
+            </p>
+          )}
+          {parsedEnv.warnings.length > 0 && (
+            <p className="help-p launch-env-warnings" role="status">
+              {parsedEnv.warnings.map((warning, i) => <span key={i}>{i > 0 && <br />}{warning}</span>)}
+            </p>
+          )}
           <fieldset className="checks">
             <legend>Launch</legend>
             <label className="check">
@@ -804,7 +937,7 @@ export function LaunchSheet({
               all hives
             </label>
           )}
-          <button type="button" className="launch-close" onClick={onClose}>
+          <button type="button" className="launch-close" onClick={close}>
             Close
           </button>
           {resume ? (
