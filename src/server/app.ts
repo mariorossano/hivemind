@@ -22,6 +22,8 @@ import { installInstanceProof } from "./instance-proof.ts";
 import { adviseAfterWait, assignAdaptiveTask, mutateAdaptiveTask, mutateAdaptiveRoom, sendAdaptiveAgentMessage, setAdaptiveThreadStatus } from './adaptive-topology-actions.ts';
 
 export type AppHooks = {
+  /** Trusted listener origin for local bot processes and MCP clients, never proxy/request headers. */
+  serverOrigin?: () => string;
   jevDiagnosticFetch?: typeof fetch;
   telegramRunning?: () => boolean;
   reloadTelegram?: () => boolean | Promise<boolean>;
@@ -42,6 +44,8 @@ function windowRoots(messages: readonly { id: string }[], threadId: string | nul
 }
 
 export function createApp(hive: Hive, hooks: AppHooks = {}) {
+  // HTTP hosting supplies its actual bound address. Request-only apps retain their own origin.
+  const serverOrigin = (requestUrl: string) => hooks.serverOrigin ? hooks.serverOrigin() : requestUrl;
   const parseBotInput = <T>(schema: z.ZodType<T>, input: unknown): T => {
     const parsed = schema.safeParse(input);
     if (!parsed.success) throw new HiveError(400, 'Invalid bot request');
@@ -88,7 +92,7 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
   ui.put("/projects/:slug/bots/catalog/:id", async c => {
     const project = hive.projects.getProjectBySlug(c.req.param("slug"));
     try {
-      return c.json({ configuration: await saveProjectBotConfiguration(hive.home, project, c.req.url, c.req.param("id"), await readLimitedJson(c.req.raw, BOT_CONFIGURATION_REQUEST_BYTES)) });
+      return c.json({ configuration: await saveProjectBotConfiguration(hive.home, project, serverOrigin(c.req.url), c.req.param("id"), await readLimitedJson(c.req.raw, BOT_CONFIGURATION_REQUEST_BYTES)) });
     } catch (error) {
       if (error instanceof HiveError) throw error;
       throw new HiveError(400, botErrorMessage(error));
@@ -136,7 +140,7 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
     if (!['status', 'start', 'stop'].includes(body?.action)) throw new HiveError(400, 'Choose status, start or stop');
     try {
       const { project } = botDefinition(bot.projectId!, access.definitionId);
-      return c.json({ result: await callProjectBot(hive.home, project, c.req.url, access.definitionId, bot, { tool: body.action, arguments: {} }, true, () => {
+      return c.json({ result: await callProjectBot(hive.home, project, serverOrigin(c.req.url), access.definitionId, bot, { tool: body.action, arguments: {} }, true, () => {
         const current = hive.bots.botCredential(human, project.id, bot.id);
         if (hive.bots.access(current.bot).revision !== access.revision) throw new HiveError(409, 'Bot access changed; refresh before this operation');
         if (body.action === 'start' && current.credential.revoked) throw new HiveError(403, 'Reconnect active credentials before starting');
@@ -155,7 +159,7 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
     hive.bots.setAccess(human, project.id, created.bot.id, { capabilities: definition.capabilities!.filter(cap => cap !== 'receive'),
       definitionId: definition.id, receiveChannels: [], expectedRevision: 1 });
     try {
-      await connectProjectBot(hive.home, project, c.req.url, definition.id, created.bot, created.token, () => {
+      await connectProjectBot(hive.home, project, serverOrigin(c.req.url), definition.id, created.bot, created.token, () => {
         const bot = hive.identity.agentByToken(created.token);
         if (hive.bots.access(bot).definitionId !== definition.id) throw new HiveError(409, 'Bot connection changed before setup');
       });
@@ -175,7 +179,7 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
     const { project, definition } = botDefinition(current.bot.projectId!, access.definitionId);
     if (!definition.configured) throw new HiveError(409, 'Configure the definition first');
     const rotated = hive.bots.changeBotCredential(human, project.id, current.bot.id, { action: 'rotate', expectedRevision: input?.expectedRevision });
-    try { return c.json(await connectProjectBot(hive.home, project, c.req.url, access.definitionId, current.bot, rotated.token!, () => {
+    try { return c.json(await connectProjectBot(hive.home, project, serverOrigin(c.req.url), access.definitionId, current.bot, rotated.token!, () => {
       const bot = hive.identity.agentByToken(rotated.token!);
       if (hive.bots.access(bot).revision !== access.revision) throw new HiveError(409, 'Bot access changed before connection');
     })); }
@@ -183,7 +187,7 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
   });
   ui.get("/launch-context", c => {
     const slug = c.req.query("project");
-    return c.json(launchContext(hive.home, c.req.url, slug ? hive.projects.getProjectBySlug(slug) : undefined));
+    return c.json(launchContext(hive.home, serverOrigin(c.req.url), slug ? hive.projects.getProjectBySlug(slug) : undefined));
   });
   ui.get("/adaptive-routing", c => {
     hive.identity.getAgent("human");
@@ -481,7 +485,7 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
     if (!access.definitionId) throw new HiveError(409, 'Bot definition is not connected');
     const input = await readLimitedJson(c.req.raw, BOT_CONFIGURATION_REQUEST_BYTES);
     try {
-      return c.json({ result: await callProjectBot(hive.home, hive.projects.getProject(me.projectId), c.req.url, access.definitionId, bot, input, false, () => {
+      return c.json({ result: await callProjectBot(hive.home, hive.projects.getProject(me.projectId), serverOrigin(c.req.url), access.definitionId, bot, input, false, () => {
         const actor = hive.identity.agentByToken(c.get('token'));
         if (actor.role !== 'brain' || actor.projectId !== bot.projectId) throw new HiveError(403, 'Project brain access changed');
         const current = hive.bots.botCredential(hive.identity.getAgent('human'), actor.projectId!, bot.id);

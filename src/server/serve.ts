@@ -5,7 +5,7 @@ import type { Socket } from "node:net";
 import path from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 import { getRequestListener } from "@hono/node-server";
-import { DEFAULT_PORT, type Message } from "../shared/types.ts";
+import { DEFAULT_PORT, HiveError, type Message } from "../shared/types.ts";
 import { createRealtimeStream } from "../shared/realtime-client.ts";
 import { Hive } from "./hive.ts";
 import type { HiveEvents } from "./hive-events.ts";
@@ -44,6 +44,12 @@ export function startServer(opts: { port?: number; hive?: Hive; telegram?: boole
   }
   const telegram = startTelegram(hive, opts.telegram !== false);
   const app = createApp(hive, {
+    serverOrigin: () => {
+      const address = server.address();
+      if (!address || typeof address === 'string') throw new HiveError(503, 'Server is not listening');
+      // The listener is loopback-only. The actual port also covers port:0 in embedded/test servers.
+      return `http://127.0.0.1:${address.port}`;
+    },
     telegramRunning: () => telegram.running(),
     reloadTelegram: () => telegram.reload(),
     configureTelegram: input => telegram.configure(input),
@@ -167,4 +173,3 @@ export function startServer(opts: { port?: number; hive?: Hive; telegram?: boole
   };
   return { server, hive, port, shutdown, ready };
 }
-
