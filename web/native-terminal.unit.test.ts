@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
-  decodeTerminalData, encodeTerminalInput, parseTerminalEvent, terminalDataLength, terminalSessionLaunchProblem, terminalSize,
-  TERMINAL_BROKER_LIMITS, TERMINAL_EVENT, type TerminalMessage, type TerminalSessionLaunch,
+  decodeTerminalData, encodeTerminalInput, parseTerminalEvent, terminalDataLength, terminalSecretProblem, terminalSessionLaunchProblem,
+  terminalSize, OPENCODE_API_KEY_PROBLEM, TERMINAL_BROKER_LIMITS, TERMINAL_SECRET_MAX_BYTES, TERMINAL_SECRET_NAMES, TERMINAL_EVENT,
+  type TerminalMessage, type TerminalSessionLaunch,
 } from "./native-bridge.ts";
 
 // The page side of the terminal bridge contract (HivemindKit BridgeTerminalEvent
@@ -25,6 +26,9 @@ test("parses every terminal event the app sends", () => {
     { type: "terminal-exit", stream: 1, status: 0 },
     { type: "terminal-exit", stream: 1, status: null },
     { type: "terminal-killed", id: "k", session: "hm-acme-atlas" },
+    { type: "terminal-killed", id: "all", sessions: ["hm-acme-atlas"],
+      errors: [{ session: "hm-acme-bea", code: "no-such-session", message: "hm-acme-bea is not running" }] },
+    { type: "terminal-killed", id: null, sessions: [], errors: [] },
     { type: "terminal-error", id: "a", code: "no-such-session", message: "gone", stream: null },
   ];
   for (const event of events) assert.deepEqual(parseTerminalEvent(event), event);
@@ -52,6 +56,12 @@ test("drops malformed or unknown terminal events", () => {
     { type: "terminal-output", stream: 1, data: "" },
     { type: "terminal-exit", stream: 1, status: "0" },
     { type: "terminal-killed", id: null, session: "hm-A" },
+    { type: "terminal-killed", id: null, sessions: ["hm-acme-atlas", "acme"], errors: [] },
+    { type: "terminal-killed", id: null, sessions: "hm-acme-atlas", errors: [] },
+    { type: "terminal-killed", id: null, sessions: ["hm-acme-atlas"] },
+    { type: "terminal-killed", id: null, sessions: [], errors: [{ session: "nope", code: "internal", message: "m" }] },
+    { type: "terminal-killed", id: null, sessions: [], errors: [{ session: "hm-acme-atlas", code: 1, message: "m" }] },
+    { type: "terminal-killed", id: null, session: "hm-acme-atlas", sessions: ["hm-acme-atlas"], errors: [] },
     { type: "terminal-error", id: null, code: 1, message: "m", stream: null },
   ];
   for (const event of bad) assert.equal(parseTerminalEvent(event), null, JSON.stringify(event));
@@ -113,5 +123,26 @@ test("session launches are checked as the broker checks them", () => {
   ];
   for (const launches of refused) {
     assert.notEqual(terminalSessionLaunchProblem(launches), null, JSON.stringify(launches).slice(0, 80));
+  }
+});
+
+test("a launch passes only an OpenCode key, checked as the app and the broker check it, and no problem quotes it", () => {
+  const key = "sk-go-TEST_s3cr3t_VALUE";
+  const good: TerminalSessionLaunch = { project: "acme", agent: "Atlas", title: "Acme - Atlas", cwd: "~/acme", command: "opencode" };
+  assert.deepEqual(TERMINAL_SECRET_NAMES, ["OPENCODE_API_KEY"]);
+  assert.equal(terminalSessionLaunchProblem([{ ...good, secrets: { OPENCODE_API_KEY: key } }]), null);
+  assert.equal(terminalSessionLaunchProblem([{ ...good, secrets: { OPENCODE_API_KEY: "k".repeat(TERMINAL_SECRET_MAX_BYTES) } }]), null);
+  assert.equal(terminalSecretProblem("!~#$%&'()*+,-./:;<=>?@[\\]^_`{|}\""), null, "every printable ASCII character but space");
+  const values = ["", "k".repeat(TERMINAL_SECRET_MAX_BYTES + 1), `${key} x`, `${key}\n`, `${key}\t`, `${key}\0`, `${key}è`, `${key}\x7f`];
+  for (const value of values) {
+    assert.equal(terminalSecretProblem(value), OPENCODE_API_KEY_PROBLEM, JSON.stringify(value).slice(0, 40));
+    const problem = terminalSessionLaunchProblem([{ ...good, secrets: { OPENCODE_API_KEY: value } }]);
+    assert.equal(problem, OPENCODE_API_KEY_PROBLEM);
+  }
+  const shapes: unknown[] = [{}, { OPENCODE_API_KEY: key, OTHER: key }, { PATH: key }, { OPENCODE_API_KEY: 1 }, [key], key, null];
+  for (const secrets of shapes) {
+    const problem = terminalSessionLaunchProblem([{ ...good, secrets: secrets as TerminalSessionLaunch["secrets"] }]);
+    assert.notEqual(problem, null, JSON.stringify(secrets));
+    assert.ok(!problem!.includes(key));
   }
 });

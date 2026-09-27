@@ -14,6 +14,7 @@ test("launch model dropdown has Codex, Claude, and Cursor slugs", () => {
   const names = allLaunchModels();
   assert.ok(names.length > 80);
   assert.ok(names.includes("gpt-6-astra"));
+  for (const slug of ["gpt-6-sol", "gpt-6-luna", "claude-opus-5-5"]) assert.ok(names.includes(slug), slug);
   assert.ok(names.includes("gpt-5.3-codex"));
   assert.ok(names.includes("opus"));
   assert.ok(names.includes("claude-opus-5-thinking-high"));
@@ -46,6 +47,29 @@ test("choice ids stay unique when every family is listed", () => {
   assert.equal(new Set(ids).size, ids.length);
   assert.ok(ids.includes("codex:gpt-5.3-codex"));
   assert.ok(ids.includes("cursor:gpt-5.3-codex"));
+});
+
+test("Cursor offers all Grok 4.7 effort and speed variants without a cursor- prefix", () => {
+  for (const software of ["agent", "cursor"]) {
+    const choices = modelChoiceGroups(software).flatMap(group => group.choices);
+    for (const effort of ["low", "medium", "high", "xhigh"]) {
+      for (const suffix of ["", "-fast"]) {
+        const model = `grok-4.7-${effort}${suffix}`;
+        const id = `cursor:${model}`;
+        assert.deepEqual(choices.find(choice => choice.id === id), {
+          id, label: model, model, effort: "",
+        });
+        assert.equal(selectedChoiceId(software, model, effort), id);
+        assert.deepEqual(parseChoiceId(id), { model, effort: "" });
+      }
+    }
+    assert.equal(choices.some(choice => choice.model.startsWith("cursor-grok-4.7")), false);
+    assert.ok(choices.some(choice => choice.model === "cursor-grok-4.6-xhigh"));
+  }
+  for (const software of ["codex", "claude"]) {
+    assert.equal(modelChoiceGroups(software).some(group =>
+      group.choices.some(choice => choice.model.startsWith("grok-4.7-"))), false);
+  }
 });
 
 test("selectedChoiceId follows the software family", () => {

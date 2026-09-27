@@ -3,6 +3,8 @@ import { softwareFamily } from "./launch-prompt.ts";
 export type ModelGroup = { label: string; models: string[] };
 
 const CODEX = [
+  "gpt-6-sol",
+  "gpt-6-luna",
   "gpt-6-astra",
   "gpt-5.3-codex",
   "gpt-5.3-codex-spark",
@@ -25,6 +27,7 @@ const CLAUDE = [
   "haiku",
   "claude-fable-5",
   "claude-fable-5-1",
+  "claude-opus-5-5",
   "claude-opus-5",
   "claude-opus-4-8",
   "claude-opus-4-7",
@@ -220,6 +223,14 @@ const CURSOR = [
   "claude-4.5-sonnet-thinking",
   "claude-4-sonnet",
   "claude-4-sonnet-thinking",
+  "grok-4.7-low",
+  "grok-4.7-low-fast",
+  "grok-4.7-medium",
+  "grok-4.7-medium-fast",
+  "grok-4.7-high",
+  "grok-4.7-high-fast",
+  "grok-4.7-xhigh",
+  "grok-4.7-xhigh-fast",
   "cursor-grok-4.6-low",
   "cursor-grok-4.6-low-fast",
   "cursor-grok-4.6-medium",

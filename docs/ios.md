@@ -117,12 +117,18 @@ The page is the same as in Hivemind.app, with these differences:
   background** in the Launch agent sheet. It starts the session on the Mac and
   then shows its terminal in the app; several launches open **Terminal
   sessions**.
-- There is no **Open in Terminal**: Terminal.app is on the Mac. Sessions open in
-  the app's own terminal (Terminal sessions, or the agent's **Terminal** tab).
+- There is no **Open in Terminal** (nor a row's **Terminal.app**): Terminal.app
+  is on the Mac. Sessions open in the app's own terminal (Terminal sessions, or
+  the agent's **Terminal** tab). **Terminate all** works as on the Mac, one
+  batch `terminal-kill` through the gateway.
   The app sends every launch without opening Terminal and refuses the bridge's
   `terminal-open`, whatever the page asks.
 - A launch without a folder, or with `~`, uses the Mac user's home folder,
   which the Mac sends with each device session.
+- The **OpenCode Go API key** field is there too, for OpenCode launches. The
+  key goes with the launch through the gateway's TLS connection to the Mac's
+  broker and is not saved on the device or the Mac
+  ([Launch secrets](terminal-broker.md#launch-secrets)).
 - The notices say what the Mac is missing ("Terminals need Hivemind Server
   running on your Mac", "Install tmux on your Mac: `brew install tmux`"). The
   app cannot start Hivemind Server on the Mac.
