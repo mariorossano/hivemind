@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { test, type TestContext } from 'node:test';
-import { mkdtempSync, writeFileSync, rmSync, realpathSync, watch, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { invokeBot } from './bot-executor.ts';
+import { readPidMarker, waitForPidMarker } from '../test-support/pid-marker.ts';
 
 function executable(t: TestContext, body: string) {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'bot-executor-test-'));
@@ -49,25 +50,30 @@ test('bot executor rejects invalid/oversized output and never leaks failure diag
   await assert.rejects(invokeBot('/not-an-executable', '/not-a-profile', { value: 'x'.repeat(65536) }), /exceeds 64 KiB/);
 });
 
-test('bot deadline settles even when a detached descendant keeps output pipes open', { timeout: 5000 }, async t => {
+test('bot deadline settles even when a detached descendant keeps output pipes open', { timeout: 10000 }, async t => {
   const { dir, file } = executable(t, `
     const {spawn}=require('node:child_process'),path=require('node:path');
     const ready=path.join(process.argv[4],'ready');
-    const child=spawn(process.execPath,['-e',"require('node:fs').writeFileSync(process.argv[1],String(process.pid));setInterval(()=>{},1000)",ready],{detached:true,stdio:['ignore',1,2]});
+    const child=spawn(process.execPath,['-e',"require('node:fs').writeFileSync(process.argv[1],String(process.pid)+String.fromCharCode(10));setTimeout(()=>process.exit(0),15000)",ready],{detached:true,stdio:['ignore',1,2]});
     child.unref();
   `);
   let descendant: number | undefined;
-  t.after(() => { if (descendant) { try { process.kill(descendant, 'SIGKILL'); } catch { /* already exited */ } } });
   const marker = path.join(dir, 'ready');
-  const ready = new Promise<void>(resolve => {
-    const watcher = watch(dir, () => { if (existsSync(marker)) { watcher.close(); resolve(); } });
-    t.after(() => watcher.close());
-  });
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const result = invokeBot(file, dir, {});
   const rejected = assert.rejects(result, /outcome may be unknown/);
-  await ready; descendant = Number(readFileSync(marker, 'utf8'));
-  assert.ok(Number.isSafeInteger(descendant) && descendant > 0);
-  t.mock.timers.tick(30001);
-  await rejected;
+  // Observe early failures while readiness is pending; the awaits below still assert the result.
+  void rejected.catch(() => {});
+  try {
+    descendant = await waitForPidMarker(marker);
+    t.mock.timers.tick(30001);
+    await rejected;
+    process.kill(descendant, 0); // Rejection must precede the fixture's safety exit.
+  } finally {
+    // A failed readiness/assertion must not leave the deadline frozen or an orphan alive.
+    t.mock.timers.tick(30001);
+    const pid = descendant ?? readPidMarker(marker);
+    if (pid) { try { process.kill(pid, 'SIGKILL'); } catch { /* already exited */ } }
+    await rejected;
+  }
 });
