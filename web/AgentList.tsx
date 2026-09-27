@@ -4,8 +4,8 @@ import type { AgentWork } from "../src/shared/tasks.ts";
 import type { Agent, InboxStatus } from "../src/shared/types.ts";
 import { InboxReceipt, QueueBadge } from "./InboxReceipt.tsx";
 import { focusFirstMenuItem, menuKeyDown } from "./menu-keys.ts";
-import { agentStatusLine } from "./nav-model.ts";
-import { agentLiveSession, useTerminalState } from "./use-terminal.ts";
+import { agentRuntime } from "./agent-runtime.ts";
+import { useTerminalState } from "./use-terminal.ts";
 
 export function AgentList({
   agents,
@@ -18,8 +18,10 @@ export function AgentList({
   work = {},
   botChannels = {},
   onOpen,
+  onPanel,
   onAskClear,
   onAskRemove,
+  onSetLaunchMode,
 }: {
   agents: Agent[];
   projectName: string;
@@ -34,28 +36,33 @@ export function AgentList({
   /** Where each bot posts, by agent id, e.g. "#general". */
   botChannels?: Record<string, string>;
   onOpen: (a: Agent) => void;
+  onPanel?: (a: Agent) => void;
   onAskClear: (name: string) => void;
   onAskRemove: (name: string) => void;
+  /** Human sets whether this brain's worker requests wait for approval. */
+  onSetLaunchMode?: (agent: Agent, mode: "approval" | "auto") => Promise<void>;
 }) {
   const [menu, setMenu] = useState<string | null>(null);
   // Hivemind.app only: which agents run in a live tmux session (reported on join, else recorded at launch).
   const terminals = useTerminalState();
-  const sessionOf = (a: Agent) => terminals.native ? agentLiveSession(terminals, a, agents)?.name ?? null : null;
+  const runtimeOf = (a: Agent) => agentRuntime(a, { agents }, terminals, work[a.id]);
   const human = agents.find((a) => a.role === "human");
   const brains = agents.filter((a) => a.role === "brain");
   const workers = agents.filter((a) => a.role === "worker");
   const bots = agents.filter((a) => a.role === "bot");
   const rank = { senior: 0, mid: 1, junior: 2 } as const;
   workers.sort((a, b) => (rank[a.seniority ?? "mid"] ?? 3) - (rank[b.seniority ?? "mid"] ?? 3) || a.name.localeCompare(b.name));
-  const row = (a: Agent, canClear: boolean) => (
-    <PersonRow
+  const row = (a: Agent, canClear: boolean) => {
+    const runtime = runtimeOf(a);
+    return <PersonRow
       key={a.id}
       agent={a}
       queued={queued[a.id] ?? 0}
       inbox={inbox[a.id]}
-      status={agentStatusLine(a, work[a.id])}
-      terminalSession={sessionOf(a)}
+      status={runtime.statusLine}
+      terminalSession={runtime.sessionState === "running" ? runtime.sessionName : null}
       onOpen={() => onOpen(a)}
+      onPanel={onPanel ? () => { setMenu(null); onPanel(a); } : undefined}
       menuOpen={menu === a.name}
       onMenu={() => setMenu(menu === a.name ? null : a.name)}
       onCloseMenu={() => setMenu(null)}
@@ -67,8 +74,9 @@ export function AgentList({
         setMenu(null);
         onAskRemove(a.name);
       }}
-    />
-  );
+      onSetLaunchMode={a.role === "brain" ? onSetLaunchMode : undefined}
+    />;
+  };
 
   // Brains, then workers by seniority; the role sits beside each name, so the groups need no headings.
   return (
@@ -113,12 +121,14 @@ function PersonRow({
   status,
   terminalSession,
   onOpen,
+  onPanel,
   self,
   menuOpen,
   onMenu,
   onCloseMenu,
   onAskClear,
   onAskRemove,
+  onSetLaunchMode,
 }: {
   onManageCredential?: () => void;
   agent: Agent;
@@ -129,17 +139,36 @@ function PersonRow({
   /** The live tmux session the agent runs in (Hivemind.app only). */
   terminalSession?: string | null;
   onOpen: () => void;
+  onPanel?: () => void;
   self?: boolean;
   menuOpen?: boolean;
   onMenu?: () => void;
   onCloseMenu?: () => void;
   onAskClear?: () => void;
   onAskRemove?: () => void;
+  onSetLaunchMode?: (agent: Agent, mode: "approval" | "auto") => Promise<void>;
 }) {
   const menuRef = useRef<HTMLDivElement>(null);
   const actionRef = useRef<HTMLButtonElement>(null);
   const role = roleLabel(agent);
   const queuedCount = inbox?.queued?.atLeast ?? queued ?? 0; // as QueueBadge counts it
+  const launchMode = agent.role === "brain" ? agent.launchMode ?? "approval" : null;
+  const [modeBusy, setModeBusy] = useState(false);
+  const [modeError, setModeError] = useState<string | null>(null);
+
+  const changeLaunchMode = async () => {
+    if (!onSetLaunchMode || !launchMode || modeBusy) return;
+    setModeBusy(true);
+    setModeError(null);
+    try {
+      await onSetLaunchMode(agent, launchMode === "auto" ? "approval" : "auto");
+      onCloseMenu?.();
+    } catch (failure) {
+      setModeError(String((failure as Error).message || failure));
+    } finally {
+      setModeBusy(false);
+    }
+  };
 
   useEffect(() => {
     if (menuOpen) focusFirstMenuItem(menuRef.current);
@@ -181,6 +210,10 @@ function PersonRow({
             </span>
           )}
           <InboxReceipt status={inbox} />
+          {launchMode && <span className="person-launch-mode" title={`Worker launch mode: ${launchMode === "auto" ? "Auto" : "Approval"}`}>
+            {launchMode === "auto" ? "Auto" : "Approval"}
+          </span>}
+          {modeError && <span className="person-mode-error" role="alert">{modeError}</span>}
         </span>
       </button>
       {onMenu && (
@@ -200,6 +233,7 @@ function PersonRow({
       {menuOpen && (
         <div className="person-menu" role="menu" aria-label={`Actions for ${agent.name}`}
           onKeyDown={(event) => menuKeyDown(event, actionRef, () => onCloseMenu?.())}>
+          {onPanel && <button type="button" role="menuitem" onClick={onPanel}>Agent details</button>}
           {onManageCredential && (
             <button type="button" role="menuitem" aria-label={`Manage credentials for ${agent.name}`}
               onClick={() => { onCloseMenu?.(); onManageCredential(); }}>
@@ -209,6 +243,12 @@ function PersonRow({
           {onAskClear && (
             <button type="button" role="menuitem" onClick={onAskClear}>
               Clear context
+            </button>
+          )}
+          {onSetLaunchMode && launchMode && (
+            <button type="button" role="menuitemcheckbox" aria-checked={launchMode === "auto"} disabled={modeBusy}
+              onClick={() => void changeLaunchMode()}>
+              {modeBusy ? "Saving launch mode…" : "Auto-launch workers"}
             </button>
           )}
           {onAskRemove && (

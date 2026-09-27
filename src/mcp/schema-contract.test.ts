@@ -66,7 +66,7 @@ test("production MCP schemas and calls retain their observable contracts", { tim
   await t.test("all advertised production inputs retain types, required fields and enums", async () => {
     const { tools } = await connected.listTools({}, { timeout: 5000, signal: t.signal });
     const expected: Record<string, [string[], Record<string, string>]> = {
-      join: [["role"], { role: "string", seniority: "string", focus: "string", resume: "string", project: "string" }],
+      join: [["role"], { role: "string", seniority: "string", focus: "string", resume: "string", project: "string", claim: "string" }],
       get_worker_capabilities: [["workerId"], { workerId: "string" }],
       set_capabilities: [["expectedRevision", "card"], { expectedRevision: "integer", card: "object" }],
       worker_match_suggest: [["taskId", "mode", "category"], { taskId: "string", requiredCapabilities: "array", mode: "string", category: "string", minContext: "integer", minReviewedResults: "integer", minimumAcceptedRate: "number", offset: "integer" }],
@@ -92,6 +92,10 @@ test("production MCP schemas and calls retain their observable contracts", { tim
         channel: "string", requestId: "string", expectedRevision: "integer", humanInstructionSeq: "integer", action: "union",
       }],
       assign_task: [["requestId", "worker", "contract"], { requestId: "string", worker: "string", channel: "string", contract: "object", room: "object" }],
+      job_event: [["requestId", "type", "title"], { requestId: "string", type: "string", title: "string", originMessageId: "string" }],
+      worker_templates: [[], {}],
+      request_worker: [["requestId", "template", "contract"], { requestId: "string", template: "string", contract: "object", slug: "string", job: "union", taskId: "string", expectedRevision: "integer" }],
+      release_worker: [["worker", "reason"], { worker: "string", reason: "string" }],
       get_task: [["taskId"], { taskId: "string" }],
       get_task_timeline: [["taskId"], { taskId: "string", export: "boolean" }],
       get_handoffs: [[], { taskId: "string", beforeTask: "string" }],
@@ -170,6 +174,17 @@ test("production MCP schemas and calls retain their observable contracts", { tim
     assert.match(JSON.stringify(requiredChoice.content), /Provide channel or to/);
   });
 
+  await t.test("existing-task request requires taskId and expectedRevision together", async () => {
+    const result = await call("request_worker", {
+      requestId: "00000000-0000-4000-8000-000000000001", template: "example",
+      taskId: "00000000-0000-4000-8000-000000000002",
+      contract: { objective: "Do the task", scope: [], nonGoals: [], acceptanceCriteria: ["Done"],
+        dependencies: [], evidenceSeqs: [] },
+    });
+    assert.equal(result.isError, true);
+    assert.match(JSON.stringify(result.content), /taskId and expectedRevision must be supplied together/);
+  });
+
   const invalid: Array<[string, Record<string, unknown>]> = [
     ["join", {}], ["join", { role: "human" }], ["join", { role: 42 }],
     ["join", { role: "brain", seniority: null }], ["join", { role: "brain", focus: null }],
@@ -200,6 +215,9 @@ test("production MCP schemas and calls retain their observable contracts", { tim
     ["get_room", { channel: "general", beforeRevision: 0 }],
     ["room_event", { channel: "general", requestId: "r", expectedRevision: 0, action: { type: "configure" } }],
     ["assign_task", { requestId: "r", worker: "Nobody", contract: {} }],
+    ["request_worker", { requestId: "r", template: "builder", contract: {} }],
+    ["request_worker", { requestId: "00000000-0000-4000-8000-000000000001", template: "", contract: {} }],
+    ["release_worker", { worker: "", reason: "done" }],
     ["get_task", { taskId: "invalid" }],
     ["get_task_timeline", { taskId: "invalid" }],
     ["get_task_timeline", { taskId: "00000000-0000-4000-8000-000000000001", export: "1" }],

@@ -1,5 +1,5 @@
 import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { ChevronDown, ChevronRight, ChevronsUpDown, Inbox, Plus, Route, Search, SlidersHorizontal, SquareTerminal, Terminal, TextSearch } from "lucide-react";
+import { ChevronDown, ChevronRight, ChevronsUpDown, Inbox, ListTodo, Plus, Route, Search, SlidersHorizontal, SquareTerminal, Terminal, TextSearch } from "lucide-react";
 import { isLiveSearchQuery } from "../src/shared/search-query.ts";
 import type { AgentWork } from "../src/shared/tasks.ts";
 import type { Agent, Channel, Project } from "../src/shared/types.ts";
@@ -15,9 +15,11 @@ import type { ProjectSheets } from "./use-sheets.ts";
 
 type AgentActions = {
   onAgent: (agent: Agent) => void;
+  onOpenPanel: (agent: Agent) => void;
   onCreateBot: (projectId: string) => void;
   onManageBot: (agent: Agent) => void;
   onAskAgent: (name: string, kind: "clear" | "remove") => void;
+  onSetLaunchMode?: (agent: Agent, mode: "approval" | "auto") => Promise<void>;
 };
 
 /**
@@ -256,6 +258,7 @@ function ProjectSection({ project, snap, sel, go, unified, tools, find, onProjec
     .flatMap(bot => { const where = botWhere(channels, bot); return where ? [[bot.id, where]] : []; }));
   const n = snap.mentionCounts[project.slug] ?? 0;
   const inboxActive = sel.kind === "inbox" && sel.project === project.slug;
+  const tasksActive = sel.kind === "tasks" && sel.project === project.slug;
   const jevActive = sel.kind === "jev" && sel.project === project.slug;
   const channelRow = (ch: Channel) => (
     <ChannelItem
@@ -307,6 +310,10 @@ function ProjectSection({ project, snap, sel, go, unified, tools, find, onProjec
         <Inbox className="nav-icon" size={15} aria-hidden="true" />
         <span>For you</span>
         {n > 0 && <em>{n}</em>}
+      </button>
+      <button type="button" className={`nav ${tasksActive ? "active" : ""}`}
+        aria-current={tasksActive ? "page" : undefined} onClick={() => go({ kind: "tasks", project: project.slug })}>
+        <ListTodo className="nav-icon" size={15} aria-hidden="true" /><span>Tasks</span>
       </button>
       {snap.jev?.enabled && (
         <button
@@ -409,8 +416,10 @@ function ProjectSection({ project, snap, sel, go, unified, tools, find, onProjec
           work={agentWork}
           botChannels={botChannels}
           onOpen={agentActions.onAgent}
+          onPanel={agentActions.onOpenPanel}
           onAskClear={(name) => agentActions.onAskAgent(name, "clear")}
           onAskRemove={(name) => agentActions.onAskAgent(name, "remove")}
+          onSetLaunchMode={agentActions.onSetLaunchMode}
         />
       </div>
     </div>

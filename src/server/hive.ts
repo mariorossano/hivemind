@@ -2,6 +2,15 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { ROUTINE_BATCH_MS } from "../shared/notifications.ts";
+import { WorkerTemplateStore } from "./worker-templates.ts";
+import { LauncherQueue } from "./launcher-queue.ts";
+import { AgentActivityService } from './services/agent-activity.ts';
+import { AgentLifecycleLog } from './services/agent-lifecycle-log.ts';
+import { AgentManagement } from './services/agent-management.ts';
+import { TaskViews } from './services/task-views.ts';
+import { JobStore } from './services/jobs.ts';
+import { WorkerOrchestration } from "./services/worker-orchestration.ts";
+import { AgentTraffic } from "./agent-traffic.ts";
 import { AdaptiveTopologyRuntime } from "./adaptive-topology.ts";
 import { HiveBus } from "./hive-events.ts";
 import { InboxDeliveryStore } from "./inbox-delivery.ts";
@@ -48,8 +57,18 @@ export { parseMentions } from "../shared/mentions.ts";
  */
 type ServiceRegistry = Core & {
   home: string;
+  traffic: AgentTraffic;
   waiters: Waiters;
   uploads: UploadBudget;
+  workerTemplates: WorkerTemplateStore;
+  launcherQueue: LauncherQueue;
+  workerOrchestration: WorkerOrchestration;
+  jobs: JobStore;
+  taskViews: TaskViews;
+  activity: AgentActivityService;
+  lifecycleLog: AgentLifecycleLog;
+  management: AgentManagement;
+  routing: RoutingStore;
   telegramAdmin: TelegramAdminService;
   files: FileService;
   projects: ProjectService;
@@ -82,6 +101,8 @@ export class Hive {
   readonly storage: Storage;
   /** Post-commit change notifications; see HiveEvents for every event and payload. */
   readonly bus = new HiveBus();
+  /** Bytes the agent API returned per brain/worker since start (Human snapshot). */
+  readonly traffic = new AgentTraffic();
   readonly home: string;
 
   readonly telegramAdmin!: TelegramAdminService;
@@ -100,6 +121,14 @@ export class Hive {
   readonly inbox!: InboxDeliveryStore;
   readonly tasks!: TaskStore;
   readonly routing!: RoutingStore;
+  readonly workerTemplates!: WorkerTemplateStore;
+  readonly launcherQueue!: LauncherQueue;
+  readonly workerOrchestration!: WorkerOrchestration;
+  readonly jobs!: JobStore;
+  readonly taskViews!: TaskViews;
+  readonly activity!: AgentActivityService;
+  readonly lifecycleLog!: AgentLifecycleLog;
+  readonly management!: AgentManagement;
   readonly rooms!: RoomStore;
   readonly notifications!: NotificationStore;
   readonly timeline!: TimelineStore;
@@ -112,7 +141,7 @@ export class Hive {
     this.db = new DatabaseSync(dbPath);
     this.storage = Storage.for(this.db);
     this.bus.bindStorage(this.storage);
-    const partial: Partial<ServiceRegistry> = { storage: this.storage, bus: this.bus, home: this.home, waiters: new Waiters() };
+    const partial: Partial<ServiceRegistry> = { storage: this.storage, bus: this.bus, home: this.home, traffic: this.traffic, waiters: new Waiters() };
     const services = partial as ServiceRegistry;
     try {
       // Refuse a newer or unknown schema before anything (even the journal mode) writes to the file.
@@ -126,11 +155,15 @@ export class Hive {
       this.uploads = services.uploads = new UploadBudget({ db: this.db, transaction: work => this.storage.transaction(work) }, options.uploadLimits);
       this.telegramAdmin = services.telegramAdmin = new TelegramAdminService(services);
       this.files = services.files = new FileService(services);
+      this.workerTemplates = services.workerTemplates = new WorkerTemplateStore(services);
+      this.lifecycleLog = services.lifecycleLog = new AgentLifecycleLog(services);
+      this.launcherQueue = services.launcherQueue = new LauncherQueue(services);
       this.projects = services.projects = new ProjectService(services);
       this.identity = services.identity = new IdentityService(services);
       this.lifecycle = services.lifecycle = new AgentLifecycle(services);
       this.channels = services.channels = new ChannelService(services);
       this.messageQueries = services.messageQueries = new MessageQueries(services);
+      this.activity = services.activity = new AgentActivityService(services);
       this.delivery = services.delivery = new DeliveryService(services);
       this.messages = services.messages = new MessageService(services);
       this.reads = new ReadService(services);
@@ -141,13 +174,17 @@ export class Hive {
       services.sendRequests = new SendRequests(this.db);
       // The coordination stores take the same registry, each typed down to its slice (services/ports.ts).
       this.tasks = services.tasks = new TaskStore(services);
+      this.workerOrchestration = services.workerOrchestration = new WorkerOrchestration(services);
+      this.jobs = services.jobs = new JobStore(services);
+      this.taskViews = services.taskViews = new TaskViews(services);
       this.rooms = services.rooms = new RoomStore(services);
       this.notifications = services.notifications = new NotificationStore(services);
-      this.routing = new RoutingStore(services);
+      this.routing = services.routing = new RoutingStore(services);
       this.timeline = services.timeline = new TimelineStore(services);
       this.adaptiveTopology = services.adaptiveTopology = new AdaptiveTopologyRuntime(services);
       this.inbox = services.inbox = new InboxDeliveryStore(this.db);
       services.inboxReader = new InboxReader(this.db, this.inbox, this.notifications, options.routineBatchMs ?? ROUTINE_BATCH_MS);
+      this.management = services.management = new AgentManagement(services);
     } catch (error) {
       try { this.db.close(); } catch { /* preserve the initialization failure */ }
       throw error;

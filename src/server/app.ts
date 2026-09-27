@@ -1,7 +1,7 @@
 import { Readable } from "node:stream";
 import { Hono } from "hono";
 import { requestJson, validateRequest } from "./api-input.ts";
-import { threadResponseSchema, uploadLength } from "../shared/api-contract.ts";
+import { integerArgument, threadResponseSchema, uploadLength } from "../shared/api-contract.ts";
 import { DEFAULT_WAIT_MS, HiveError, type Agent } from "../shared/types.ts";
 import { resolveUploadMime } from "../shared/mime.ts";
 import { standingOrders } from "../shared/standing-orders.ts";
@@ -16,6 +16,7 @@ import { decodeJevCallCursor } from "../shared/jev-calls.ts";
 import { ACTIVITY_REASONS, type ActivityReason } from "../shared/read-state.ts";
 import { installJevDiagnostics } from './adaptive-routing-diagnostics.ts';
 import { installInstanceProof } from "./instance-proof.ts";
+import { installLauncherChannel } from "./launcher-channel.ts";
 import { adviseAfterWait, assignAdaptiveTask, mutateAdaptiveTask, mutateAdaptiveRoom, sendAdaptiveAgentMessage, setAdaptiveThreadStatus } from './adaptive-topology-actions.ts';
 
 export type AppHooks = {
@@ -50,6 +51,7 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
   });
   app.get("/api/health", c => c.json({ ok: true, name: "hivemind" }));
   installInstanceProof(app, hooks.instanceSecret ?? null);
+  installLauncherChannel(app, hive, hooks.instanceSecret ?? null);
   /** The channel and root of a thread id (a message or task id); null when the id is unknown. */
   const threadOwner = (id: string): { channelId: string; threadId: string } | null => {
     const ref = hive.messageQueries.messageRef(id);
@@ -114,12 +116,17 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
   ui.get("/snapshot", c => {
     const human = hive.identity.getAgent("human");
     const channels = hive.channels.listChannels(human);
-    return c.json({ you: human, projects: hive.projects.listProjects(), agents: hive.identity.listAgents(), channels,
+    const queue = hive.delivery.queueSnapshot();
+    const agents = hive.identity.listAgents().map(agent => ({ ...agent, activity: hive.activity.forAgent(agent, queue.queued[agent.id] ?? 0) }));
+    return c.json({ you: human, projects: hive.projects.listProjects(), agents, channels,
+      agentTraffic: hive.traffic.snapshot(agents.map(item => item.id)),
       archivedChannelIds: hive.rooms.archivedChannelIds(channels),
-      ...hive.reads.readSnapshot(human), ...hive.delivery.queueSnapshot(),
+      ...hive.reads.readSnapshot(human), ...queue, agentWork: hive.tasks.workStatus(),
       telegram: { running: Boolean(hooks.telegramRunning?.()), configured: publicTelegramView(hive.home).configured, ...hive.telegramAdmin.health() },
-      jev: { enabled: adaptiveRoutingPublic(hive.home).enabled } });
+      jev: { enabled: adaptiveRoutingPublic(hive.home).enabled }, launcherAvailable: Boolean(hooks.instanceSecret) });
   });
+  // Public Human-session projection; launch commands and claim tickets stay in the signed native channel.
+  ui.get("/launch-requests", c => c.json({ requests: hive.launcherQueue.listPending() }));
   // Roster status lines, refreshed on task events.
   ui.get("/nav-status", c => c.json({ agentWork: hive.tasks.workStatus() }));
   ui.get("/read-state", c => c.json(hive.reads.readSnapshot(hive.identity.getAgent("human"))));
@@ -186,6 +193,36 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
     const human = hive.identity.getAgent("human");
     const agent = hive.identity.removeAgent(human, decodeURIComponent(c.req.param("name")));
     return c.json({ ok: true, name: agent.name });
+  });
+  ui.get('/agents/:id/overview', c => c.json(hive.management.overview(hive.identity.getAgent('human'), c.req.param('id'))));
+  ui.patch('/agents/:id/identity', async c => c.json(hive.management.editIdentity(hive.identity.getAgent('human'),
+    c.req.param('id'), await requestJson(c.req.raw))));
+  ui.put('/agents/:id/capability', async c => c.json({ capability: hive.routing.setForHuman(hive.identity.getAgent('human'),
+    c.req.param('id'), await requestJson(c.req.raw)) }));
+  ui.get('/agents/:id/remove-impact', c => c.json(hive.management.removeImpact(hive.identity.getAgent('human'), c.req.param('id'))));
+  ui.post('/agents/:id/remove', async c => c.json({ agent: hive.management.remove(hive.identity.getAgent('human'),
+    c.req.param('id'), await requestJson(c.req.raw)) }));
+  ui.get('/agents/:id/lifecycle', c => c.json(hive.management.lifecycle(hive.identity.getAgent('human'),
+    c.req.param('id'), c.req.query('before') ? Number(c.req.query('before')) : undefined,
+    c.req.query('limit') ? Number(c.req.query('limit')) : undefined)));
+  ui.post('/agents/:id/runtime-event', async c => c.json({ event: hive.management.runtimeEvent(hive.identity.getAgent('human'),
+    c.req.param('id'), await requestJson(c.req.raw)) }));
+  ui.get('/tasks', c => c.json(hive.taskViews.list(hive.identity.getAgent('human'), {
+    projectId: c.req.query('project') ? projectRef(c.req.query('project')!).id : undefined,
+    cursor: c.req.query('cursor'), limit: c.req.query('limit') ? Number(c.req.query('limit')) : undefined,
+  })));
+  ui.get('/tasks/:id', c => c.json({ item: hive.taskViews.get(hive.identity.getAgent('human'), c.req.param('id')) }));
+  ui.get('/jobs', c => c.json({ jobs: hive.jobs.list(hive.identity.getAgent('human'),
+    c.req.query('project') ? projectRef(c.req.query('project')!).id : undefined) }));
+  ui.post('/jobs/:id/close', async c => {
+    const body = await requestJson(c.req.raw);
+    return c.json({ job: hive.jobs.close(hive.identity.getAgent('human'), c.req.param('id'), body.expectedRevision) });
+  });
+  ui.post('/tasks/:id/control', async c => c.json(hive.tasks.control(hive.identity.getAgent('human'),
+    c.req.param('id'), await requestJson(c.req.raw))));
+  ui.patch("/agents/:name/launch-mode", async c => {
+    const body = await requestJson(c.req.raw);
+    return c.json({ agent: hive.identity.setLaunchMode(hive.identity.getAgent("human"), decodeURIComponent(c.req.param("name")), body.mode) });
   });
   ui.delete("/projects/:slug", async c => {
     const human = hive.identity.getAgent('human'), slug = parseProjectSlug(c.req.param('slug'));
@@ -257,6 +294,20 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
   ui.get('/channels/:id/room', c => c.json(hive.rooms.view(hive.identity.getAgent('human'), c.req.param('id'))));
   ui.get('/channels/:id/room/history', c => c.json({ history: hive.rooms.history(hive.identity.getAgent('human'), c.req.param('id'), Number(c.req.query('before') ?? Number.MAX_SAFE_INTEGER)) }));
   ui.post('/channels/:id/room', async c => c.json(hive.rooms.event(hive.identity.getAgent('human'), c.req.param('id'), await requestJson(c.req.raw))));
+  ui.get('/projects/:id/worker-templates', c => c.json({ templates: hive.workerTemplates.list(projectRef(c.req.param('id')).id) }));
+  ui.post('/projects/:id/worker-templates', async c => c.json(hive.workerTemplates.create(hive.identity.getAgent('human'),
+    projectRef(c.req.param('id')).id, await requestJson(c.req.raw)), 201));
+  ui.put('/worker-templates/:id', async c => c.json(hive.workerTemplates.update(hive.identity.getAgent('human'), c.req.param('id'), await requestJson(c.req.raw))));
+  // A reserved worker and its single-use launch ticket (docs/identity-lifecycle.md#reserved-workers).
+  ui.post('/worker-templates/:id/reserve', async c => {
+    c.header('Cache-Control', 'no-store');
+    const body = await requestJson(c.req.raw);
+    return c.json(hive.identity.reserve(hive.identity.getAgent('human'), hive.workerTemplates.get(c.req.param('id')), body.label ?? null), 201);
+  });
+  ui.delete('/worker-templates/:id', c => {
+    hive.workerTemplates.delete(hive.identity.getAgent('human'), c.req.param('id'), integerArgument(c.req.query('revision') ?? '', 1));
+    return c.json({ ok: true });
+  });
   ui.post('/projects/:id/bots', async c => {
     c.header('Cache-Control', 'no-store');
     return c.json(hive.bots.createBot(hive.identity.getAgent('human'), c.req.param('id'), await readLimitedJson(c.req.raw, CREDENTIAL_JSON_BYTES)), 201);
@@ -334,8 +385,19 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
   ui.get('/tasks/:id/timeline/export', c => c.json({ fixture: hive.timeline.exportTask(hive.identity.getAgent('human'), c.req.param('id')) }));
 
   const agent = new Hono();
+  const jsonBytes = async (res: Response) =>
+    res.headers.get('content-type')?.startsWith('application/json') ? (await res.clone().arrayBuffer()).byteLength : null;
   agent.use('*', async (c, next) => {
-    if (c.req.path === '/api/agent/join' && c.req.method === 'POST') { await validateRequest(c.req.raw); return next(); }
+    if (c.req.path === '/api/agent/join' && c.req.method === 'POST') {
+      await validateRequest(c.req.raw);
+      await next();
+      const bytes = await jsonBytes(c.res);
+      if (bytes !== null && c.res.ok) {
+        const id = ((await c.res.clone().json()) as { agent?: { id?: unknown } }).agent?.id;
+        if (typeof id === 'string') hive.traffic.record(id, c.req.routePath, bytes);
+      }
+      return;
+    }
     const token = (c.req.header('authorization') ?? '').replace(/^Bearer\s+/i, '').trim();
     if (!token) throw new HiveError(401, 'Missing token. Join first.');
     let me = hive.identity.agentByToken(token);
@@ -346,24 +408,32 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
     me = hive.identity.agentByToken(token);
     hive.identity.touch(me.id, true); c.set('me', me); c.set('token', token);
     await next();
+    const bytes = await jsonBytes(c.res);
+    if (bytes !== null) hive.traffic.record(me.id, c.req.routePath, bytes);
+    if (c.res.ok && !["/api/agent/ping", "/api/agent/wait", "/api/agent/inbox/session"].includes(c.req.path)) hive.activity.action(me.id);
   });
   agent.post('/join', async c => {
     const body = await requestJson(c.req.raw);
     const bearer = (c.req.header('authorization') ?? '').replace(/^Bearer\s+/i, '').trim();
     const result = hive.identity.join({ role: body.role, seniority: body.seniority ?? null, focus: body.focus ?? null,
       token: bearer || body.token || null, resumeName: body.resume || body.resumeName || null, project: body.project ?? null, cwd: body.cwd ?? null,
-      terminalSession: body.terminalSession ?? null });
+      terminalSession: body.terminalSession ?? null, claim: body.claim ?? null });
     return c.json({ ...result, describe: describeAgent(result.agent), standingOrders: result.created ? standingOrders(result.agent) : undefined,
       ordersRef: result.created ? undefined : 'unchanged', handoffs: hive.tasks.handoffs(result.agent) });
   });
   agent.get('/me', c => {
     const me = c.get('me');
-    if (c.req.query('orders') === '1') return c.json({ you: me, standingOrders: standingOrders(me) });
-    return c.json({ you: { name: me.name, role: me.role, seniority: me.seniority, focus: me.focus, online: me.online, project: me.project },
-      ordersRef: 'unchanged' });
+    const you = { name: me.name, role: me.role, seniority: me.seniority, focus: me.focus, online: me.online,
+      project: me.project, ...(me.role === 'brain' ? { launchMode: me.launchMode } : {}) };
+    if (c.req.query('orders') === '1') return c.json({ you, standingOrders: standingOrders(me) });
+    return c.json({ you, ordersRef: 'unchanged' });
   });
   // terminalSession is a Human UI label; agents' roster stays as it was.
-  agent.get('/agents', c => c.json({ agents: hive.identity.listAgents(c.get('me')).map(({ createdAt: _c, terminalSession: _t, ...a }) => a) }));
+  agent.get('/agents', c => c.json({ agents: hive.workerOrchestration.roster(c.get('me')).map(agent => { const { createdAt: _c, terminalSession: _t, ...a } = agent; return { ...a, activity: hive.activity.forAgent(agent) }; }) }));
+  agent.post('/jobs/events', async c => c.json({ job: hive.jobs.event(c.get('me'), await requestJson(c.req.raw)) }));
+  agent.get('/worker-templates', c => c.json(hive.workerOrchestration.templates(c.get('me'))));
+  agent.post('/workers/request', async c => c.json(hive.workerOrchestration.request(c.get('me'), await requestJson(c.req.raw))));
+  agent.post('/workers/release', async c => c.json(hive.workerOrchestration.release(c.get('me'), await requestJson(c.req.raw))));
   agent.get('/search', c => {
     const me = c.get('me');
     return c.json(hive.messageQueries.searchMessages(me, { q: String(c.req.query('q') ?? ''), project: c.req.query('project') || me.project,

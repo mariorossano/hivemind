@@ -1,10 +1,12 @@
 import { useSyncExternalStore } from "react";
 import type { Agent } from "../src/shared/types.ts";
 import { terminalSessionName } from "../src/shared/terminal-session.ts";
+import { agentSessionLabel, recordedAgentSession } from "./agent-runtime.ts";
 import {
   TERMINAL_EVENT, brokerUnavailableHint, decodeTerminalData, encodeTerminalInput, inNativeApp, onMacDesktop, onNativePlatform,
   parseTerminalEvent, postNative, reportedNativePlatform, serverUnverifiedHint, terminalDataLength, terminalLaunchItems,
-  terminalSessionLaunchProblem, terminalSize, tmuxInstallHint, TERMINAL_BROKER_LIMITS, type NativePlatform, type TerminalEvent,
+  templateSecretNameProblem, templateSecretValueProblem, terminalSessionLaunchProblem, terminalSize, tmuxInstallHint,
+  TERMINAL_BROKER_LIMITS, type NativePlatform, type TerminalEvent,
   type TerminalKillFailure, type TerminalMessage, type TerminalSessionInfo, type TerminalSessionLaunch,
 } from "./native-bridge.ts";
 
@@ -31,6 +33,8 @@ export type TerminalState = {
   broker: Status["broker"] | null;
   /** Every Hivemind session, sorted by name; null while unknown (no broker). */
   sessions: TerminalSessionInfo[] | null;
+  /** Last complete broker list, retained only to label a reconnecting session. Never proves it is running. */
+  lastKnownSessions?: TerminalSessionInfo[] | null;
   /** The latest error that answered no request of this page, e.g. Open in Terminal on a session that just ended. */
   lastError: { code: string; message: string } | null;
 };
@@ -84,6 +88,7 @@ type Pending =
   | { kind: "launch"; resolve: (event: TerminalLaunched) => void; reject: (error: TerminalRequestError) => void; timer: number }
   | { kind: "kill"; resolve: () => void; reject: (error: TerminalRequestError) => void; timer: number }
   | { kind: "kill-many"; resolve: (result: TerminalKilledMany) => void; reject: (error: TerminalRequestError) => void; timer: number }
+  | { kind: "secrets"; resolve: (names: string[]) => void; reject: (error: TerminalRequestError) => void; timer: number }
   | { kind: "attach"; stream: StreamEntry };
 type StreamEntry = {
   handlers: TerminalStreamHandlers;
@@ -100,7 +105,8 @@ type StreamEntry = {
 /** How much input typed before the stream is attached is kept for it (64 KiB); older keys beyond are dropped. */
 export const HELD_INPUT_BYTES = 64 * 1024;
 
-const BROWSER_STATE: TerminalState = { native: false, platform: null, tmux: null, broker: null, sessions: null, lastError: null };
+const BROWSER_STATE: TerminalState = { native: false, platform: null, tmux: null, broker: null, sessions: null,
+  lastKnownSessions: null, lastError: null };
 const NO_ANSWER = "Hivemind did not answer. Is Hivemind Server running?";
 
 export type TerminalHub = ReturnType<typeof createTerminalHub>;
@@ -118,7 +124,8 @@ export function createTerminalHub(win: Win, timeouts: { request?: number; attach
   const attachTimeout = timeouts.attach ?? 10_000;
   const linger = timeouts.linger ?? 1_000;
   let state: TerminalState = {
-    native: true, platform: reportedNativePlatform() ?? "macos", tmux: null, broker: null, sessions: null, lastError: null,
+    native: true, platform: reportedNativePlatform() ?? "macos", tmux: null, broker: null, sessions: null,
+    lastKnownSessions: null, lastError: null,
   };
   const listeners = new Set<() => void>();
   const pending = new Map<string, Pending>();
@@ -197,12 +204,13 @@ export function createTerminalHub(win: Win, timeouts: { request?: number; attach
       case "terminal-status": {
         const lost = state.broker === "connected" && detail.broker !== "connected";
         setState({ platform: detail.platform, tmux: detail.tmux, broker: detail.broker,
-          ...(detail.broker === "connected" ? {} : { sessions: null }) });
+          ...(detail.broker === "connected" ? {} : { sessions: null }),
+          ...(detail.broker === "unverified" ? { lastKnownSessions: null } : {}) });
         if (lost) brokerLost();
         return;
       }
       case "sessions":
-        setState({ sessions: detail.items });
+        setState({ sessions: detail.items, lastKnownSessions: detail.items });
         return;
       case "terminal-launched": {
         const request = detail.id ? pending.get(detail.id) : undefined;
@@ -215,7 +223,8 @@ export function createTerminalHub(win: Win, timeouts: { request?: number; attach
       case "terminal-killed": {
         const ended = "sessions" in detail ? detail.sessions : [detail.session];
         if (state.sessions?.some(item => ended.includes(item.name))) {
-          setState({ sessions: state.sessions.filter(item => !ended.includes(item.name)) });
+          const remaining = state.sessions.filter(item => !ended.includes(item.name));
+          setState({ sessions: remaining, lastKnownSessions: remaining });
         }
         const request = detail.id ? pending.get(detail.id) : undefined;
         if (!request || request.kind !== ("sessions" in detail ? "kill-many" : "kill")) return;
@@ -223,6 +232,14 @@ export function createTerminalHub(win: Win, timeouts: { request?: number; attach
         win.clearTimeout((request as { timer: number }).timer);
         if (request.kind === "kill-many" && "sessions" in detail) request.resolve({ sessions: detail.sessions, errors: detail.errors });
         else if (request.kind === "kill") request.resolve();
+        return;
+      }
+      case "template-secrets": {
+        const request = detail.id ? pending.get(detail.id) : undefined;
+        if (request?.kind !== "secrets") return;
+        pending.delete(detail.id!);
+        win.clearTimeout(request.timer);
+        request.resolve(detail.names);
         return;
       }
       case "terminal-attached": {
@@ -277,6 +294,8 @@ export function createTerminalHub(win: Win, timeouts: { request?: number; attach
           else { win.clearTimeout(request.timer); request.reject(error); }
           return;
         }
+        // Approval has its own request listener and inline error on its card.
+        if (detail.id?.startsWith("approval-")) return;
         // A stream the broker no longer knows is over; other stream errors (a refused input) are not.
         const entry = detail.stream !== null ? streams.get(detail.stream) : undefined;
         if (entry && detail.code === "no-such-stream") loseStream(entry);
@@ -300,7 +319,7 @@ export function createTerminalHub(win: Win, timeouts: { request?: number; attach
     }, linger);
   };
 
-  function request<T>(kind: "launch" | "kill" | "kill-many", message: TerminalMessage & { id?: string }, timeout = requestTimeout) {
+  function request<T>(kind: "launch" | "kill" | "kill-many" | "secrets", message: TerminalMessage & { id?: string }, timeout = requestTimeout) {
     return new Promise<T>((resolve, reject) => {
       const id = message.id!;
       if (!post(message)) { reject(new TerminalRequestError("not-sent", "Terminals are available only in Hivemind.app")); return; }
@@ -365,6 +384,20 @@ export function createTerminalHub(win: Win, timeouts: { request?: number; attach
         result.errors.push(...answer.errors);
       }
       return result;
+    },
+    /** A worker template's secret names kept by Hivemind Server.app. An older app answers unknown-type. */
+    templateSecrets(template: string): Promise<string[]> {
+      return request<string[]>("secrets", { type: "template-secrets-list", id: newId(), template });
+    },
+    /** Adds or replaces one secret; resolves with the template's names. The value is checked here as the app checks it. */
+    setTemplateSecret(template: string, name: string, value: string): Promise<string[]> {
+      const problem = templateSecretNameProblem(name) ?? templateSecretValueProblem(value);
+      if (problem) return Promise.reject(new TerminalRequestError("bad-message", problem));
+      return request<string[]>("secrets", { type: "template-secrets-set", id: newId(), template, name, value });
+    },
+    /** Deletes one secret, or every secret of the template when `name` is null; resolves with the names left. */
+    deleteTemplateSecrets(template: string, name: string | null): Promise<string[]> {
+      return request<string[]>("secrets", { type: "template-secrets-delete", id: newId(), template, name });
     },
     attach(session: string, cols: number, rows: number, handlers: TerminalStreamHandlers): TerminalAttachment {
       const entry: StreamEntry = {
@@ -446,7 +479,7 @@ export function useTerminalState(): TerminalState {
 
 /** The session an agent reported on join, when it is a Hivemind session name. */
 export function agentTerminalSession(agent: Pick<Agent, "terminalSession"> | undefined | null): string | null {
-  return terminalSessionName((agent as { terminalSession?: unknown } | null | undefined)?.terminalSession);
+  return agentSessionLabel(agent);
 }
 
 /** The running session of that name, if the broker lists it. */
@@ -464,12 +497,7 @@ type SessionAgent = Pick<Agent, "name" | "project" | "removedAt" | "terminalSess
  */
 export function recordedSession(state: TerminalState, agent: SessionAgent | undefined | null,
   agents: readonly SessionAgent[] = []): TerminalSessionInfo | null {
-  if (!agent?.project || agent.removedAt != null || !state.sessions) return null;
-  const name = agent.name.toLowerCase();
-  const claimed = new Set(agents.map(agentTerminalSession).filter(Boolean));
-  const matches = state.sessions.filter(item => item.alive && item.project === agent.project && item.agent?.toLowerCase() === name
-    && !claimed.has(item.name));
-  return matches.length === 1 ? matches[0]! : null;
+  return agent && state.sessions ? recordedAgentSession(agent, { agents }, state.sessions) : null;
 }
 
 /** The live session an agent runs in: the one it reported on join when it has that label, else recordedSession. */

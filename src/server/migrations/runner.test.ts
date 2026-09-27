@@ -119,14 +119,24 @@ test("a populated current-main (user_version 2) hive upgrades with every row and
   // messages stay) and agent_terminal_session adds agents.terminal_session (empty); every other row and object is untouched.
   const dropped = ["adaptive_topology_locks", "adaptive_topology_tasks", "adaptive_topology_evaluated", "adaptive_topology_messages",
     "decision_requests", "decision_mutations"];
-  const rewritten = ["adaptive_topology_executions", "adaptive_topology_events", "agents"];
-  // #217 (performance_retention) adds the per-message receipt index, backfilled from the delivery ledger.
-  const added = ["inbox_receipts"];
+  const rewritten = ["adaptive_topology_executions", "adaptive_topology_events", "agents", "task_records", "worker_capabilities"];
+  // #217 (performance_retention) adds the per-message receipt index, backfilled from the delivery ledger;
+  // worker_templates (#276) adds an empty table.
+  const added = ["inbox_receipts", "worker_templates", "launch_requests", "launcher_commands", "jobs", "job_events",
+    "agent_name_aliases", "agent_lifecycle_events"];
   type AgentRow = { id: string; token_hash: string; removed_at?: number | null; terminal_session?: string | null };
   const beforeAgents = before.rows.agents as AgentRow[], afterAgents = after.rows.agents as AgentRow[];
-  assert.deepEqual(afterAgents.map(({ token_hash: _t, removed_at, terminal_session, ...row }) => ({ ...row, removed_at, terminal_session })),
-    beforeAgents.map(({ token_hash: _t, ...row }) => ({ ...row, removed_at: null, terminal_session: null })),
-    "every agent is kept, none removed, none labelled with a terminal session");
+  // agent_reservations adds pending_until, claim_hash and template_id, all empty for agents that already joined.
+  assert.deepEqual(afterAgents.map(({ token_hash: _t, ...row }) => row),
+    beforeAgents.map(({ token_hash: _t, ...row }) => ({ ...row, removed_at: null, terminal_session: null, pending_until: null,
+      claim_hash: null, template_id: null, launch_mode: 'approval', archived_at: null, reserved_by_brain_id: null,
+      identity_revision: 1, seniority_overridden: 0, focus_overridden: 0 })),
+    "every agent is kept, none removed, reserved or labelled with a terminal session");
+  assert.deepEqual(after.rows.task_records, before.rows.task_records!.map(row => ({ ...(row as object), job_id: null })));
+  assert.deepEqual(after.rows.worker_capabilities,
+    before.rows.worker_capabilities!.map(row => ({ ...(row as object), last_editor_id: null })));
+  assert.deepEqual(after.rows.agent_name_aliases, []);
+  assert.deepEqual(after.rows.agent_lifecycle_events, []);
   for (const [i, row] of afterAgents.entries()) {
     if (row.id === "human") assert.match(row.token_hash, /^[0-9a-f]{64}$/);
     if (row.id === "human") assert.notEqual(row.token_hash, beforeAgents[i]!.token_hash, "the constant Human hash is replaced");
@@ -150,7 +160,7 @@ test("a populated current-main (user_version 2) hive upgrades with every row and
   assert.deepEqual(new Map((after.rows.inbox_receipts as Array<{ agent_id: string; seq: number; acknowledged_at: number | null }>)
     .map(row => [`${row.agent_id}:${row.seq}`, row.acknowledged_at])), receipts, "receipts are backfilled from the delivery ledger");
   const performance = ["idx_threads_channel", "idx_room_events_channel_revision", "idx_attachments_sha256",
-    "upload_usage_insert", "upload_usage_delete", "upload_usage_change"];
+    "upload_usage_insert", "upload_usage_delete", "upload_usage_change", "idx_launch_requests_agent", "idx_task_updated_page", "idx_launch_task_worker"];
   const objects = (schema: SchemaRow[]) => schema.filter(row => !dropped.includes(row.tbl) && !rewritten.includes(row.tbl)
     && !added.includes(row.tbl) && row.name !== "adaptive_channel_deleted" && !performance.includes(row.name) && !row.name.startsWith("inbox_receipts_"));
   assert.deepEqual(objects(after.schema), objects(before.schema));

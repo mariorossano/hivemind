@@ -87,15 +87,23 @@ export type TaskContract = z.infer<typeof taskContractSchema>;
 export type TaskResult = z.infer<typeof taskResultSchema>;
 export type TaskAction = z.infer<typeof taskActionSchema>;
 export type TaskState = 'sent' | 'delivered' | 'accepted' | 'rejected' | 'blocked' | 'result_submitted' | 'changes_requested' | 'accepted_complete'
+  | 'paused'
   /** Closed by Hivemind because the assigned worker was removed (#215); a revise reassigns it. */
   | 'cancelled';
+export type TaskPause = { mode: 'soft' | 'hard'; requestId: string; previousState: TaskState;
+  requestedAt: number; graceUntil: number | null; stopRequestedAt?: number; closedAt?: number; resumeRequestId?: string };
 export type TaskEnvelope = {
   taskId: string; channelId: string; revision: number; contractVersion: number;
-  actorId: string; actorRole: 'brain' | 'worker'; assignerId: string; workerId: string;
+  actorId: string; actorRole: 'brain' | 'worker' | 'human'; assignerId: string; workerId: string;
   previousWorkerId?: string;
   checkpointVersion?: number;
   claimVersion?: number;
-  action: TaskAction | { type: 'assign'; contract: TaskContract };
+  action: TaskAction | { type: 'assign'; contract: TaskContract } |
+    { type: 'launch'; state: 'launched' | 'failed' | 'rejected' | 'expired'; requestId: string } |
+    { type: 'pause'; mode: 'soft' | 'hard'; reason?: string } |
+    { type: 'resume'; reason?: string } |
+    { type: 'cancel'; reason: string } |
+    { type: 'hard_stop_requested' } | { type: 'hard_stopped' };
 };
 export type TaskSnapshot = {
   room?: RoomTask;
@@ -104,6 +112,8 @@ export type TaskSnapshot = {
   coordination?: TaskCoordinationView;
   /** Why the task was cancelled; cleared when it is revised. */
   cancellation?: { reason: string; at: number };
+  pause?: TaskPause;
+  jobId?: string | null;
   id: string; channelId: string; assignerId: string; assignerName: string; workerId: string; workerName: string;
   revision: number; contractVersion: number; state: TaskState; contract: TaskContract;
   dispatchSeq: number; receivedAt: number | null; lastEventSeq: number; updatedAt: number;
@@ -131,6 +141,12 @@ export type ChannelTaskPage = { items: TaskSummary[]; hasMore: boolean };
 export function taskBody(envelope: TaskEnvelope): string {
   const a = envelope.action;
   const header = `Task ${a.type} · ${envelope.taskId} · revision ${envelope.revision} / contract ${envelope.contractVersion}`;
+  if (a.type === 'launch') return `${header}\nWorker launch ${a.state}. Request ${a.requestId}.`;
+  if (a.type === 'pause') return `${header}\nHuman paused this task (${a.mode}). Save a checkpoint and stop work.${a.reason ? ` Reason: ${a.reason}` : ''}`;
+  if (a.type === 'resume') return `${header}\nHuman resumed this task. Re-read the current contract and saved handoff before continuing.${a.reason ? ` Reason: ${a.reason}` : ''}`;
+  if (a.type === 'cancel') return `${header}\nHuman cancelled this task. Stop work immediately. Reason: ${a.reason}`;
+  if (a.type === 'hard_stopped') return `${header}\nThe worker session was closed after the hard-pause grace period.`;
+  if (a.type === 'hard_stop_requested') return `${header}\nThe hard-pause grace period ended; the worker session is being closed.`;
   if (a.type === 'assign' || a.type === 'revise') {
     const c = a.contract;
     return [header, a.type === 'revise' ? `Reason: ${a.reason}` : '', `Objective: ${c.objective}`,
@@ -143,18 +159,16 @@ export function taskBody(envelope: TaskEnvelope): string {
     return [header, `Advisory claim version ${envelope.claimVersion}`,
       'reason' in a ? `Reason: ${a.reason}` : '',
       'paths' in a ? `Declared intent: ${a.paths.join('; ') || 'no paths declared'}` : '',
-      'leaseSeconds' in a ? `Lease requested: ${a.leaseSeconds} seconds` : '',
-      'Advisory coordination only: no filesystem lock, code execution, reassignment or change of task authority. Expiry requires explicit reconciliation.'].filter(Boolean).join('\n');
+      'leaseSeconds' in a ? `Lease requested: ${a.leaseSeconds} seconds` : ''].filter(Boolean).join('\n');
   }
   if (a.type === 'checkpoint') {
     const c = a.checkpoint;
-    return [header, `Checkpoint version ${envelope.checkpointVersion}; later checkpoints supersede this report.`,
+    return [header, `Checkpoint version ${envelope.checkpointVersion} (a report, not completion)`,
       `Completed: ${c.completedSteps.join('; ') || 'none reported'}`,
       `Open questions: ${c.unresolvedQuestions.join('; ') || 'none reported'}`,
       `Next action: ${c.nextAction}`, `Artifacts: ${c.artifacts.join('; ') || 'none'}`,
-      `Reported checks (not independently verified): ${c.checks.map(check => `${check.name}: ${check.outcome} [${check.evidenceSeqs.join(', ')}]`).join('; ') || 'none run/reported'}`,
-      `Evidence seqs: ${c.evidenceSeqs.join(', ') || 'none'}`,
-      'Checkpoint only: not completion or a host context reset. Later unsaved work may exist.'].join('\n');
+      `Reported checks: ${c.checks.map(check => `${check.name}: ${check.outcome} [${check.evidenceSeqs.join(', ')}]`).join('; ') || 'none run/reported'}`,
+      `Evidence seqs: ${c.evidenceSeqs.join(', ') || 'none'}`].join('\n');
   }
   if (a.type === 'accept') return `${header}\nWorker explicitly accepted the current contract.`;
   if (a.type === 'reject') return `${header}\nReason: ${a.reason}`;
@@ -163,7 +177,6 @@ export function taskBody(envelope: TaskEnvelope): string {
   if (a.type !== 'result') throw new Error('Unknown task action');
   const r = a.result;
   return [header, r.summary, `Artifacts: ${r.artifacts.join('; ') || 'none'}`,
-    `Reported checks (not independently verified): ${r.checks.map(c => `${c.name}: ${c.outcome} [seqs ${c.evidenceSeqs.join(', ')}]`).join('; ') || 'none run/reported'}`,
-    `Known gaps: ${r.gaps.join('; ') || 'none reported'}`, `Evidence seqs: ${r.evidenceSeqs.join(', ') || 'none'}`,
-    'Result submitted; not accepted-complete until the assigning brain reviews it.'].join('\n');
+    `Reported checks: ${r.checks.map(c => `${c.name}: ${c.outcome} [seqs ${c.evidenceSeqs.join(', ')}]`).join('; ') || 'none run/reported'}`,
+    `Known gaps: ${r.gaps.join('; ') || 'none reported'}`, `Evidence seqs: ${r.evidenceSeqs.join(', ') || 'none'}`].join('\n');
 }

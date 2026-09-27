@@ -168,6 +168,8 @@
 .person-meta .focus { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; color: var(--mute); }
 .person-meta .queue-badge { flex: none; margin: 0; padding: 0 5px; border-radius: 8px; font-size: 10.5px; line-height: 15px; }
 .person-details .inbox-receipt { font-size: 10.5px; line-height: 15px; color: var(--mute); opacity: 1; }
+.person-launch-mode { align-self: flex-start; font-size: 10.5px; line-height: 15px; color: var(--mute); }
+.person-mode-error { font-size: 11px; line-height: 1.35; color: var(--bad-ink); overflow-wrap: anywhere; }
 .person > .kebab { align-self: flex-start; margin: 3px 3px 0 0; opacity: 0; }
 .person:hover > .kebab, .person:focus-within > .kebab, .person > .kebab.on { opacity: 1; }
 @media (hover: none) { .person > .kebab { opacity: 1; } }
@@ -234,7 +236,7 @@
   .shell[data-m="search"] .side-find > .switcher-open { display: none; }
   .m-back { display: grid; place-items: center; flex: none; margin-left: -0.35rem; font-size: 1.3rem; width: 40px; height: 40px; border-radius: 8px; color: var(--ink2); }
   .m-back:active { background: var(--active); }
-  .m-tabs { display: grid; flex: none; border-top: 1px solid var(--line); padding-bottom: env(safe-area-inset-bottom); grid-template-columns: repeat(3, minmax(0, 1fr)); background: var(--surface); }
+  .m-tabs { display: grid; flex: none; border-top: 1px solid var(--line); padding-bottom: env(safe-area-inset-bottom); grid-template-columns: repeat(4, minmax(0, 1fr)); background: var(--surface); }
   .m-tabs button { position: relative; display: flex; justify-content: center; align-items: center; flex-direction: column; gap: 2px; min-height: 56px; font-size: 11.5px; font-weight: 500; color: var(--mute); }
   .m-tabs button.on { color: var(--ink); font-weight: 600; box-shadow: inset 0 2px 0 var(--accent); }
   .m-tabs em { font-style: normal; background: var(--badge); color: var(--badge-ink); position: absolute; top: 6px; left: calc(50% + 6px); display: grid; place-items: center; min-width: 17px; height: 17px; padding: 0 4px;

@@ -43,6 +43,11 @@ test("join stores the reported session; the UI snapshot shows it and the agents'
   assert.ok((roster.json.agents as Agent[]).every(agent => !("terminalSession" in agent)));
   const me = await call("GET", "/api/agent/me", undefined, joined.json.token);
   assert.equal("terminalSession" in me.json.you, false);
+  const withOrders = await call("GET", "/api/agent/me?orders=1", undefined, joined.json.token);
+  assert.equal(withOrders.status, 200);
+  assert.deepEqual(withOrders.json.you, me.json.you, "orders reuse the same agent-visible projection");
+  assert.equal("terminalSession" in withOrders.json.you, false);
+  assert.match(withOrders.json.standingOrders, /wait/);
 
   const plain = await call("POST", "/api/agent/join", { role: "brain" });
   assert.equal("terminalSession" in (await snapshotAgent(plain.json.agent.id)), false, "no session, no field");
@@ -110,7 +115,7 @@ test("removing an agent drops its label", t => {
   assert.equal(tombstone.terminalSession, undefined);
 });
 
-test("the label carries no capability: only identity storage and the join/snapshot paths know it", () => {
+test("the reported label carries no capability; the launcher validates independently derived session names", () => {
   const src = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   const sources = (dir: string): string[] => readdirSync(dir).flatMap(name => {
     const full = path.join(dir, name);
@@ -120,6 +125,9 @@ test("the label carries no capability: only identity storage and the join/snapsh
   const mentions = (pattern: RegExp) => sources(src).filter(file => pattern.test(readFileSync(path.join(src, file), "utf8"))).sort();
   assert.deepEqual(mentions(/\bterminal_session\b/),
     ["server/migrations/agent-terminal-session.ts", "server/services/identity.ts", "server/services/rows.ts"]);
-  assert.deepEqual(mentions(/terminalSession/), ["cli.ts", "mcp/index.ts", "server/app.ts", "server/services/identity.ts",
-    "shared/api-contract.ts", "shared/terminal-session.ts", "shared/types.ts"]);
+  assert.deepEqual(mentions(/terminalSession/), ["cli.ts", "mcp/index.ts", "server/app.ts", "server/launcher-queue.ts", "server/services/agent-management.ts", "server/services/identity.ts",
+    "shared/agent-management.ts", "shared/api-contract.ts", "shared/terminal-session.ts", "shared/types.ts"]);
+  // Human management exposes display/impact metadata and UI observations, never Node execution authority.
+  // The queue may reuse the name validator, but never turn an agent's self-reported label into kill authority.
+  assert.doesNotMatch(readFileSync(path.join(src, "server/launcher-queue.ts"), "utf8"), /\.terminalSession\b/);
 });
