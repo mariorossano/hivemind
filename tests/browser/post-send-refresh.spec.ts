@@ -71,7 +71,8 @@ async function fixture(page: Page, inThread: boolean) {
       } else h.emit(kind, { channelId: a.id });
     },
     async sendFromHistory() {
-      await scope.locator('.stream').evaluate(el => { el.scrollTop = 0; });
+      await scope.locator('.stream').hover();
+      await page.mouse.wheel(0, -100_000);
       await expect(scope.getByRole('button', { name: inThread ? 'Refresh thread' : 'Jump to recent', exact: true })).toBeVisible();
       await scope.locator('.composer textarea').fill('My confirmed message');
       await scope.locator('.composer textarea').press('Enter');
@@ -94,6 +95,7 @@ async function fixture(page: Page, inThread: boolean) {
   await page.route('**/api/ui/snapshot', route => json(route, snap()));
   await page.route('**/api/ui/read-state', route => json(route, snap()));
   await page.route('**/api/ui/nav-status', route => json(route, { agentWork: {} }));
+  await page.route("**/api/ui/launch-requests", route => json(route, { requests: [] }));
   await page.route('**/api/ui/read', route => { revision++; return json(route, snap()); });
   await page.route('**/api/ui/activity?*', route => json(route, { ...snap(), items: [], hasMore: false }));
   await page.route('**/api/ui/channels/*/room', route => json(route, { room: null, tasks: [], activeTaskCount: 0,

@@ -1,9 +1,10 @@
+import { jobEventSchema } from '../shared/jobs.ts';
 import { setCapabilitiesSchema, suggestWorkersSchema, routingOutcomeSchema, routingOverrideSchema } from '../shared/routing.ts';
 import { attachmentIdsSchema, cursorSchema, limitSchema, memberNamesSchema, messageBodySchema, nameSchema, normalizeChannelReference, referenceSchema, senioritySchema, sequenceSchema } from "../shared/api-contract.ts";
 import type { HandoffList } from '../shared/handoffs.ts';
 import { sendOperation } from "../client/send-operation.ts";
 import { requestIdSchema } from "../shared/mutation.ts";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, type RegisteredTool } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { mkdirSync } from "node:fs";
@@ -13,9 +14,11 @@ import { agentDownloadToFile, agentRequest } from "../client/http.ts";
 import { imagePreview } from "../server/files.ts";
 import { guessMime } from "../shared/mime.ts";
 import { waitUntilMail } from "./wait-loop.ts";
+import { createWaitView } from "./wait-view.ts";
 import { digestExpansionSchema } from "../shared/digest.ts";
 import { claimPreviewSchema } from '../shared/task-claims.ts';
 import { assignTaskSchema, taskEventSchema } from '../shared/tasks.ts';
+import { requestWorkerSchema, releaseWorkerSchema } from '../shared/worker-orchestration.ts';
 import { roomEventSchema } from '../shared/rooms.ts';
 import { subscriptionSchema } from '../shared/notifications.ts';
 import { packageVersion } from "../shared/package-root.ts";
@@ -23,10 +26,10 @@ import { attachablePath } from "./attach-guard.ts";
 import { MESSAGE_EVENT_TYPES } from "../shared/types.ts";
 import { terminalSessionFields } from "../shared/terminal-session.ts";
 import { JOIN_SESSION, PARAM_DESCRIPTIONS, SEARCH_NEXT, TOOL_DESCRIPTIONS, joinNext } from "./tool-text.ts";
-import { MCP_HEARTBEAT_MS, MCP_WAIT_POLL_MS, WAIT_NEXT, type Agent, type Channel, type WaitResult } from "../shared/types.ts";
+import { MCP_HEARTBEAT_MS, MCP_WAIT_POLL_MS, type Agent, type Channel, type WaitResult } from "../shared/types.ts";
 
 function text(data: unknown) {
-  return { content: [{ type: "text" as const, text: typeof data === "string" ? data : JSON.stringify(data, null, 2) }] };
+  return { content: [{ type: "text" as const, text: typeof data === "string" ? data : JSON.stringify(data) }] };
 }
 
 export { normalizeChannelReference };
@@ -34,6 +37,12 @@ export { normalizeChannelReference };
 const channelPath = (reference: string) => encodeURIComponent(normalizeChannelReference(reference));
 /** Explicit shapes of the subscriptions tool, listed in its description. */
 export const SUBSCRIPTION_MODES = ["list", "set", "reset"] as const;
+
+/** Role is only a startup hint when this process has no preloaded credential. */
+export function configuredToolRole(env: NodeJS.ProcessEnv): "brain" | "worker" | null {
+  if (env.HIVEMIND_TOKEN) return null;
+  return env.HIVEMIND_ROLE === "brain" || env.HIVEMIND_ROLE === "worker" ? env.HIVEMIND_ROLE : null;
+}
 
 export function resolveVisibleWorkerReference(reference: string, roster: Agent[]): string {
   const value = reference.trim();
@@ -46,6 +55,7 @@ export function resolveVisibleWorkerReference(reference: string, roster: Agent[]
 
 export async function startMcp() {
   let sessionToken = process.env.HIVEMIND_TOKEN;
+  const toolRole = configuredToolRole(process.env);
   let heartbeat: ReturnType<typeof setInterval> | undefined;
   
   function token(): string {
@@ -62,14 +72,18 @@ export async function startMcp() {
     heartbeat.unref();
   }
   const server = new McpServer({ name: "hivemind", version: packageVersion() });
+  const brainTools: RegisteredTool[] = [];
+  const workerTools: RegisteredTool[] = [];
   // Serialize joins to prevent two concurrent first calls creating two identities.
   let joins: Promise<unknown> = Promise.resolve();
   const joinSerial = <T>(work: () => Promise<T>): Promise<T> => {
     const next = joins.catch(() => undefined).then(work); joins = next; return next;
   };
   let joinedName: string | undefined;
+  const joinedNames = new Set<string>();
   let inboxId = randomUUID();
   let inboxReady: Promise<{ sessionId: string }> | undefined;
+  let waitView = createWaitView();
   const inboxSession = (signal?: AbortSignal) => {
     if (!inboxReady) {
       inboxReady = agentRequest<{ sessionId: string }>(
@@ -91,10 +105,23 @@ export async function startMcp() {
       focus: z.string().max(4000).optional(),
       resume: z.string().optional(),
       project: z.string().optional(),
+      claim: z.string().optional().describe(PARAM_DESCRIPTIONS.claim),
     },
-    async ({ role, seniority, focus, resume, project }) => joinSerial(async () => {
-      if (joinedName && resume && resume.toLowerCase() !== joinedName.toLowerCase())
+    async ({ role, seniority, focus, resume, project, claim }) => joinSerial(async () => {
+      if (toolRole && role !== toolRole)
+        throw new Error(`This MCP process is configured for ${toolRole}; join with role=${toolRole} or start another MCP process`);
+      if (joinedName && claim)
         throw new Error("This process already has an identity; start a new MCP process to replace it");
+      if (joinedName && resume && !joinedNames.has(resume.toLowerCase())) {
+        // Human may have renamed this identity while its MCP process kept running.
+        // Verify the current token before accepting a new name: a stale token must
+        // not turn this process into another identity through name-based resume.
+        const me = await agentRequest<{ you: { name: string } }>("GET", "/api/agent/me", undefined, token());
+        if (me.you.name.toLowerCase() !== resume.toLowerCase())
+          throw new Error("This process already has an identity; start a new MCP process to replace it");
+        joinedName = me.you.name;
+        joinedNames.add(joinedName.toLowerCase());
+      }
       // The session key lives only in this process; resuming by name needs nothing stored.
       const auth = sessionToken;
       const result = await agentRequest<{
@@ -114,13 +141,15 @@ export async function startMcp() {
           resume: resume ?? null,
           project: project ?? null,
           cwd: process.cwd(),
+          ...(claim ? { claim } : {}),
           ...terminalSessionFields(process.env),
         },
-        auth ?? null,
+        claim ? null : auth ?? null,
       );
-      if (sessionToken !== result.token) { inboxId = randomUUID(); inboxReady = undefined; }
+      if (sessionToken !== result.token) { inboxId = randomUUID(); inboxReady = undefined; waitView = createWaitView(); }
       sessionToken = result.token;
       joinedName = result.agent.name;
+      joinedNames.add(joinedName.toLowerCase());
       ensureHeartbeat();
       return text({
         name: result.agent.name,
@@ -136,18 +165,21 @@ export async function startMcp() {
   );
 
   server.tool("whoami", TOOL_DESCRIPTIONS.whoami, { orders: z.boolean().optional() }, async ({ orders }) => {
-    return text(await agentRequest("GET", `/api/agent/me${orders ? "?orders=1" : ""}`, undefined, token()));
+    const me = await agentRequest<{ you: { name: string } }>("GET", `/api/agent/me${orders ? "?orders=1" : ""}`, undefined, token());
+    joinedName = me.you.name;
+    joinedNames.add(joinedName.toLowerCase());
+    return text(me);
   });
 
   server.tool("agents", TOOL_DESCRIPTIONS.agents, async () => {
     return text(await agentRequest("GET", "/api/agent/agents", undefined, token()));
   });
 
-  server.tool("bot_tools", TOOL_DESCRIPTIONS.bot_tools, async () =>
-    text(await agentRequest('GET', '/api/agent/bot-tools', undefined, token())));
-  server.tool("call_bot_tool", TOOL_DESCRIPTIONS.call_bot_tool, {
+  brainTools.push(server.tool("bot_tools", TOOL_DESCRIPTIONS.bot_tools, async () =>
+    text(await agentRequest('GET', '/api/agent/bot-tools', undefined, token()))));
+  brainTools.push(server.tool("call_bot_tool", TOOL_DESCRIPTIONS.call_bot_tool, {
     botId: z.string().min(1), tool: z.string().min(1), arguments: z.record(z.string(), z.unknown()),
-  }, async ({ botId, tool, arguments: args }) => text(await agentRequest('POST', `/api/agent/bots/${encodeURIComponent(botId)}/tools`, { tool, arguments: args }, token(), 35000)));
+  }, async ({ botId, tool, arguments: args }) => text(await agentRequest('POST', `/api/agent/bots/${encodeURIComponent(botId)}/tools`, { tool, arguments: args }, token(), 35000))));
 
   server.tool("channels", TOOL_DESCRIPTIONS.channels, {
     unread: z.boolean().optional(),
@@ -279,11 +311,19 @@ export async function startMcp() {
     TOOL_DESCRIPTIONS.room_event,
     { channel: referenceSchema, ...roomEventSchema.shape },
     async ({ channel, ...args }) => text(await agentRequest('POST', `/api/agent/channels/${channelPath(channel)}/room`, args, token())));
-  server.tool("assign_task",
+  brainTools.push(server.tool("assign_task",
     TOOL_DESCRIPTIONS.assign_task,
     assignTaskSchema.shape,
     async args => text(await agentRequest('POST', '/api/agent/tasks',
-      { ...args, channel: args.channel ? normalizeChannelReference(args.channel) : undefined }, token())));
+      { ...args, channel: args.channel ? normalizeChannelReference(args.channel) : undefined }, token()))));
+  brainTools.push(server.tool("job_event", TOOL_DESCRIPTIONS.job_event, jobEventSchema.shape,
+    async args => text(await agentRequest('POST', '/api/agent/jobs/events', args, token()))));
+  brainTools.push(server.tool("worker_templates", TOOL_DESCRIPTIONS.worker_templates, {},
+    async () => text(await agentRequest('GET', '/api/agent/worker-templates', undefined, token()))));
+  brainTools.push(server.tool("request_worker", TOOL_DESCRIPTIONS.request_worker, requestWorkerSchema.shape,
+    async args => text(await agentRequest('POST', '/api/agent/workers/request', requestWorkerSchema.parse(args), token()))));
+  brainTools.push(server.tool("release_worker", TOOL_DESCRIPTIONS.release_worker, releaseWorkerSchema.shape,
+    async args => text(await agentRequest('POST', '/api/agent/workers/release', args, token()))));
   server.tool("get_worker_capabilities", TOOL_DESCRIPTIONS.get_worker_capabilities,
     { workerId: z.string().trim().min(1).max(100).describe(PARAM_DESCRIPTIONS.workerId) },
     async ({ workerId }) => {
@@ -294,14 +334,14 @@ export async function startMcp() {
       }
       return text(await agentRequest('GET', `/api/agent/workers/${resolved}/capabilities`, undefined, token()));
     });
-  server.tool("set_capabilities", TOOL_DESCRIPTIONS.set_capabilities,
-    setCapabilitiesSchema.shape, async args => text(await agentRequest('POST', '/api/agent/capabilities', args, token())));
-  server.tool("worker_match_suggest", TOOL_DESCRIPTIONS.worker_match_suggest,
-    { taskId: z.string().uuid(), ...suggestWorkersSchema.shape }, async ({ taskId, ...args }) => text(await agentRequest('POST', `/api/agent/tasks/${taskId}/routing`, args, token())));
-  server.tool("worker_match_outcome", TOOL_DESCRIPTIONS.worker_match_outcome,
-    { taskId: z.string().uuid(), ...routingOutcomeSchema.shape }, async ({ taskId, ...args }) => text(await agentRequest('POST', `/api/agent/tasks/${taskId}/routing-outcome`, args, token())));
-  server.tool("worker_match_override", TOOL_DESCRIPTIONS.worker_match_override,
-    { taskId: z.string().uuid(), ...routingOverrideSchema.shape }, async ({ taskId, ...args }) => text(await agentRequest('POST', `/api/agent/tasks/${taskId}/routing-override`, args, token())));
+  workerTools.push(server.tool("set_capabilities", TOOL_DESCRIPTIONS.set_capabilities,
+    setCapabilitiesSchema.shape, async args => text(await agentRequest('POST', '/api/agent/capabilities', args, token()))));
+  brainTools.push(server.tool("worker_match_suggest", TOOL_DESCRIPTIONS.worker_match_suggest,
+    { taskId: z.string().uuid(), ...suggestWorkersSchema.shape }, async ({ taskId, ...args }) => text(await agentRequest('POST', `/api/agent/tasks/${taskId}/routing`, args, token()))));
+  brainTools.push(server.tool("worker_match_outcome", TOOL_DESCRIPTIONS.worker_match_outcome,
+    { taskId: z.string().uuid(), ...routingOutcomeSchema.shape }, async ({ taskId, ...args }) => text(await agentRequest('POST', `/api/agent/tasks/${taskId}/routing-outcome`, args, token()))));
+  brainTools.push(server.tool("worker_match_override", TOOL_DESCRIPTIONS.worker_match_override,
+    { taskId: z.string().uuid(), ...routingOverrideSchema.shape }, async ({ taskId, ...args }) => text(await agentRequest('POST', `/api/agent/tasks/${taskId}/routing-override`, args, token()))));
   server.tool("get_handoffs",
     TOOL_DESCRIPTIONS.get_handoffs,
     { taskId: z.string().uuid().optional(), beforeTask: z.string().uuid().optional() },
@@ -319,10 +359,10 @@ export async function startMcp() {
     { taskId: z.string().uuid(), export: z.boolean().optional() },
     async ({ taskId, export: fixture }) => text(await agentRequest('GET',
       `/api/agent/tasks/${taskId}/timeline${fixture ? '/export' : ''}`, undefined, token())));
-  server.tool("preview_task_claim",
+  brainTools.push(server.tool("preview_task_claim",
     TOOL_DESCRIPTIONS.preview_task_claim,
     { taskId: z.string().uuid(), ...claimPreviewSchema.shape },
-    async ({ taskId, ...args }) => text(await agentRequest('POST', `/api/agent/tasks/${taskId}/claim-preview`, args, token())));
+    async ({ taskId, ...args }) => text(await agentRequest('POST', `/api/agent/tasks/${taskId}/claim-preview`, args, token()))));
   server.tool("task_event",
     TOOL_DESCRIPTIONS.task_event,
     { taskId: z.string().uuid(), ...taskEventSchema.shape },
@@ -346,10 +386,7 @@ export async function startMcp() {
           ),
         { signal: extra.signal },
       );
-      return text({
-        instruction: WAIT_NEXT,
-        ...result,
-      });
+      return text(waitView(result));
     },
   );
 
@@ -365,7 +402,7 @@ export async function startMcp() {
     },
   );
 
-  server.tool(
+  brainTools.push(server.tool(
     "create_channel",
     TOOL_DESCRIPTIONS.create_channel,
     {
@@ -384,7 +421,7 @@ export async function startMcp() {
         ),
       );
     },
-  );
+  ));
 
   server.tool(
     "set_thread_status",
@@ -398,7 +435,7 @@ export async function startMcp() {
     },
   );
 
-  server.tool(
+  brainTools.push(server.tool(
     "invite",
     TOOL_DESCRIPTIONS.invite,
     {
@@ -415,16 +452,16 @@ export async function startMcp() {
         ),
       );
     },
-  );
+  ));
 
-  server.tool(
+  brainTools.push(server.tool(
     "clear_context",
     TOOL_DESCRIPTIONS.clear_context,
     { agent: z.string() },
     async ({ agent }) => {
       return text(await agentRequest("POST", "/api/agent/clear-context", { name: agent }, token()));
     },
-  );
+  ));
 
   server.tool(
     "attach",
@@ -507,6 +544,10 @@ export async function startMcp() {
     },
   );
 
+  // Disabled before connect: tools/list is stable for the life of this MCP process.
+  // The HTTP server continues to enforce the real agent's permissions.
+  if (toolRole === "brain") for (const tool of workerTools) tool.disable();
+  if (toolRole === "worker") for (const tool of brainTools) tool.disable();
   if (sessionToken) ensureHeartbeat();
   const previousClose = server.server.onclose;
   server.server.onclose = () => { if (heartbeat) clearInterval(heartbeat); previousClose?.(); };

@@ -26,6 +26,9 @@ public final class TerminalBroker {
     /// session's shell; nil: a launch that carries any fails, rather than
     /// start without them.
     public var secrets: LaunchSecretStore?
+    /// Where worker template secrets are kept (the Keychain in the app); nil:
+    /// secrets.* requests are answered with an error.
+    public var templateSecrets: (any TemplateSecretVault)?
     /// Never given a secret or a variable's value: the broker logs names,
     /// counts and paths only.
     public var log: (String) -> Void
@@ -34,7 +37,7 @@ public final class TerminalBroker {
       tmux: any TmuxRunning, terminals: any BrokerTerminalSpawning, scheduler: any Scheduling,
       locateTmux: @escaping () -> String?, isDirectory: @escaping (String) -> Bool,
       environment: [String: String], idlePollInterval: TimeInterval = 15, secrets: LaunchSecretStore? = nil,
-      log: @escaping (String) -> Void = { _ in }
+      templateSecrets: (any TemplateSecretVault)? = nil, log: @escaping (String) -> Void = { _ in }
     ) {
       self.tmux = tmux
       self.terminals = terminals
@@ -44,6 +47,7 @@ public final class TerminalBroker {
       self.environment = environment
       self.idlePollInterval = idlePollInterval
       self.secrets = secrets
+      self.templateSecrets = templateSecrets
       self.log = log
     }
   }
@@ -53,6 +57,9 @@ public final class TerminalBroker {
   public let configPath: String
   /// Called after anything the menu shows changed.
   public var onChange: (@MainActor () -> Void)?
+  /// Server.app signs a Human's native approval after the verified page or
+  /// paired device sends it through this broker. Nil in tests/other hosts.
+  public var launcherDecision: (@MainActor (String, TemplateID?, Bool) async -> Result<Void, BrokerProtocolError>)?
 
   public private(set) var isRunning = false
   /// Where tmux was found last; looked up again on every hello.
@@ -389,9 +396,47 @@ public final class BrokerConnection {
       entry.terminal.resize(size)
     case .detach(let stream):
       detach(stream, id: id)
-    case .sessionsList, .sessionsSubscribe, .sessionsUnsubscribe, .launch, .attach, .kill:
+    case .secretsList(let template):
+      templateSecrets(template, id: id) { _ in }
+    case .secretsSet(let template, let name, let value):
+      templateSecrets(template, id: id) { vault throws(BrokerProtocolError) in
+        let names = try Self.vaultCall { () throws(BrokerFiles.Failure) in try vault.names(for: template) }
+        guard names.contains(name) || names.count < TemplateSecrets.maxNames else {
+          throw BrokerProtocolError.invalid("name", "a template holds at most \(TemplateSecrets.maxNames) secrets")
+        }
+        try Self.vaultCall { () throws(BrokerFiles.Failure) in try vault.set(value, name: name, for: template) }
+        broker?.deps.log("[broker] template \(template): set secret \(name)")
+      }
+    case .secretsDelete(let template, let name):
+      templateSecrets(template, id: id) { vault throws(BrokerProtocolError) in
+        try Self.vaultCall { () throws(BrokerFiles.Failure) in try vault.delete(name: name, for: template) }
+        broker?.deps.log("[broker] template \(template): deleted \(name.map { "secret \($0)" } ?? "every secret")")
+      }
+    case .sessionsList, .sessionsSubscribe, .sessionsUnsubscribe, .launch, .attach, .kill,
+         .launcherApprove, .launcherReject:
       enqueue(frame)
     }
+  }
+
+  /// Runs `change` on the vault, then answers with the template's names (or the error, which never holds a value).
+  private func templateSecrets(
+    _ template: TemplateID, id: String?, _ change: (any TemplateSecretVault) throws(BrokerProtocolError) -> Void
+  ) {
+    guard let vault = broker?.deps.templateSecrets else {
+      return send(.error(BrokerProtocolError(.internal, "this broker cannot keep template secrets")), id: id)
+    }
+    do {
+      try change(vault)
+      let names = try Self.vaultCall { () throws(BrokerFiles.Failure) in try vault.names(for: template) }
+      send(.secrets(template: template, names: names), id: id)
+    } catch {
+      if error.code == .internal { broker?.deps.log("[broker] template \(template): \(error.message)") }
+      send(.error(error), id: id)
+    }
+  }
+
+  private static func vaultCall<T>(_ work: () throws(BrokerFiles.Failure) -> T) throws(BrokerProtocolError) -> T {
+    do { return try work() } catch { throw BrokerProtocolError(.internal, error.message) }
   }
 
   private func enqueue(_ frame: BrokerRequestFrame) {
@@ -436,8 +481,24 @@ public final class BrokerConnection {
       await attach(session, size: size, id: id)
     case .kill(let session):
       await kill(session, id: id)
-    case .hello, .input, .resize, .detach:
+    case .launcherApprove(let requestId, let templateId):
+      await decide(requestId: requestId, templateId: templateId, approve: true, id: id)
+    case .launcherReject(let requestId):
+      await decide(requestId: requestId, templateId: nil, approve: false, id: id)
+    case .hello, .input, .resize, .detach, .secretsList, .secretsSet, .secretsDelete:
       break
+    }
+  }
+
+  private func decide(requestId: String, templateId: TemplateID?, approve: Bool, id: String?) async {
+    guard let decision = broker?.launcherDecision else {
+      return send(.error(BrokerProtocolError(.internal, "launcher approval is unavailable")), id: id)
+    }
+    switch await decision(requestId, templateId, approve) {
+    case .success:
+      send(.launcherDecided(requestId: requestId, action: approve ? "approve" : "reject"), id: id)
+    case .failure(let error):
+      send(.error(error), id: id)
     }
   }
 
@@ -498,7 +559,8 @@ public final class BrokerConnection {
         guard let store = broker.deps.secrets else {
           results.append(nil)
           let message = launch.secrets != nil ? "launches[\(index)].secrets: this broker cannot pass secrets"
-            : "launches[\(index)].environment: this broker cannot pass environment variables"
+            : launch.environment != nil ? "launches[\(index)].environment: this broker cannot pass environment variables"
+            : "launches[\(index)].template: this broker cannot pass template secrets"
           errors.append(BrokerLaunchFailure(index: index, code: .internal, message: message))
           continue
         }
@@ -516,11 +578,22 @@ public final class BrokerConnection {
         errors.append(BrokerLaunchFailure(index: index, code: .cwdMissing, message: "launches[\(index)].cwd: not a folder"))
         continue
       }
+      // The template's secrets come from the vault here, never from the client.
+      var templateSecrets: [String: String] = [:]
+      if let template = launch.template, let vault = broker.deps.templateSecrets {
+        do { templateSecrets = try vault.values(for: template) } catch {
+          broker.deps.log("[broker] \(name): cannot read template \(template)'s secrets: \(error.message)")
+          results.append(nil)
+          errors.append(BrokerLaunchFailure(index: index, code: .internal, message: "launches[\(index)].template: \(error.message)"))
+          continue
+        }
+        if !templateSecrets.isEmpty { broker.deps.log("[broker] \(name): template secrets \(templateSecrets.keys.sorted())") }
+      }
       if let file = environmentFile, let store = broker.deps.secrets {
-        do { try store.write(environment: launch.environment, secrets: launch.secrets, to: file) } catch {
+        do { try store.write(environment: launch.environment, secrets: launch.secrets, templateSecrets: templateSecrets, to: file) } catch {
           broker.deps.log("[broker] \(name): cannot write its launch file: \(error.message)")
           results.append(nil)
-          let field = launch.secrets != nil ? "secrets" : "environment"
+          let field = launch.secrets != nil ? "secrets" : launch.environment != nil ? "environment" : "template"
           errors.append(BrokerLaunchFailure(index: index, code: .internal, message: "launches[\(index)].\(field): \(error.message)"))
           continue
         }

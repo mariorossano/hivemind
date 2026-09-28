@@ -145,18 +145,21 @@ public struct BrokerLaunch: Equatable, Sendable {
   /// file (docs/terminal-broker.md#launch-environment), and ignored the same
   /// way by a launch that reuses a running session.
   public let environment: LaunchEnvironment?
+  /// The worker template this launch starts: the broker adds the template's
+  /// secrets from its vault to the launch file (docs/terminal-broker.md#template-secrets).
+  public let template: TemplateID?
 
   public init(
     project: String, agent: String?, title: String, cwd: String, command: String, session: SessionName? = nil,
-    secrets: LaunchSecrets? = nil, environment: LaunchEnvironment? = nil
+    secrets: LaunchSecrets? = nil, environment: LaunchEnvironment? = nil, template: TemplateID? = nil
   ) throws(BrokerProtocolError) {
     try self.init(project: project, agent: agent, title: title, cwd: cwd, command: command, session: session, secrets: secrets,
-                  environment: environment, field: "launch")
+                  environment: environment, template: template, field: "launch")
   }
 
   init(
     project: String, agent: String?, title: String, cwd: String, command: String, session: SessionName?,
-    secrets: LaunchSecrets? = nil, environment: LaunchEnvironment? = nil, field: String
+    secrets: LaunchSecrets? = nil, environment: LaunchEnvironment? = nil, template: TemplateID? = nil, field: String
   ) throws(BrokerProtocolError) {
     guard Self.isProjectSlug(project) else {
       throw .invalid("\(field).project", "must be a project slug (lowercase letters, digits and dashes, at most 32)")
@@ -187,10 +190,11 @@ public struct BrokerLaunch: Equatable, Sendable {
     self.session = session
     self.secrets = secrets
     self.environment = environment
+    self.template = template
   }
 
-  /// Whether the session gets a launch file: any secret or variable.
-  public var handsVariables: Bool { secrets != nil || environment != nil }
+  /// Whether the session gets a launch file: any secret or variable, or a template whose secrets may be kept.
+  public var handsVariables: Bool { secrets != nil || environment != nil || template != nil }
 
   public static func isProjectSlug(_ value: String) -> Bool {
     let bytes = Array(value.utf8)
@@ -286,6 +290,14 @@ public enum BrokerRequest: Equatable, Sendable {
   case detach(stream: BrokerStreamID)
   /// Kill a session and everything in it; answered with `killed`.
   case kill(session: SessionName)
+  /// A worker template's secret names; answered with `secrets`. Values are never sent back.
+  case secretsList(template: TemplateID)
+  /// Add or replace a template secret in the app's vault; answered with `secrets`.
+  case secretsSet(template: TemplateID, name: String, value: TemplateSecretValue)
+  /// Delete one template secret, or all of them when `name` is nil; answered with `secrets`.
+  case secretsDelete(template: TemplateID, name: String?)
+  case launcherApprove(requestId: String, templateId: TemplateID?)
+  case launcherReject(requestId: String)
 
   public var type: String {
     switch self {
@@ -299,6 +311,11 @@ public enum BrokerRequest: Equatable, Sendable {
     case .resize: "resize"
     case .detach: "detach"
     case .kill: "kill"
+    case .secretsList: "secrets.list"
+    case .secretsSet: "secrets.set"
+    case .secretsDelete: "secrets.delete"
+    case .launcherApprove: "launcher.approve"
+    case .launcherReject: "launcher.reject"
     }
   }
 }
@@ -333,6 +350,7 @@ extension BrokerRequestFrame: Codable {
   private enum Key: String, CodingKey {
     case type, id, version, token, client, launches, session, cols, rows, stream, data
     case project, agent, title, cwd, command, secrets, environment
+    case template, name, value, requestId, templateId
   }
 
   public init(from decoder: any Decoder) throws {
@@ -379,6 +397,7 @@ extension BrokerRequestFrame: Codable {
           session: BrokerCoding.optionalSession(item, .session, field: "\(field).session"),
           secrets: BrokerCoding.optionalSecrets(item, .secrets, field: "\(field).secrets"),
           environment: BrokerCoding.optionalEnvironment(item, .environment, field: "\(field).environment"),
+          template: BrokerCoding.optionalTemplate(item, .template, field: "\(field).template"),
           field: field))
       }
       request = .launch(launches)
@@ -396,6 +415,26 @@ extension BrokerRequestFrame: Codable {
       request = .detach(stream: try BrokerCoding.stream(c, .stream))
     case "kill":
       request = .kill(session: try BrokerCoding.session(c, .session))
+    case "secrets.list":
+      request = .secretsList(template: try BrokerCoding.template(c, .template))
+    case "secrets.set":
+      let template = try BrokerCoding.template(c, .template)
+      let name = try BrokerCoding.secretName(c, .name)
+      guard let value = TemplateSecretValue(try BrokerCoding.string(c, .value)) else {
+        throw BrokerProtocolError.invalid("value", TemplateSecrets.valueRule)
+      }
+      request = .secretsSet(template: template, name: name, value: value)
+    case "secrets.delete":
+      let template = try BrokerCoding.template(c, .template)
+      request = .secretsDelete(template: template, name: try BrokerCoding.optionalSecretName(c, .name))
+    case "launcher.approve", "launcher.reject":
+      let requestId = try BrokerCoding.string(c, .requestId)
+      guard UUID(uuidString: requestId) != nil else { throw BrokerProtocolError.invalid("requestId", "must be a UUID") }
+      if type == "launcher.approve" {
+        request = .launcherApprove(requestId: requestId, templateId: try BrokerCoding.optionalTemplate(c, .templateId, field: "templateId"))
+      } else {
+        request = .launcherReject(requestId: requestId)
+      }
     default:
       throw BrokerProtocolError(.unknownType, "unknown message type \(BrokerText.quoted(type))")
     }
@@ -425,6 +464,7 @@ extension BrokerRequestFrame: Codable {
         try item.encodeIfPresent(launch.session, forKey: .session)
         try item.encodeIfPresent(launch.secrets?.dictionary, forKey: .secrets)
         try item.encodeIfPresent(launch.environment?.dictionary, forKey: .environment)
+        try item.encodeIfPresent(launch.template?.rawValue, forKey: .template)
       }
     case .attach(let session, let size):
       try c.encode(session, forKey: .session)
@@ -441,6 +481,20 @@ extension BrokerRequestFrame: Codable {
       try c.encode(stream, forKey: .stream)
     case .kill(let session):
       try c.encode(session, forKey: .session)
+    case .secretsList(let template):
+      try c.encode(template.rawValue, forKey: .template)
+    case .secretsSet(let template, let name, let value):
+      try c.encode(template.rawValue, forKey: .template)
+      try c.encode(name, forKey: .name)
+      try c.encode(value.value, forKey: .value)
+    case .secretsDelete(let template, let name):
+      try c.encode(template.rawValue, forKey: .template)
+      try c.encodeIfPresent(name, forKey: .name)
+    case .launcherApprove(let requestId, let templateId):
+      try c.encode(requestId, forKey: .requestId)
+      try c.encodeIfPresent(templateId?.rawValue, forKey: .templateId)
+    case .launcherReject(let requestId):
+      try c.encode(requestId, forKey: .requestId)
     }
   }
 }
@@ -465,6 +519,9 @@ public enum BrokerEvent: Equatable, Sendable {
   /// exited. `status` is the attach process's exit status when there was one.
   case exit(stream: BrokerStreamID, status: Int?)
   case killed(session: SessionName)
+  /// The template's secret names after a secrets.list, .set or .delete, sorted. Never a value.
+  case secrets(template: TemplateID, names: [String])
+  case launcherDecided(requestId: String, action: String)
   /// `stream` is set when the error is about one stream.
   case error(code: BrokerErrorCode, message: String, stream: BrokerStreamID?)
 
@@ -477,6 +534,8 @@ public enum BrokerEvent: Equatable, Sendable {
     case .output: "output"
     case .exit: "exit"
     case .killed: "killed"
+    case .secrets: "secrets"
+    case .launcherDecided: "launcher.decided"
     case .error: "error"
     }
   }
@@ -512,6 +571,7 @@ public struct BrokerEventFrame: Equatable, Sendable {
 extension BrokerEventFrame: Codable {
   private enum Key: String, CodingKey {
     case type, id, version, tmuxPath, items, names, created, errors, stream, session, data, status, code, message
+    case template, requestId, action
   }
 
   public init(from decoder: any Decoder) throws {
@@ -547,6 +607,20 @@ extension BrokerEventFrame: Codable {
       event = .exit(stream: try BrokerCoding.stream(c, .stream), status: try BrokerCoding.optionalInt(c, .status))
     case "killed":
       event = .killed(session: try BrokerCoding.session(c, .session))
+    case "secrets":
+      let template = try BrokerCoding.template(c, .template)
+      guard let names = try? c.decode([String].self, forKey: .names), names.count <= TemplateSecrets.maxNames,
+            names.allSatisfy(TemplateSecrets.isValidName) else {
+        throw BrokerProtocolError.invalid("names", "must be up to \(TemplateSecrets.maxNames) secret names")
+      }
+      event = .secrets(template: template, names: names)
+    case "launcher.decided":
+      let requestId = try BrokerCoding.string(c, .requestId)
+      let action = try BrokerCoding.string(c, .action)
+      guard UUID(uuidString: requestId) != nil, action == "approve" || action == "reject" else {
+        throw BrokerProtocolError.invalid("launcher.decided", "invalid decision")
+      }
+      event = .launcherDecided(requestId: requestId, action: action)
     case "error":
       let code: BrokerErrorCode
       do { code = try c.decode(BrokerErrorCode.self, forKey: .code) } catch {
@@ -587,6 +661,12 @@ extension BrokerEventFrame: Codable {
       try c.encode(status, forKey: .status)
     case .killed(let session):
       try c.encode(session, forKey: .session)
+    case .secrets(let template, let names):
+      try c.encode(template.rawValue, forKey: .template)
+      try c.encode(names, forKey: .names)
+    case .launcherDecided(let requestId, let action):
+      try c.encode(requestId, forKey: .requestId)
+      try c.encode(action, forKey: .action)
     case .error(let code, let message, let stream):
       try c.encode(code, forKey: .code)
       try c.encode(message, forKey: .message)
@@ -742,6 +822,31 @@ enum BrokerCoding {
     }
     guard let values else { return nil }
     return try LaunchEnvironment(values, field: field)
+  }
+
+  static func template<K: CodingKey>(_ c: KeyedDecodingContainer<K>, _ key: K) throws(BrokerProtocolError) -> TemplateID {
+    guard let template = TemplateID(try string(c, key)) else { throw .invalid(key.stringValue, "must be a template id (a lowercase UUID)") }
+    return template
+  }
+
+  /// Missing or null: nil. Anything else must be a template id.
+  static func optionalTemplate<K: CodingKey>(_ c: KeyedDecodingContainer<K>, _ key: K, field: String) throws(BrokerProtocolError) -> TemplateID? {
+    guard let value = try optionalString(c, key, field: field) else { return nil }
+    guard let template = TemplateID(value) else { throw .invalid(field, "must be a template id (a lowercase UUID)") }
+    return template
+  }
+
+  static func secretName<K: CodingKey>(_ c: KeyedDecodingContainer<K>, _ key: K) throws(BrokerProtocolError) -> String {
+    let name = try string(c, key)
+    guard TemplateSecrets.isValidName(name) else { throw .invalid(key.stringValue, TemplateSecrets.nameRule) }
+    return name
+  }
+
+  /// Missing or null: nil. Anything else must be a secret name.
+  static func optionalSecretName<K: CodingKey>(_ c: KeyedDecodingContainer<K>, _ key: K) throws(BrokerProtocolError) -> String? {
+    guard let name = try optionalString(c, key) else { return nil }
+    guard TemplateSecrets.isValidName(name) else { throw .invalid(key.stringValue, TemplateSecrets.nameRule) }
+    return name
   }
 
   static func stream<K: CodingKey>(_ c: KeyedDecodingContainer<K>, _ key: K) throws(BrokerProtocolError) -> BrokerStreamID {

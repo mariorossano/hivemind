@@ -10,6 +10,8 @@ import type { IdentityService } from "./identity.ts";
 import type { MessageQueries } from "./message-queries.ts";
 import type { MessageService } from "./messages.ts";
 import type { BotService } from "./bots.ts";
+import type { LauncherQueue } from "../launcher-queue.ts";
+import type { WorkerOrchestration } from "./worker-orchestration.ts";
 
 /**
  * Narrow interfaces the domain services (and the sub-stores) depend on instead of
@@ -110,6 +112,10 @@ type CoordinationWriter<K extends "insertCoordinationMessage" | "ensureThread"> 
 
 export type TaskStoreDeps = TaskCoordinationDeps & Agents & Messages<"getMessageById" | "getVisibleMessage"> &
   Poster<"publishTaskMessage"> & CoordinationWriter<"insertCoordinationMessage" | "ensureThread"> & {
+    readonly messages: Pick<MessageService, "moveTaskThread">;
+    readonly launcherQueue: Pick<LauncherQueue, "createResume">;
+    readonly workerOrchestration: Pick<WorkerOrchestration, "archiveFinishedTask" | "stopForHardPause" | "retryHardStop">;
+    readonly jobs?: { syncForTask(taskId: string): void };
     readonly channels: { openDm(actor: Agent, otherName: string): Channel };
     readonly messageQueries: Pick<MessageQueries, "hasNewerInThread">;
     readonly rooms: RoomStore;
@@ -125,8 +131,11 @@ export type NotificationDeps = Core & Channels<"getChannel" | "canSeeChannel"> &
 };
 export type RoutingDeps = Core & Channels & ChannelScopes<"channelIdsIn" | "memberChannelIds"> & Agents<"getAgent"> &
   Poster<"postMessage"> & {
+    readonly channels: Pick<ChannelService, 'openDm'>;
     readonly identity: Pick<IdentityService, "projectWorkerIds">;
     readonly tasks: Pick<TaskStore, "get">;
+    readonly lifecycleLog?: { record(input: { agentId: string; projectId: string | null; actorId: string | null;
+      kind: 'capability_edited'; summary: string; source: 'server' }): unknown };
   };
 export type TimelineDeps = Core & Channels<"getChannel" | "canSeeChannel"> & Messages<"getMessageById"> & {
   readonly messageQueries: Pick<MessageQueries, "messageRef" | "wakeHeader" | "traceMessages" | "postedByBot" | "seqsOf">;

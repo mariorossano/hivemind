@@ -36,6 +36,8 @@ export type MessageServiceDeps = Core & {
   readonly tasks: Pick<TaskStore, "has">;
   readonly timeline: Pick<TimelineStore, "prepare" | "recordMessage" | "source">;
   readonly adaptiveTopology: Pick<AdaptiveTopologyRuntime, "threadStatusChange">;
+  readonly lifecycleLog?: { record(input: { agentId: string; projectId: string | null; actorId: string | null;
+    kind: 'context_cleared'; summary: string; source: 'server' }): unknown };
 };
 
 /**
@@ -183,6 +185,14 @@ export class MessageService implements MessagePoster {
     this.db.prepare("INSERT OR IGNORE INTO threads(id, channel_id, status) VALUES (?, ?, NULL)").run(threadId, channelId);
   }
 
+  /** Move only a task root and its thread, leaving unrelated messages in the old channel. */
+  moveTaskThread(taskId: string, fromChannelId: string, toChannelId: string): void {
+    this.db.prepare("UPDATE messages SET channel_id=? WHERE channel_id=? AND (id=? OR thread_id=?)")
+      .run(toChannelId, fromChannelId, taskId, taskId);
+    this.db.prepare("UPDATE threads SET channel_id=? WHERE id=? AND channel_id=?")
+      .run(toChannelId, taskId, fromChannelId);
+  }
+
   postSystem(channelId: string, body: string) {
     const human = this.deps.identity.getAgent(HUMAN_ID);
     try {
@@ -220,11 +230,17 @@ export class MessageService implements MessagePoster {
     if (!target) throw new HiveError(404, `No agent named ${targetName}`);
     if (target.role !== "worker") throw new HiveError(400, "clear_context is for workers");
     const dm = this.deps.channels.openDm(actor, target.name);
-    return this.postMessage(actor, {
-      channel: dm.id,
-      body: `CONTROL clear_context: before following this request, use get_handoffs and save a checkpoint for relevant active tasks where possible (task_event checkpoint with the current revision). Then discard prior task memory, keeping your Hivemind identity (${target.name}) and standing orders, and wait. This is an instruction only: Hivemind has not erased host context or stopped execution. Do not clear automatically after every result.`,
-      kind: "control",
-      control: "clear_context",
+    return this.deps.storage.transaction(() => {
+      const message = this.postMessage(actor, {
+        channel: dm.id,
+        body: `CONTROL clear_context: before following this request, use get_handoffs and save a checkpoint for relevant active tasks where possible (task_event checkpoint with the current revision). Then discard prior task memory, keeping your Hivemind identity (${target.name}) and standing orders, and wait. This is an instruction only: Hivemind has not erased host context or stopped execution. Do not clear automatically after every result.`,
+        kind: "control",
+        control: "clear_context",
+      });
+      this.deps.lifecycleLog?.record({ agentId: target.id, projectId: target.projectId, actorId: actor.id,
+        kind: 'context_cleared', summary: 'A clear-context instruction was sent; host context was not erased by the server.',
+        source: 'server' });
+      return message;
     });
   }
 

@@ -10,8 +10,10 @@ import HivemindKit
 final class TerminalBrokerService {
   let paths: HivemindPaths
   var onChange: (@MainActor () -> Void)?
+  var launcherDecision: (@MainActor (String, TemplateID?, Bool) async -> Result<Void, BrokerProtocolError>)?
 
   private var broker: TerminalBroker?
+  var inProcessBroker: TerminalBroker? { broker }
   private var listener: BrokerSocketListener?
   private var failure: String?
   private let log: RotatingLog
@@ -57,8 +59,15 @@ final class TerminalBrokerService {
         },
         environment: ProcessInfo.processInfo.environment,
         secrets: LaunchSecretStore(folder: paths.launchSecrets),
+        templateSecrets: KeychainTemplateSecretVault(),
         log: { log.append($0) }))
     broker.onChange = { [weak self] in self?.onChange?() }
+    broker.launcherDecision = { [weak self] requestId, templateId, approve in
+      guard let handler = self?.launcherDecision else {
+        return .failure(.init(.internal, "launcher approval is unavailable"))
+      }
+      return await handler(requestId, templateId, approve)
+    }
     self.broker = broker
     self.listener = listener
     broker.start()

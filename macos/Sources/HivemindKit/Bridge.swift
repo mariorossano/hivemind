@@ -55,6 +55,16 @@ public enum BridgeMessage: Equatable, Sendable {
   /// terminal-status and sessions now, then sessions on every change.
   case sessionsSubscribe
   case sessionsUnsubscribe
+  // Worker template secrets (docs/worker-templates.md#secrets): kept by
+  // Hivemind Server.app, answered with template-secrets (names only).
+  case templateSecretsList(id: String?, template: TemplateID)
+  case templateSecretsSet(id: String?, template: TemplateID, name: String, value: TemplateSecretValue)
+  /// `name` nil: every secret of the template.
+  case templateSecretsDelete(id: String?, template: TemplateID, name: String?)
+  /// A Human decision travels through the verified native bridge and the
+  /// Server.app broker, which signs the HTTP request with its instance secret.
+  case launcherApprove(id: String?, requestId: String, templateId: TemplateID?)
+  case launcherReject(id: String?, requestId: String)
 
   static let maxText = 4096
   /// The most sessions one terminal-kill may name (web TERMINAL_BROKER_LIMITS.kills).
@@ -123,9 +133,44 @@ public enum BridgeMessage: Equatable, Sendable {
       self = .sessionsSubscribe
     case "sessions-unsubscribe":
       self = .sessionsUnsubscribe
+    case "template-secrets-list":
+      guard let id = Self.requestID(object["id"]), let template = Self.template(object["template"]) else { return nil }
+      self = .templateSecretsList(id: id, template: template)
+    case "template-secrets-set":
+      guard let id = Self.requestID(object["id"]), let template = Self.template(object["template"]),
+            let name = object["name"] as? String, TemplateSecrets.isValidName(name),
+            let value = (object["value"] as? String).flatMap(TemplateSecretValue.init) else { return nil }
+      self = .templateSecretsSet(id: id, template: template, name: name, value: value)
+    case "template-secrets-delete":
+      guard let id = Self.requestID(object["id"]), let template = Self.template(object["template"]) else { return nil }
+      switch object["name"] {
+      case nil, is NSNull: self = .templateSecretsDelete(id: id, template: template, name: nil)
+      case let name as String where TemplateSecrets.isValidName(name): self = .templateSecretsDelete(id: id, template: template, name: name)
+      default: return nil
+      }
+    case "launcher-approve":
+      guard let id = Self.requestID(object["id"]), let requestId = object["requestId"] as? String,
+            UUID(uuidString: requestId) != nil else { return nil }
+      let templateId: TemplateID?
+      switch object["templateId"] {
+      case nil, is NSNull: templateId = nil
+      case let value as String:
+        guard let parsed = TemplateID(value) else { return nil }
+        templateId = parsed
+      default: return nil
+      }
+      self = .launcherApprove(id: id, requestId: requestId, templateId: templateId)
+    case "launcher-reject":
+      guard let id = Self.requestID(object["id"]), let requestId = object["requestId"] as? String,
+            UUID(uuidString: requestId) != nil else { return nil }
+      self = .launcherReject(id: id, requestId: requestId)
     default:
       return nil
     }
+  }
+
+  private static func template(_ value: Any?) -> TemplateID? {
+    (value as? String).flatMap(TemplateID.init)
   }
 
   private static func text(_ value: Any?) -> String? {
@@ -196,14 +241,16 @@ public struct TerminalSessionLaunch: Equatable, Sendable {
   /// The sheet's Environment variables (BrokerLaunch.environment). Never
   /// logged: LaunchEnvironment redacts itself.
   public let environment: LaunchEnvironment?
+  /// The worker template launched (BrokerLaunch.template): the broker adds its secrets.
+  public let template: TemplateID?
 
   public init?(
     project: String, agent: String?, title: String, cwd: String?, command: String, session: SessionName? = nil,
-    secrets: LaunchSecrets? = nil, environment: LaunchEnvironment? = nil
+    secrets: LaunchSecrets? = nil, environment: LaunchEnvironment? = nil, template: TemplateID? = nil
   ) {
     // Validate with the home folder standing in for "~" and a missing folder.
     guard Self.launch(project: project, agent: agent, title: title, cwd: cwd, command: command, session: session, secrets: secrets,
-                      environment: environment, home: "/") != nil else { return nil }
+                      environment: environment, template: template, home: "/") != nil else { return nil }
     if let cwd {
       guard cwd.hasPrefix("/") || cwd == "~" || cwd.hasPrefix("~/"), cwd.utf8.count <= BrokerLimits.maxCwdBytes else { return nil }
     }
@@ -215,6 +262,7 @@ public struct TerminalSessionLaunch: Equatable, Sendable {
     self.session = session
     self.secrets = secrets
     self.environment = environment
+    self.template = template
   }
 
   init?(body: Any) {
@@ -270,8 +318,16 @@ public struct TerminalSessionLaunch: Equatable, Sendable {
       environment = valid
     default: return nil
     }
+    let template: TemplateID?
+    switch object["template"] {
+    case nil, is NSNull: template = nil
+    case let id as String:
+      guard let valid = TemplateID(id) else { return nil }
+      template = valid
+    default: return nil
+    }
     self.init(project: project, agent: agent, title: title, cwd: cwd, command: command, session: session, secrets: secrets,
-              environment: environment)
+              environment: environment, template: template)
   }
 
   /// All launches of a message, or nil when the list or any one is invalid.
@@ -289,12 +345,12 @@ public struct TerminalSessionLaunch: Equatable, Sendable {
   /// `home`. Nil only when the expanded folder breaks the broker's limits.
   public func brokerLaunch(home: String) -> BrokerLaunch? {
     Self.launch(project: project, agent: agent, title: title, cwd: cwd, command: command, session: session, secrets: secrets,
-                environment: environment, home: home)
+                environment: environment, template: template, home: home)
   }
 
   private static func launch(
     project: String, agent: String?, title: String, cwd: String?, command: String, session: SessionName?, secrets: LaunchSecrets?,
-    environment: LaunchEnvironment?, home: String
+    environment: LaunchEnvironment?, template: TemplateID?, home: String
   ) -> BrokerLaunch? {
     let base = home.hasSuffix("/") && home.count > 1 ? String(home.dropLast()) : home
     let folder: String
@@ -304,7 +360,7 @@ public struct TerminalSessionLaunch: Equatable, Sendable {
     case let path?: folder = path
     }
     return try? BrokerLaunch(project: project, agent: agent, title: title, cwd: folder, command: command, session: session, secrets: secrets,
-                             environment: environment)
+                             environment: environment, template: template)
   }
 }
 
@@ -326,6 +382,9 @@ public enum BridgeTerminalEvent: Equatable, Sendable {
   /// The answer to a terminal-kill with `sessions`: the ones that ended, in
   /// order, and why each other one did not.
   case killedMany(id: String?, sessions: [SessionName], errors: [BridgeKillFailure])
+  /// A template's secret names, answering a template-secrets-* message.
+  case templateSecrets(id: String?, template: TemplateID, names: [String])
+  case launcherDecided(id: String?, requestId: String, action: String)
   case error(id: String?, code: BrokerErrorCode, message: String, stream: BrokerStreamID?)
 
   public enum TmuxStatus: String, Sendable, Equatable {
@@ -354,6 +413,8 @@ public enum BridgeTerminalEvent: Equatable, Sendable {
     case .output: "terminal-output"
     case .exit: "terminal-exit"
     case .killed, .killedMany: "terminal-killed"
+    case .templateSecrets: "template-secrets"
+    case .launcherDecided: "launcher-decided"
     case .error: "terminal-error"
     }
   }
@@ -369,6 +430,8 @@ public enum BridgeTerminalEvent: Equatable, Sendable {
     case .output(let stream, let data): self = .output(stream: stream, data: data)
     case .exit(let stream, let status): self = .exit(stream: stream, status: status)
     case .killed(let session): self = .killed(id: id, session: session)
+    case .secrets(let template, let names): self = .templateSecrets(id: id, template: template, names: names)
+    case .launcherDecided(let requestId, let action): self = .launcherDecided(id: id, requestId: requestId, action: action)
     case .error(let code, let message, let stream): self = .error(id: id, code: code, message: message, stream: stream)
     }
   }
@@ -408,6 +471,14 @@ public enum BridgeTerminalEvent: Equatable, Sendable {
       put("id", id)
       detail["sessions"] = sessions.map(\.rawValue)
       detail["errors"] = errors.map { ["session": $0.session.rawValue, "code": $0.code.rawValue, "message": $0.message] as [String: Any] }
+    case .templateSecrets(let id, let template, let names):
+      put("id", id)
+      detail["template"] = template.rawValue
+      detail["names"] = names
+    case .launcherDecided(let id, let requestId, let action):
+      put("id", id)
+      detail["requestId"] = requestId
+      detail["action"] = action
     case .error(let id, let code, let message, let stream):
       put("id", id)
       detail["code"] = code.rawValue

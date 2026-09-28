@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { test, type TestContext } from "node:test";
 import { botCapabilities } from "./bot-capabilities.ts";
-import { applyMigrations, schemaVersion } from "./index.ts";
+import { applyMigrations, LATEST_VERSION, MIGRATIONS, schemaVersion } from "./index.ts";
 import { hasColumn } from "./schema.ts";
 
 function previousSchema(t: TestContext): DatabaseSync {
@@ -24,15 +24,26 @@ function rowsOf(db: DatabaseSync): Record<string, unknown[]> {
     [String(name), db.prepare(`SELECT * FROM "${name}" ORDER BY rowid`).all().map(row => ({ ...row }))]));
 }
 
+function assertPreviousRowsPreserved(db: DatabaseSync, before: Record<string, unknown[]>): void {
+  const after = rowsOf(db);
+  for (const [table, rows] of Object.entries(before)) {
+    assert.equal(after[table]?.length, rows.length, `${table}: no rows lost or added`);
+    if (!rows.length) continue;
+    const columns = Object.keys(rows[0] as object);
+    assert.deepEqual(after[table]!.map(row => Object.fromEntries(columns.map(column =>
+      [column, (row as Record<string, unknown>)[column]]))), rows, `${table}: existing values preserved`);
+  }
+}
+
 test("upstream terminal schema 31 gains Bot access without changing existing rows or terminal labels", t => {
   const db = previousSchema(t);
   applyMigrations(db, { target: 31 });
   db.prepare("UPDATE agents SET terminal_session = ? WHERE role = 'worker'").run("hm-fixture-worker");
   const before = rowsOf(db);
-  assert.deepEqual(applyMigrations(db).map(m => m.name), ["bot_capabilities"]);
-  assert.equal(schemaVersion(db), 32);
-  const { bot_access, ...after } = rowsOf(db);
-  assert.deepEqual(after, before);
+  assert.deepEqual(applyMigrations(db).map(m => m.name), MIGRATIONS.filter(m => m.version > 31).map(m => m.name));
+  assert.equal(schemaVersion(db), LATEST_VERSION);
+  const { bot_access } = rowsOf(db);
+  assertPreviousRowsPreserved(db, before);
   assert.deepEqual(bot_access, [{ bot_id: "fixture-bot", capabilities: '["publish"]', receive_channels: "[]",
     definition_id: null, revision: 1 }]);
   assert.deepEqual(applyMigrations(db), []);
@@ -48,15 +59,51 @@ test("local Bot preview schema 31 gains terminal labels without resetting grants
   db.prepare("UPDATE bot_access SET capabilities = ?, receive_channels = ?, definition_id = ?, revision = ?")
     .run('["receive","tools"]', JSON.stringify([channel]), "fixture-service", 7);
   const before = rowsOf(db);
-  assert.deepEqual(applyMigrations(db).map(m => m.name), ["bot_capabilities"]);
-  assert.equal(schemaVersion(db), 32);
-  const { agents, ...after } = rowsOf(db), { agents: oldAgents, ...oldRest } = before;
-  assert.deepEqual(after, oldRest, "all other rows, including Bot grants and credentials, are unchanged");
-  assert.deepEqual(agents, oldAgents!.map(row => ({ ...(row as object), terminal_session: null })));
+  assert.deepEqual(applyMigrations(db).map(m => m.name), MIGRATIONS.filter(m => m.version > 31).map(m => m.name));
+  assert.equal(schemaVersion(db), LATEST_VERSION);
+  assertPreviousRowsPreserved(db, before);
+  assert.ok(db.prepare("SELECT terminal_session FROM agents").all().every(row => row.terminal_session === null));
   const migrated = rowsOf(db);
   assert.deepEqual(applyMigrations(db), []);
   assert.deepEqual(rowsOf(db), migrated);
 });
+
+test("deployed fork schema 32 converges without losing Bot grants or terminal labels", t => {
+  const db = previousSchema(t);
+  applyMigrations(db, { target: 31 });
+  botCapabilities(db);
+  db.exec("PRAGMA user_version = 32");
+  db.prepare("UPDATE agents SET terminal_session = ? WHERE role = 'worker'").run("hm-fixture-worker");
+  db.prepare("UPDATE bot_access SET capabilities = '[]', revision = 11").run();
+  assert.equal(db.prepare("SELECT name FROM sqlite_master WHERE name = 'worker_templates'").get(), undefined);
+  const before = rowsOf(db);
+  applyMigrations(db);
+  assert.equal(schemaVersion(db), LATEST_VERSION);
+  assertPreviousRowsPreserved(db, before);
+  assert.deepEqual(db.prepare("SELECT * FROM worker_templates").all(), []);
+  assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+  const migrated = rowsOf(db);
+  assert.deepEqual(applyMigrations(db), []);
+  assert.deepEqual(rowsOf(db), migrated);
+});
+
+for (const version of [32, 33, 34, 35, 36, 37, 38]) {
+  test(`upstream schema ${version} gains Bot grants and preserves existing data`, t => {
+    const db = previousSchema(t);
+    applyMigrations(db, { target: version });
+    const project = String(db.prepare("SELECT id FROM projects ORDER BY id LIMIT 1").get()!.id);
+    db.prepare("INSERT INTO worker_templates VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .run("fixture-template", project, "fixture", 4, '{"label":"Existing template"}', 1, 2);
+    const before = rowsOf(db);
+    applyMigrations(db);
+    assert.equal(schemaVersion(db), LATEST_VERSION);
+    assertPreviousRowsPreserved(db, before);
+    assert.deepEqual(db.prepare("SELECT * FROM bot_access WHERE bot_id = 'fixture-bot'").get(),
+      Object.assign(Object.create(null), { bot_id: "fixture-bot", capabilities: '["publish"]', receive_channels: '[]', definition_id: null, revision: 1 }));
+    assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+    assert.deepEqual(applyMigrations(db), []);
+  });
+}
 
 test("preview Bot access disabled by Human is not re-enabled during the merge migration", t => {
   const db = previousSchema(t);
