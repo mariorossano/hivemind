@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
-import { HiveError, HUMAN_ID, HUMAN_NAME, PRESENCE_IDLE_MS, type Agent, type ChannelType, type Project, type Seniority } from "../../shared/types.ts";
+import { HiveError, HUMAN_ID, HUMAN_NAME, PRESENCE_IDLE_MS, RESERVATION_MS, type Agent, type ChannelType, type Project, type Seniority } from "../../shared/types.ts";
 import { joinInputSchema, validated } from "../../shared/api-contract.ts";
+import { agentIdentityEditSchema } from '../../shared/agent-management.ts';
 import { canonicalWorktree, resolveJoinProject } from "../../shared/project.ts";
 import { pickName } from "../names.ts";
 import type { AgentDirectory, Core, MessagePoster, WaiterRegistry } from "./ports.ts";
@@ -32,7 +33,28 @@ export type JoinInput = {
   cwd?: string | null;
   /** The Hivemind tmux session the joining process runs in; null or absent clears the agent's label. */
   terminalSession?: string | null;
+  /** A reserved worker's single-use launch ticket (reserve): joins as that worker. */
+  claim?: string | null;
 };
+
+/** What reserve() needs of a worker template. */
+export type ReservationTemplate = {
+  id: string;
+  projectId: string;
+  slug: string;
+  spec: { enabled: boolean; seniority: Seniority; focus: string; maxConcurrent: number };
+};
+
+/** A name part from free text: lowercase letters, digits and single dashes, at most 24 characters. */
+export function nameSlug(text: string): string {
+  return text.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "").slice(0, 24).replace(/-+$/, "");
+}
+
+/** A launch ticket: shown once, stored as its hash. */
+function newClaimTicket(): string {
+  return `hmc_${randomBytes(24).toString("hex")}`;
+}
 
 export type IdentityServiceDeps = Core & {
   readonly projects: {
@@ -44,10 +66,15 @@ export type IdentityServiceDeps = Core & {
     addMember(channelId: string, agentId: string): void;
     channelsOfProject(projectId: string): Array<{ id: string; type: ChannelType }>;
     generalChannelId(projectId: string): string | null;
+    openDm(actor: Agent, otherName: string): { id: string };
+    updateDmLabelsForAgent(agentId: string): void;
   };
   readonly messages: Pick<MessagePoster, "postMessage" | "postSystem">;
   readonly waiters: WaiterRegistry;
-  readonly lifecycle: { removeAgent(actor: Agent, name: string): Agent };
+  readonly lifecycle: { removeAgent(actor: Agent, name: string): Agent; expireReservation(agentId: string): void };
+  readonly lifecycleLog?: { record(input: { agentId: string; projectId: string | null; actorId: string | null;
+    kind: 'joined' | 'resumed' | 'identity_edited' | 'archived' | 'session_ended'; summary: string;
+    source: 'server' }): unknown };
 };
 
 /**
@@ -87,19 +114,20 @@ export class IdentityService implements AgentDirectory {
   /** The agent when it exists and was not removed. */
   findActiveAgent(id: string): Agent | null {
     const agent = this.findAgent(id);
-    return agent && agent.removedAt === undefined ? agent : null;
+    return agent && agent.removedAt === undefined && agent.archivedAt === undefined ? agent : null;
   }
 
   /** Ids of a project's workers (removed ones excluded). */
   projectWorkerIds(projectId: string): string[] {
-    return (this.db.prepare("SELECT id FROM agents WHERE project_id = ? AND role = 'worker' AND removed_at IS NULL").all(projectId) as { id: string }[])
+    return (this.db.prepare("SELECT id FROM agents WHERE project_id = ? AND role = 'worker' AND removed_at IS NULL AND archived_at IS NULL")
+      .all(projectId) as { id: string }[])
       .map((row) => row.id);
   }
 
   /** An agent that can still be addressed by name; removed agents are not found. */
   getAgentByName(name: string): Agent | null {
     const agent = this.findAgentByName(name);
-    return agent && agent.removedAt === undefined ? agent : null;
+    return agent && agent.removedAt === undefined && agent.archivedAt === undefined ? agent : null;
   }
 
   /** Any agent holding the name, including a removed one: removed names stay reserved. */
@@ -110,13 +138,73 @@ export class IdentityService implements AgentDirectory {
     return row ? this.mapAgent(row) : null;
   }
 
+  /** Former names are accepted only for resume/history, never for mentions or new work. */
+  private resumeRow(name: string): AgentRow | undefined {
+    return this.db.prepare(`SELECT a.* FROM agents a WHERE lower(a.name)=lower(?)
+      UNION ALL SELECT a.* FROM agent_name_aliases aliases JOIN agents a ON a.id=aliases.agent_id
+      WHERE aliases.name=? LIMIT 1`).get(name, name) as AgentRow | undefined;
+  }
+
+  private nameTaken(name: string, exceptAgentId?: string): boolean {
+    return Boolean(this.db.prepare(`SELECT 1 FROM agents WHERE lower(name)=lower(?) AND id!=?
+      UNION ALL SELECT 1 FROM agent_name_aliases WHERE name=? AND agent_id!=? LIMIT 1`)
+      .get(name, exceptAgentId ?? '', name, exceptAgentId ?? ''));
+  }
+
+  /** Allocation-only check; old aliases never become addressable people. */
+  isNameReserved(name: string): boolean { return this.nameTaken(name); }
+
+  private reservedNames(): Set<string> {
+    return new Set((this.db.prepare(`SELECT lower(name) AS name FROM agents
+      UNION SELECT lower(name) AS name FROM agent_name_aliases`).all() as { name: string }[]).map(row => row.name));
+  }
+
+  /** Human edits one active identity; stored fields, not stale join arguments, remain authoritative. */
+  editIdentity(actor: Agent, agentId: string, raw: unknown): Agent {
+    if (actor.role !== 'human') throw new HiveError(403, 'Only Human edits agent identities');
+    const parsed = agentIdentityEditSchema.safeParse(raw);
+    if (!parsed.success) throw new HiveError(400, 'Invalid identity edit');
+    const input = parsed.data;
+    return this.deps.storage.transaction(() => {
+      const row = this.db.prepare('SELECT * FROM agents WHERE id=?').get(agentId) as AgentRow | undefined;
+      if (!row || row.removed_at !== null || row.archived_at !== null || !['brain','worker'].includes(row.role))
+        throw new HiveError(404, 'Active agent not found');
+      if (row.identity_revision !== input.expectedRevision) throw new HiveError(409, 'Identity changed; reload before editing');
+      if (input.seniority !== undefined && row.role !== 'worker') throw new HiveError(400, 'Only workers have seniority');
+      const name = input.name ?? row.name;
+      if (this.nameTaken(name, row.id)) throw new HiveError(409, 'Agent name is already reserved');
+      const renamed = name !== row.name;
+      if (renamed) {
+        // Renaming back to one's own former alias promotes it to the current name.
+        this.db.prepare('DELETE FROM agent_name_aliases WHERE name=? AND agent_id=?').run(name, row.id);
+        this.db.prepare('INSERT OR IGNORE INTO agent_name_aliases(name,agent_id,created_at) VALUES(?,?,?)')
+          .run(row.name, row.id, Date.now());
+      }
+      this.db.prepare(`UPDATE agents SET name=?,focus=?,seniority=?,identity_revision=identity_revision+1,
+        focus_overridden=?,seniority_overridden=? WHERE id=?`).run(name,
+        input.focus === undefined ? row.focus : input.focus,
+        input.seniority === undefined ? row.seniority : input.seniority,
+        input.focus === undefined ? row.focus_overridden : 1,
+        input.seniority === undefined ? row.seniority_overridden : 1, row.id);
+      if (renamed) this.deps.channels.updateDmLabelsForAgent(row.id);
+      const changed = this.getAgent(row.id);
+      const dm = this.deps.channels.openDm(actor, changed.name);
+      this.deps.messages.postMessage(actor, { channel: dm.id, kind: 'control',
+        body: 'CONTROL identity_changed: Human updated your Hivemind identity. Call whoami with orders=true now and use the returned name, focus and seniority. Previous terminal labels and message text may show the former name.' });
+      this.deps.lifecycleLog?.record({ agentId: row.id, projectId: row.project_id, actorId: actor.id,
+        kind: 'identity_edited', summary: renamed ? `Human changed this agent's name to ${name}.` : 'Human updated this agent identity.', source: 'server' });
+      this.deps.storage.afterCommit(() => this.deps.bus.emit('agent', changed));
+      return changed;
+    });
+  }
+
   /** The current session-key hash: it changes when the agent resumes or a bot credential rotates. */
   sessionFingerprint(agentId: string): string | undefined {
     return (this.db.prepare("SELECT token_hash FROM agents WHERE id=?").get(agentId) as { token_hash: string } | undefined)?.token_hash;
   }
 
   agentByToken(token: string): Agent {
-    const row = this.db.prepare("SELECT * FROM agents WHERE token_hash = ? AND removed_at IS NULL").get(hashToken(token)) as
+    const row = this.db.prepare("SELECT * FROM agents WHERE token_hash = ? AND removed_at IS NULL AND archived_at IS NULL").get(hashToken(token)) as
       | AgentRow
       | undefined;
     if (!row) throw new HiveError(401, "Invalid token");
@@ -135,8 +223,14 @@ export class IdentityService implements AgentDirectory {
       createdAt: row.created_at,
       projectId: row.project_id,
       project: projectSlug,
+      identityRevision: row.identity_revision,
       ...(row.removed_at != null ? { removedAt: row.removed_at } : {}),
+      ...(row.archived_at != null ? { archivedAt: row.archived_at } : {}),
+      ...(row.role === "brain" ? { launchMode: row.launch_mode } : {}),
       ...(row.terminal_session ? { terminalSession: row.terminal_session } : {}),
+      ...(row.pending_until != null && row.removed_at == null ? { pending: { until: row.pending_until,
+        ...(row.reserved_by_brain_id ? { brainId: row.reserved_by_brain_id } : {}) } } : {}),
+      ...(row.template_id ? { templateId: row.template_id } : {}),
     };
   }
 
@@ -152,16 +246,67 @@ export class IdentityService implements AgentDirectory {
     const rows = this.db.prepare(`
       SELECT a.*, p.slug AS project_slug FROM agents a
       LEFT JOIN projects p ON p.id = a.project_id
-      WHERE a.removed_at IS NULL ${scoped ? "AND (a.role = 'human' OR a.project_id = ?)" : ""}
+      WHERE a.removed_at IS NULL AND a.archived_at IS NULL
+        ${scoped ? "AND (a.role = 'human' OR (a.project_id = ? AND (a.pending_until IS NULL OR EXISTS (SELECT 1 FROM launch_requests r WHERE r.agent_id=a.id AND r.brain_id=? AND r.task_id IS NOT NULL))))" : ""}
       ORDER BY a.role, a.seniority, a.name
-    `).all(...(scoped ? [viewer.projectId] : [])) as Joined[];
+    `).all(...(scoped ? [viewer.projectId, viewer.id] : [])) as Joined[];
     return rows.map((row) => this.agentFromRow(row, row.project_slug));
+  }
+
+  setLaunchMode(actor: Agent, name: string, mode: "approval" | "auto"): Agent {
+    if (actor.role !== "human") throw new HiveError(403, "Only Human changes a brain's launch mode");
+    return this.deps.storage.transaction(() => {
+      const brain = this.getAgentByName(name);
+      if (!brain || brain.role !== "brain" || brain.archivedAt !== undefined) throw new HiveError(404, "Brain not found");
+      this.db.prepare("UPDATE agents SET launch_mode=? WHERE id=?").run(mode, brain.id);
+      const changed = this.getAgent(brain.id);
+      this.deps.storage.afterCommit(() => this.deps.bus.emit("agent", changed));
+      return changed;
+    });
+  }
+
+  archiveTaskWorker(agentId: string): Agent {
+    return this.deps.storage.transaction(() => {
+      const agent = this.getAgent(agentId);
+      if (agent.role !== "worker" || !agent.templateId || agent.removedAt !== undefined) throw new HiveError(409, "Only a task-bound worker can be archived");
+      if (agent.archivedAt === undefined) {
+        this.db.prepare("UPDATE agents SET archived_at=?, online=0, token_hash=?, claim_hash=NULL, pending_until=NULL WHERE id=?")
+          .run(now(), hashToken(newToken()), agentId);
+        this.db.prepare("DELETE FROM channel_members WHERE agent_id=?").run(agentId);
+        this.db.prepare("DELETE FROM notification_subscriptions WHERE agent_id=?").run(agentId);
+        this.deps.storage.afterCommit(() => this.deps.waiters.supersede(agentId));
+        this.deps.lifecycleLog?.record({ agentId, projectId: agent.projectId, actorId: null,
+          kind: 'archived', summary: 'Task-bound worker archived after its task ended.', source: 'server' });
+      }
+      const changed = this.getAgent(agentId);
+      this.deps.storage.afterCommit(() => this.deps.bus.emit("agent", changed));
+      return changed;
+    });
+  }
+
+  /** A confirmed native close fences the old MCP session while keeping the identity resumable. */
+  suspendSession(agentId: string): Agent {
+    return this.deps.storage.transaction(() => {
+      const agent = this.getAgent(agentId);
+      if (agent.archivedAt !== undefined || agent.removedAt !== undefined || !agent.templateId)
+        throw new HiveError(409, "Only an active task-bound worker session can be suspended");
+      this.db.prepare("UPDATE agents SET token_hash=?, online=0, terminal_session=NULL WHERE id=?")
+        .run(hashToken(newToken()), agentId);
+      this.deps.lifecycleLog?.record({ agentId, projectId: agent.projectId, actorId: null,
+        kind: 'session_ended', summary: 'Native worker session closure was confirmed.', source: 'server' });
+      const changed = this.getAgent(agentId);
+      this.deps.storage.afterCommit(() => {
+        this.deps.waiters.supersede(agentId);
+        this.deps.bus.emit("agent", changed);
+      });
+      return changed;
+    });
   }
 
   /** Brains/workers of a project that are online or blocked in a wait. */
   busyAgents(projectId: string): Agent[] {
     const rows = this.db.prepare(
-      "SELECT * FROM agents WHERE project_id = ? AND id != ? AND role != 'human' AND removed_at IS NULL",
+      "SELECT * FROM agents WHERE project_id = ? AND id != ? AND role != 'human' AND removed_at IS NULL AND archived_at IS NULL",
     ).all(projectId, HUMAN_ID) as AgentRow[];
     return rows.map((row) => this.mapAgent(row)).filter((agent) => agent.online || this.deps.waiters.has(agent.id));
   }
@@ -180,12 +325,12 @@ export class IdentityService implements AgentDirectory {
     }
     const { storage, projects } = this.deps;
     const assertResumable = (agent: Agent) => {
+      if (agent.archivedAt !== undefined) throw new HiveError(410, `${agent.name} was archived and cannot resume`);
       if (agent.role !== input.role) {
         throw new HiveError(409, `${agent.name} is a ${agent.role}; role cannot change`);
       }
-      if (input.role === "worker" && input.seniority && agent.seniority !== input.seniority) {
-        throw new HiveError(409, `${agent.name} is ${agent.seniority}; seniority cannot change`);
-      }
+      // Human edits are authoritative. A running client's old join arguments
+      // never reset or block its stored seniority or focus.
       if (input.project) this.assertSameProject(agent, projects.getProjectBySlug(input.project));
       else if (input.cwd) {
         const cwd = canonicalWorktree(input.cwd);
@@ -195,11 +340,16 @@ export class IdentityService implements AgentDirectory {
     };
     // The session key of a running process: a repeated join keeps its session.
     const current = input.token
-      ? this.db.prepare("SELECT * FROM agents WHERE token_hash = ? AND removed_at IS NULL").get(hashToken(input.token)) as AgentRow | undefined
+      ? this.db.prepare("SELECT * FROM agents WHERE token_hash = ? AND removed_at IS NULL AND archived_at IS NULL")
+        .get(hashToken(input.token)) as AgentRow | undefined
       : undefined;
+    if (input.claim) {
+      if (current) throw new HiveError(409, `This process is already ${current.name}; a launch ticket needs a new MCP process`);
+      return this.claim(input, input.claim);
+    }
     if (current) {
       const agent = this.mapAgent(current);
-      if (input.resumeName && agent.name.toLowerCase() !== input.resumeName.toLowerCase()) {
+      if (input.resumeName && this.resumeRow(input.resumeName)?.id !== agent.id) {
         throw new HiveError(403, `This session is ${agent.name}, not ${input.resumeName}`);
       }
       assertResumable(agent);
@@ -212,18 +362,38 @@ export class IdentityService implements AgentDirectory {
     // Brains and workers have no stored credentials: resuming by name opens a new session
     // and supersedes the previous one, whose key stops working.
     if (input.resumeName) {
-      const row = this.db.prepare("SELECT * FROM agents WHERE lower(name) = lower(?) AND role IN ('brain','worker')")
-        .get(input.resumeName) as AgentRow | undefined;
+      const row = this.resumeRow(input.resumeName);
       if (!row) throw new HiveError(404, `No brain or worker named ${input.resumeName}; join without resume to get a new name`);
+      if (row.role !== 'brain' && row.role !== 'worker') throw new HiveError(404, `No brain or worker named ${input.resumeName}`);
       if (row.removed_at != null) {
         throw new HiveError(410, `${row.name} was removed from the hive and cannot resume; join without resume to get a new name`);
       }
+      if (row.archived_at != null) throw new HiveError(410, `${row.name} was archived and cannot resume`);
+      if (row.pending_until != null) {
+        throw new HiveError(409, `${row.name} has not joined yet: only its launch can join it, with its launch ticket`);
+      }
       const agent = this.mapAgent(row);
       assertResumable(agent);
+      // A confirmed hard stop revokes the old token. Name-based resume must not
+      // bypass Human's explicit resume control while the task remains paused.
+      if (agent.templateId) {
+        const paused = this.db.prepare(`SELECT snapshot FROM task_records WHERE worker_id=?
+          AND json_extract(snapshot,'$.state')='paused'
+          AND json_extract(snapshot,'$.pause.mode')='hard' LIMIT 1`).get(agent.id) as { snapshot: string } | undefined;
+        if (paused) {
+          const task = JSON.parse(paused.snapshot) as { pause?: { resumeRequestId?: string } };
+          const request = task.pause?.resumeRequestId ? this.db.prepare(`SELECT 1 FROM launch_requests
+            WHERE id=? AND agent_id=? AND launch_kind='resume' AND state='launching' LIMIT 1`)
+            .get(task.pause.resumeRequestId, agent.id) : null;
+          if (!request) throw new HiveError(409, `${agent.name} is hard-paused until Human resumes its task`);
+        }
+      }
       return storage.transaction(() => {
         const token = this.replaceAgentSession(agent.id);
         this.touch(agent.id, true);
         this.claimTerminalSession(agent.id, input.terminalSession ?? null);
+        this.deps.lifecycleLog?.record({ agentId: agent.id, projectId: agent.projectId, actorId: null,
+          kind: 'resumed', summary: 'Agent resumed its existing identity.', source: 'server' });
         return { agent: this.getAgent(agent.id), token, created: false };
       });
     }
@@ -239,9 +409,7 @@ export class IdentityService implements AgentDirectory {
     const project = resolveJoinProject(projects.listProjects(), { project: input.project, cwd: input.cwd });
     return storage.transaction(() => {
       const { channels, messages, bus } = this.deps;
-      const taken = new Set(
-        (this.db.prepare("SELECT lower(name) AS n FROM agents").all() as { n: string }[]).map((r) => r.n),
-      );
+      const taken = this.reservedNames();
       const name = pickName(input.role, taken);
       const id = crypto.randomUUID();
       const token = newToken();
@@ -274,9 +442,115 @@ export class IdentityService implements AgentDirectory {
       const maxSeq = this.db.prepare("SELECT COALESCE(MAX(seq), 0) AS n FROM messages").get() as { n: number };
       this.db.prepare("UPDATE agents SET inbox_cursor = ? WHERE id = ?").run(maxSeq.n, id);
       this.claimTerminalSession(id, input.terminalSession ?? null, false);
+      this.deps.lifecycleLog?.record({ agentId: id, projectId: project.id, actorId: null,
+        kind: 'joined', summary: 'Agent joined the hive.', source: 'server' });
       storage.afterCommit(() => bus.emit("agent", this.getAgent(id)));
       return { agent: this.getAgent(id), token, created: true };
     });
+  }
+
+  /**
+   * Reserves a task-bound worker from a template: a worker row with its name, project, seniority and focus, a member of
+   * the project's public channels and with its inbox starting now, so mail sent while it starts reaches it. It has no
+   * session until its launch joins with the returned single-use ticket, within RESERVATION_MS.
+   */
+  reserve(actor: Agent, template: ReservationTemplate, label?: string | null, deferCap = false): { agent: Agent; ticket: string } {
+    if (actor.role !== "human" && (actor.role !== "brain" || actor.projectId !== template.projectId))
+      throw new HiveError(403, "Only Human or a brain in this project reserves a worker");
+    if (!template.spec.enabled) throw new HiveError(409, `Worker template ${template.slug} is disabled`);
+    const { storage, channels, bus } = this.deps;
+    return storage.transaction(() => {
+      const running = this.templateWorkerCount(template.id);
+      if (!deferCap && running >= template.spec.maxConcurrent) {
+        throw new HiveError(409, `Worker template ${template.slug} already has ${running} of at most ${template.spec.maxConcurrent} workers`);
+      }
+      const taken = this.reservedNames();
+      const slug = nameSlug(label ?? "");
+      const base = slug ? `${pickName("worker", taken)}-${slug}` : pickName("worker", taken);
+      let name = base;
+      for (let n = 2; taken.has(name.toLowerCase()); n++) name = `${base}-${n}`;
+      const id = crypto.randomUUID(), ticket = newClaimTicket(), t = now();
+      const maxSeq = this.db.prepare("SELECT COALESCE(MAX(seq), 0) AS n FROM messages").get() as { n: number };
+      this.db.prepare(
+        `INSERT INTO agents (id, name, role, seniority, focus, token_hash, online, last_seen_at, created_at, inbox_cursor, project_id,
+           pending_until, claim_hash, template_id, reserved_by_brain_id)
+         VALUES (?, ?, 'worker', ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(id, name, template.spec.seniority, template.spec.focus || null, hashToken(newToken()), t, t, maxSeq.n, template.projectId,
+        t + RESERVATION_MS, hashToken(ticket), template.id, actor.role === "brain" ? actor.id : null);
+      // Brain-reserved identities see only their task channel until claim; retain legacy Human reservations.
+      if (actor.role === "human") for (const ch of channels.channelsOfProject(template.projectId))
+        if (ch.type === "public") channels.addMember(ch.id, id);
+      storage.afterCommit(() => bus.emit("agent", this.getAgent(id)));
+      return { agent: this.getAgent(id), ticket };
+    });
+  }
+
+  /** Active reserved or joined workers; callers subtract requests still awaiting approval for capacity. */
+  templateWorkerCount(templateId: string): number {
+    return Number((this.db.prepare(`SELECT COUNT(*) AS n FROM agents a WHERE a.template_id = ? AND a.removed_at IS NULL
+      AND ((a.archived_at IS NULL AND (NOT EXISTS (SELECT 1 FROM launch_requests r WHERE r.agent_id=a.id)
+        OR EXISTS (SELECT 1 FROM launch_requests r WHERE r.agent_id=a.id AND r.state IN ('approved','launching','launched'))))
+        OR EXISTS (SELECT 1 FROM launch_requests r WHERE r.agent_id=a.id AND r.session IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM launcher_commands k WHERE k.request_id=r.id AND k.kind='kill' AND k.state='done')))`)
+      .get(templateId) as { n: number }).n);
+  }
+
+  /** Human changes a pending worker's template before approving its launch. */
+  retargetReservation(actor: Agent, agentId: string, template: ReservationTemplate): Agent {
+    if (actor.role !== "human") throw new HiveError(403, "Only Human changes a reserved worker's template");
+    return this.deps.storage.transaction(() => {
+      const agent = this.getAgent(agentId);
+      if (!agent.pending || agent.removedAt !== undefined || agent.archivedAt !== undefined) throw new HiveError(409, "Worker is no longer pending");
+      if (agent.projectId !== template.projectId || !template.spec.enabled) throw new HiveError(409, "Template must be enabled in the same project");
+      const row = this.db.prepare('SELECT seniority_overridden,focus_overridden FROM agents WHERE id=?')
+        .get(agentId) as Pick<AgentRow, 'seniority_overridden' | 'focus_overridden'>;
+      this.db.prepare("UPDATE agents SET template_id = ?, seniority = CASE WHEN ? THEN seniority ELSE ? END, focus = CASE WHEN ? THEN focus ELSE ? END WHERE id = ?")
+        .run(template.id, row.seniority_overridden, template.spec.seniority,
+          row.focus_overridden, template.spec.focus || null, agentId);
+      const changed = this.getAgent(agentId);
+      this.deps.storage.afterCommit(() => this.deps.bus.emit("agent", changed));
+      return changed;
+    });
+  }
+
+  /** A launch joins its reserved worker with the ticket reserve() returned; the ticket works once. */
+  private claim(input: JoinInput, ticket: string): { agent: Agent; token: string; created: boolean } {
+    if (input.role !== "worker") throw new HiveError(400, "A launch ticket joins a worker");
+    if (input.resumeName) throw new HiveError(400, "Pass a launch ticket or resume, not both");
+    const row = this.db.prepare("SELECT * FROM agents WHERE claim_hash = ? AND removed_at IS NULL").get(hashToken(ticket)) as AgentRow | undefined;
+    if (!row || row.archived_at != null) throw new HiveError(401, "This launch ticket is not valid: it was used, it expired, or its worker was removed");
+    if (row.pending_until != null && row.pending_until < now()) {
+      this.deps.lifecycle.expireReservation(row.id);
+      throw new HiveError(410, `${row.name} waited too long for its launch and was withdrawn`);
+    }
+    const agent = this.mapAgent(row);
+    // The ticket identifies a reserved worker; Human may have edited its stored
+    // seniority since the launch prompt was built, so stale CLI fields are ignored.
+    if (input.project) this.assertSameProject(agent, this.deps.projects.getProjectBySlug(input.project));
+    const { storage, channels, messages, bus } = this.deps;
+    return storage.transaction(() => {
+      const token = this.replaceAgentSession(agent.id);
+      this.db.prepare("UPDATE agents SET pending_until = NULL, claim_hash = NULL WHERE id = ?").run(agent.id);
+      this.touch(agent.id, true);
+      this.claimTerminalSession(agent.id, input.terminalSession ?? null, false);
+      this.deps.lifecycleLog?.record({ agentId: agent.id, projectId: agent.projectId, actorId: null,
+        kind: 'joined', summary: 'Reserved worker claimed its identity.', source: 'server' });
+      const joined = this.getAgent(agent.id);
+      for (const ch of channels.channelsOfProject(agent.projectId!)) if (ch.type === "public") channels.addMember(ch.id, agent.id);
+      const general = joined.projectId ? channels.generalChannelId(joined.projectId) : null;
+      if (general) {
+        messages.postMessage(this.getAgent(HUMAN_ID), { channel: general, body: `${joined.name} has joined as ${describeAgent(joined)}.`, kind: "system" });
+      }
+      storage.afterCommit(() => bus.emit("agent", this.getAgent(agent.id)));
+      return { agent: joined, token, created: true };
+    });
+  }
+
+  /** Withdraws reserved workers whose launch never joined. */
+  expireReservations(at = now()): void {
+    const rows = this.db.prepare("SELECT id FROM agents WHERE pending_until IS NOT NULL AND pending_until < ? AND removed_at IS NULL AND archived_at IS NULL")
+      .all(at) as { id: string }[];
+    for (const row of rows) this.deps.lifecycle.expireReservation(row.id);
   }
 
   /**
@@ -308,7 +582,7 @@ export class IdentityService implements AgentDirectory {
 
   touch(agentId: string, online = true) {
     const current = this.db.prepare(
-      "SELECT online, last_seen_at AS lastSeenAt FROM agents WHERE id = ? AND removed_at IS NULL",
+      "SELECT online, last_seen_at AS lastSeenAt FROM agents WHERE id = ? AND removed_at IS NULL AND archived_at IS NULL",
     ).get(agentId) as { online: number; lastSeenAt: number } | undefined;
     if (!current) return;
     const wanted = online ? 1 : 0;
@@ -330,9 +604,10 @@ export class IdentityService implements AgentDirectory {
 
   /** Marks idle brains/workers offline; an agent blocked in a wait counts as present. */
   sweepPresence(maxIdleMs = PRESENCE_IDLE_MS) {
+    this.expireReservations();
     const cutoff = now() - maxIdleMs;
     const rows = this.db.prepare(
-      `SELECT id FROM agents WHERE role != 'human' AND online = 1 AND last_seen_at < ? AND removed_at IS NULL`,
+      `SELECT id FROM agents WHERE role != 'human' AND online = 1 AND last_seen_at < ? AND removed_at IS NULL AND archived_at IS NULL`,
     ).all(cutoff) as { id: string }[];
     for (const r of rows) {
       if (this.deps.waiters.has(r.id)) {
@@ -353,7 +628,7 @@ export class IdentityService implements AgentDirectory {
    * attributed), goes offline and gets an unguessable session key, so no earlier key authenticates it again.
    */
   markRemoved(agentId: string, at: number): void {
-    this.db.prepare("UPDATE agents SET removed_at = ?, online = 0, token_hash = ?, terminal_session = NULL WHERE id = ? AND removed_at IS NULL")
-      .run(at, hashToken(newToken()), agentId);
+    this.db.prepare(`UPDATE agents SET removed_at = ?, online = 0, token_hash = ?, terminal_session = NULL, pending_until = NULL,
+      claim_hash = NULL WHERE id = ? AND removed_at IS NULL`).run(at, hashToken(newToken()), agentId);
   }
 }

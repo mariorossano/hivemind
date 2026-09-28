@@ -9,11 +9,77 @@ terminal) through the WebKit bridge. The iPhone/iPad app is the second: it
 speaks the same protocol through Hivemind Server.app's
 [remote gateway](remote-access.md#terminal-broker), over TLS.
 
-The Node server has no part in this. It has no API that runs a command or
-touches a terminal. It only stores the session name an agent reports on join,
-as a label (`agent.terminalSession`). It does serve the page that drives the
-terminals, though, so it is trusted as the UI is; see
-[Security notes](#security-notes).
+The Node server never runs a command or touches a terminal. It stores the
+session name an agent reports on join as a label (`agent.terminalSession`),
+and queues template-based launch requests for Hivemind Server.app. It also
+serves the page that drives the terminals, so it is trusted as the UI is; see
+[Security notes](#security-notes) and [Launcher channel](#launcher-channel).
+
+## Launcher channel
+
+Hivemind Server.app's `LauncherService` consumes the Node server's durable
+`launch_requests` and `launcher_commands` queue. The Node server builds each
+command from a Human-defined project template, the reserved worker identity,
+and its one-time claim ticket. A brain supplies no executable command. The
+Swift service executes through its in-process broker, including the template
+identifier so the Keychain vault adds template secrets through the private
+launch file. Template secret values never enter the Node queue or database.
+
+The channel uses the per-start instance secret, independently of Human
+cookies and agent bearer tokens:
+
+- `GET /api/launcher/next?timeoutMs=25000` long-polls one command.
+- `GET /api/launcher/approvals` reads pending approval cards for Server.app's
+  native notifications, including while Hivemind.app has no open window.
+- `POST /api/launcher/:id/result` reports `launched`, `killed`, or `failed`.
+- `POST /api/launcher/requests/:id/approve` and `/reject` decide a request.
+  Approval may include a replacement `templateId` in the same project.
+
+Each request carries `X-Hivemind-Timestamp` (Unix seconds), a 32-byte lowercase
+hex `X-Hivemind-Nonce`, and `X-Hivemind-Signature`. The signature is the hex
+HMAC-SHA256 of the following UTF-8 text, with no final newline:
+
+```text
+hivemind-launcher-v1\nMETHOD\n/path?query\nTIMESTAMP\nNONCE\nSHA256_HEX_OF_RAW_BODY
+```
+
+The verifier accepts a clock difference of at most 60 seconds and retains
+used nonces for the entire acceptance window, including future-dated
+timestamps. A server without an instance secret returns 404. Signing a
+request does not authenticate the server's answer: the Swift service also
+checks the existing instance-proof challenge before accepting commands.
+Ordinary browser pages can read pending requests with their Human session,
+but approval mutations travel through the verified native bridge and broker
+to this signed channel. The iOS gateway carries the same broker messages;
+an unverified page cannot send a sensitive approval operation.
+
+Server.app deduplicates Mac notifications by request ID. Activating one opens
+Hivemind.app's inbox through the narrowly validated `hivemind://inbox` URL.
+The iOS app uses its existing native notification bridge while active; there
+is no background push transport for a suspended iOS app.
+
+Commands keep a stable ID across polling and Node restarts. Server.app writes
+a private journal entry before a broker side effect and records its result
+afterwards. Redelivery returns the saved result. An incomplete journal entry
+is reconciled with the existing session and its ownership; if a launch may
+have happened but its session is gone, the launcher reports an uncertain
+failure and requires a new explicit request. It never launches again merely
+because a previous command's session disappeared. This is at-most-once
+execution with an explicit uncertain outcome, rather than an atomic
+transaction spanning SQLite and tmux.
+
+The queue needs to recover a pending claim ticket after a Node restart.
+Its private payload is encrypted using a durable per-home key, separate
+from the rotating instance secret; the identity and public request record
+retain only a ticket hash. Settled payloads are cleared. Human/agent API
+responses and errors never contain a claim-bearing command. Back up the
+whole Hivemind home, including its queue key, while every server is stopped.
+
+This extends the existing trust boundary: Server.app trusts the Node server
+it started and verified. Any local process can impersonate a brain under
+Hivemind's existing identity model. With Auto enabled, that process could
+request workers from Human's enabled templates, subject to their individual
+concurrency caps. It cannot supply a command or retrieve Keychain values.
 
 The contract lives in `macos/Sources/HivemindKit`:
 
@@ -92,8 +158,11 @@ the one being typed in wins.
 A session name always matches `^hm-[a-z0-9][a-z0-9-]{0,78}$` (at most 82
 characters):
 
-- `hm-<project>-<agent>` for a named agent. It is always the same session, so
-  relaunching the agent reuses it (for example with **Resume same employees**).
+- `hm-<project>-<agent>` for a named agent. With an unchanged project/name, a
+  relaunch resolves to the same generated session (for example with **Resume same employees**).
+  Human renames keep the existing native label; a subsequent launch may generate a different name.
+  The fixed-agent panel uses reserved identity aliases to detect its verified live session and asks Human
+  to stop it before resuming. A rename alone does not rename or restart a native process.
   A launch that names the agent's running session (`session`, from
   `agent.terminalSession`) reuses that one instead, whatever its name, but
   only when the broker launched that session for the same project and for no
@@ -248,6 +317,9 @@ speaks. The broker answers with `min(client, broker)`, or with
 | `resize` | `stream`, `cols`, `rows` | none |
 | `detach` | `stream` | `exit` |
 | `kill` | `session` name | `killed` |
+| `secrets.list` | `template` id | `secrets` |
+| `secrets.set` | `template` id, `name`, `value` | `secrets` |
+| `secrets.delete` | `template` id, `name`? (absent or null: every secret of the template) | `secrets` |
 
 A launch is:
 
@@ -273,6 +345,7 @@ A launch is:
 | `output` | `stream`, `data` base64 (1 B–64 KiB decoded) |
 | `exit` | `stream`, `status` int or null. The stream is over: detached, the session ended, or its tmux client exited. |
 | `killed` | `session` |
+| `secrets` | `template`, `names`: the template's secret names after the request, sorted; never a value |
 | `error` | `code`, `message`, `stream`? |
 
 Error codes (`BrokerErrorCode`):
@@ -489,6 +562,33 @@ line; the largest valid launch, with every field and variable at its limit,
 stays under `TmuxCommand.maxCommandLineBytes` (checked in
 `LaunchEnvironmentTests`).
 
+## Template secrets
+
+Worker templates ([Worker templates](worker-templates.md)) may declare secret names; their values are kept here, not in
+the Node server. `secrets.set`, `secrets.delete` and `secrets.list` are answered at once (they run no tmux) with
+`secrets`: the template's secret **names**. No request returns a value.
+
+- **Rules** (`TemplateSecrets.swift`): `template` is a lowercase UUID (the server's template id); a `name` is an
+  environment variable name a launch may set ([Launch environment](#launch-environment) rules) or `OPENCODE_API_KEY`;
+  a `value` follows the [Launch secrets](#launch-secrets) rule (1–512 printable ASCII characters, no whitespace). A
+  template keeps at most 8 secrets; a ninth name is refused with `bad-message`, replacing a value is not. Errors name
+  the field, never the value; `TemplateSecretValue` prints as `<redacted>`; the broker logs the template and the name.
+- **Vault** (`TemplateSecretVault`): the app passes `KeychainTemplateSecretVault`, one generic password per secret in
+  the login Keychain, service `<Hivemind Server bundle id>.template-secrets`, account `<template id>/<NAME>`. A broker
+  without a vault answers `internal` ("this broker cannot keep template secrets"); a Keychain failure is `internal`
+  with its reason. Tests use a fake; nothing in `swift test` touches the Keychain.
+- **Launches.** A launch may carry `template` (a template id; the page's `terminal-launch` item too). For a session it
+  is about to create, the broker reads that template's secrets from the vault and writes them to the launch's private
+  file after its environment variables and before its own `secrets` (so a secret typed for the launch wins). A
+  template with no kept secret still gets the (empty) file; a vault failure fails that launch with `internal`
+  (`launches[i].template: …`). A reused session starts nothing and reads nothing. The broker logs the names only.
+- **Older brokers** answer these types with `unknown-type`; the page then says to update Hivemind Server.
+- **Trust.** Any process that holds `broker.token` can list names, replace or delete a template's secrets, but not read
+  them over the broker. The values leave the app only in a launch's private file. A launch names a template and a
+  command separately, so whoever may launch (anything holding the token, or a page the app trusts; see
+  [Security notes](#security-notes)) can start any command with a template's secrets in its environment: the same
+  trust the broker already gives such a client over every terminal.
+
 ## Clients
 
 `BrokerClient` (HivemindKit, `ClientBroker.swift`) is the client Hivemind.app
@@ -581,6 +681,7 @@ Page → app (`window.webkit.messageHandlers.hivemind.postMessage`):
 | `terminal-kill` | `id`?, `session` | The page confirms with a modal first. At most 1 per second per window. |
 | `terminal-kill` (batch) | `id`?, `sessions`: 1–24 names | **Terminate all**, after its confirm modal. Instead of `session`, never with it; every name must be a Hivemind session name or the message is dropped, and repeats are dropped. The app sends the broker one `kill` after another (a failure does not stop the rest) and answers once. The batch counts as one request against the kill throttle; the page sends more than 24 in batches a second apart (`TerminalHub.killAll`). |
 | `sessions-subscribe` / `sessions-unsubscribe` | none | Subscribing also sends `terminal-status` |
+| `template-secrets-list` / `-set` / `-delete` | `id`?, `template`, and `name`, `value` / `name`? as the broker's `secrets.*` | [Template secrets](#template-secrets); answered with `template-secrets`. A page of an unverified server is answered `unauthorized`. |
 
 App → page: `window.dispatchEvent(new CustomEvent("hivemind:terminal", {detail}))`
 (`TERMINAL_EVENT`; `parseTerminalEvent` reads the detail):
@@ -594,6 +695,7 @@ App → page: `window.dispatchEvent(new CustomEvent("hivemind:terminal", {detail
 | `terminal-output` | `stream`, `data` base64 |
 | `terminal-exit` | `stream`, `status` |
 | `terminal-killed` | `id`, `session`; or, answering a batch `terminal-kill`, `id`, `sessions` (the names that ended, in order) and `errors`: `[{session, code, message}]` (`no-such-session` for one that had already ended) |
+| `template-secrets` | `id`, `template`, `names` |
 | `terminal-error` | `id`, `code`, `message`, `stream` |
 
 `terminal-status` is sent on every `sessions-subscribe`, and then on every

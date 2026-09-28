@@ -1,4 +1,7 @@
 import { setCapabilitiesSchema, suggestWorkersSchema, routingOutcomeSchema, routingOverrideSchema } from '../shared/routing.ts';
+import { jobEventSchema, closeJobSchema } from '../shared/jobs.ts';
+import { taskControlSchema } from '../shared/task-control.ts';
+import { agentIdentityEditSchema, agentRemoveSchema, agentRuntimeEventSchema } from '../shared/agent-management.ts';
 import { z } from "zod";
 import { readLimitedJson } from "./ingress.ts";
 import { API_JSON_BYTES, channelInputSchema, cursorSchema, integerArgument,
@@ -7,6 +10,7 @@ import { API_JSON_BYTES, channelInputSchema, cursorSchema, integerArgument,
 import { subscriptionSchema, subscriptionScopeSchema } from "../shared/notifications.ts";
 import { claimPreviewSchema } from '../shared/task-claims.ts';
 import { assignTaskSchema, taskEventSchema } from "../shared/tasks.ts";
+import { launchModeSchema, requestWorkerSchema, releaseWorkerSchema } from "../shared/worker-orchestration.ts";
 import { roomEventSchema, sourceLinkSchema, sourceReportSchema } from "../shared/rooms.ts";
 import { HiveError } from "../shared/types.ts";
 
@@ -32,7 +36,26 @@ const telegram = z.object({ botToken: z.string().max(512).optional(),
   allowUserIds: z.union([z.array(telegramId).max(128), z.string().max(4096)]).optional(),
 }).strict();
 
+const workerTemplateEnvelope = z.object({ slug: z.unknown().optional(), expectedRevision: z.unknown().optional(),
+  spec: z.record(z.string(), z.unknown()) }).strict();
+const launcherResult = z.object({ status: z.enum(["launched", "failed", "killed"]),
+  session: z.string().max(82).optional(), error: z.string().max(500).optional() }).strict();
+
 function schemaFor(path: string, method: string): z.ZodType | undefined {
+  if (/^\/api\/ui\/agents\/[^/]+\/identity$/.test(path) && method === 'PATCH') return agentIdentityEditSchema;
+  if (/^\/api\/ui\/agents\/[^/]+\/capability$/.test(path) && method === 'PUT') return setCapabilitiesSchema;
+  if (/^\/api\/ui\/agents\/[^/]+\/remove$/.test(path) && method === 'POST') return agentRemoveSchema;
+  if (/^\/api\/ui\/agents\/[^/]+\/runtime-event$/.test(path) && method === 'POST') return agentRuntimeEventSchema;
+  if (path === "/api/agent/jobs/events" && method === "POST") return jobEventSchema;
+  if (/^\/api\/ui\/jobs\/[^/]+\/close$/.test(path) && method === "POST") return closeJobSchema;
+  if (/^\/api\/ui\/tasks\/[^/]+\/control$/.test(path) && method === "POST") return taskControlSchema;
+  if (path === "/api/agent/workers/request" && method === "POST") return requestWorkerSchema;
+  if (path === "/api/agent/workers/release" && method === "POST") return releaseWorkerSchema;
+  if (/^\/api\/ui\/agents\/[^/]+\/launch-mode$/.test(path) && method === "PATCH") return z.object({ mode: launchModeSchema }).strict();
+  if (/^\/api\/launcher\/[^/]+\/result$/.test(path) && method === "POST") return launcherResult;
+  if (/^\/api\/launcher\/requests\/[^/]+\/approve$/.test(path) && method === "POST")
+    return z.object({ templateId: z.string().uuid().optional() }).strict();
+  if (/^\/api\/launcher\/requests\/[^/]+\/reject$/.test(path) && method === "POST") return empty;
   if (path.endsWith('/api/agent/join')) return join;
   if (/\/channels\/[^/]+\/messages$/.test(path)) {
     return path.startsWith('/api/bot/') ? undefined : sendInputSchema;
@@ -64,6 +87,9 @@ function schemaFor(path: string, method: string): z.ZodType | undefined {
   if (/\/channels\/[^/]+\/room$/.test(path)) return roomEventSchema;
   if (/\/channels\/[^/]+\/links$/.test(path)) return sourceLinkSchema;
   if (/\/channels\/[^/]+\/links\/[^/]+\/status$/.test(path)) return sourceReportSchema;
+  if (/^\/api\/ui\/worker-templates\/[^/]+\/reserve$/.test(path)) return z.object({ label: z.string().max(200).nullish() }).strict();
+  // Only the envelope here: WorkerTemplateStore validates the spec itself, reporting each field's reason.
+  if (/^\/api\/ui\/projects\/[^/]+\/worker-templates$/.test(path) || /^\/api\/ui\/worker-templates\/[^/]+$/.test(path)) return workerTemplateEnvelope;
   if (/\/(?:ping|leave)$/.test(path) || /\/(?:retry|discard)$/.test(path)) return empty;
   // Bot/configuration/recovery schemas have their own narrower ingress readers.
   return undefined;

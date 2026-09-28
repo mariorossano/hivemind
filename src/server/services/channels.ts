@@ -252,6 +252,8 @@ export class ChannelService implements ChannelAccess {
   openDm(actor: Agent, otherName: string): Channel {
     const other = this.deps.identity.getAgentByName(otherName);
     if (!other) throw new HiveError(404, `No agent named ${otherName}`);
+    if (other.pending?.brainId && actor.role !== "human" && actor.id !== other.pending.brainId)
+      throw new HiveError(404, `No agent named ${otherName}`);
     if (actor.role === "bot" || other.role === "bot") throw new HiveError(403, "Bots publish observations to explicitly linked channels, not DMs");
     if (other.id === actor.id) throw new HiveError(400, "Cannot DM yourself");
     if (actor.role !== "human" && other.role !== "human" && actor.projectId !== other.projectId) {
@@ -285,6 +287,7 @@ export class ChannelService implements ChannelAccess {
     return this.deps.storage.transaction(create);
   }
 
+
   /** True while the channel still exists (e.g. it was not deleted with its project). */
   exists(channelId: string): boolean {
     return Boolean(this.db.prepare("SELECT id FROM channels WHERE id = ?").get(channelId));
@@ -296,6 +299,20 @@ export class ChannelService implements ChannelAccess {
       | ChannelRow
       | undefined;
     return row ? this.mapChannel(row) : null;
+  }
+
+  /** DM ids/memberships stay stable across Human renames; refresh only their visible labels. */
+  updateDmLabelsForAgent(agentId: string): void {
+    const rows = this.db.prepare(`SELECT c.id FROM channels c JOIN channel_members m ON m.channel_id=c.id
+      WHERE c.type='dm' AND m.agent_id=?`).all(agentId) as { id: string }[];
+    for (const { id } of rows) {
+      const members = this.db.prepare('SELECT agent_id FROM channel_members WHERE channel_id=?')
+        .all(id) as { agent_id: string }[];
+      if (members.length !== 2) continue;
+      const [a, b] = members.map(member => this.deps.identity.getAgent(member.agent_id));
+      this.db.prepare('UPDATE channels SET name=? WHERE id=?').run(dmLabel(a!, b!), id);
+      this.deps.storage.afterCommit(() => this.deps.bus.emit('channel', this.getChannel(id)));
+    }
   }
 
   invite(actor: Agent, channelRef: string, memberNames: string[]): Channel {

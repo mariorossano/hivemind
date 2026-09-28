@@ -8,13 +8,14 @@ import { standingOrders } from "./standing-orders.ts";
 import { WAIT_NEXT, type Agent } from "./types.ts";
 import { assignTaskSchema, taskEventSchema } from "./tasks.ts";
 import { roomEventSchema } from "./rooms.ts";
-import { JOIN_SESSION, PARAM_DESCRIPTIONS, SEARCH_NEXT, TOOL_DESCRIPTIONS, joinNext, type ToolName } from "../mcp/tool-text.ts";
+import { JOIN_SESSION, PARAM_DESCRIPTIONS, SEARCH_NEXT, TOOL_DESCRIPTIONS, WAIT_NEXT_REPEAT, joinNext, type ToolName } from "../mcp/tool-text.ts";
 
 const agent = (role: AgentRole): Agent => ({
   id: `${role}-id`, name: role === "brain" ? "Atlas" : "Forge", role, seniority: role === "worker" ? "senior" : null,
   focus: null, online: true, lastSeenAt: 1, createdAt: 1, projectId: "project-id", project: "acme",
 });
 const orders = { brain: standingOrders(agent("brain")), worker: standingOrders(agent("worker")) };
+const templateWorkerOrders = standingOrders({ ...agent("worker"), templateId: "00000000-0000-4000-8000-000000000001" });
 
 const launchBase = { software: "codex", workspacePath: null, cdWorktree: false, projectSlug: "acme", hiveName: "Acme",
   passProject: true, adoptUntrusted: true, seniority: "senior", resumeName: "Forge" } as const;
@@ -47,7 +48,7 @@ function schemaDescriptions(): string[] {
 const params = schemaDescriptions();
 const joinTexts = [JOIN_SESSION, joinNext(true, true), joinNext(false, true), joinNext(false, false)];
 
-type Where = "orders" | "launch" | "bot-launch" | "param" | "join" | "wait" | ToolName;
+type Where = "orders" | "template-orders" | "launch" | "bot-launch" | "param" | "join" | "wait" | "wait-repeat" | ToolName;
 type Evidence = { where: Where; phrase: string; roles?: readonly AgentRole[] };
 
 /**
@@ -65,7 +66,8 @@ const COVERAGE: Record<AgentRuleId, readonly Evidence[]> = {
     { where: "launch", phrase: "If join is unavailable or fails, report the startup failure and stop." }],
   "session.read-orders": [{ where: "launch", phrase: "read your standing orders (a first join returns them; otherwise call whoami with orders=true) and follow them" },
     { where: "join", phrase: "if they are not in your context, call whoami with orders=true" }],
-  "session.identity-fixed": [{ where: "orders", phrase: "Your identity is fixed: never change role or seniority." }],
+  "session.identity-fixed": [{ where: "orders", phrase: "Your role and project stay fixed. Only Human may change your name, focus or seniority" },
+    { where: "orders", phrase: "After an identity or capability control notice, call whoami with orders=true" }],
   "session.resume-by-name": [{ where: "join", phrase: "resume=<your name> returns to your identity without credentials, superseding its older session" }],
   "session.same-process-join": [{ where: "join", phrase: "Repeated join keeps this process's identity; another identity needs a new MCP process." }],
   "session.resume-state": [{ where: "orders", phrase: "After a resume or replacement, reread get_handoffs, contracts and task state before acting (saved reports may be stale)." },
@@ -76,13 +78,23 @@ const COVERAGE: Record<AgentRuleId, readonly Evidence[]> = {
   "wait.once-no-args": [{ where: "orders", phrase: "Call wait once with no arguments and no timeout." },
     { where: "launch", phrase: "call it once with no arguments" }],
   "wait.only-mail": [{ where: "orders", phrase: "It returns only with mail; idle time and network blips are retried inside the tool." }],
-  "wait.silent": [{ where: "orders", phrase: "While wait is in flight output no text: a status line cancels it." },
+  "wait.silent": [{ where: "orders", phrase: "While wait is in flight output no text." },
     { where: "launch", phrase: "output no text while it runs" }, { where: "wait", phrase: "output no text" }],
   "wait.spinner": [{ where: "orders", phrase: "A \"Working\" spinner during wait is sleep, not thinking." }],
   "wait.retry": [{ where: "orders", phrase: "If wait is cancelled, fails transiently (e.g. fetch failed) or the prompt returns without mail, call wait again immediately." },
     { where: "launch", phrase: "call it again after handling mail or when it is cancelled or fails" }],
-  "wait.last-call": [{ where: "orders", phrase: "then make wait the last call of the turn and stay silent. Never end a turn without wait in flight." },
-    { where: "launch", phrase: "Keep wait in flight" }],
+  "wait.turn-active": [{ where: "orders", phrase: "never emit a final response, even an empty one" },
+    { where: "launch", phrase: "never emit a final response, even an empty one" },
+    { where: "wait", phrase: "instead of ending the turn, even with an empty final response" },
+    { where: "wait-repeat", phrase: "instead of ending the turn, even with an empty final response" }],
+  "wait.host-continuation": [{ where: "orders", phrase: "use its continuation/wait tool on that same call until it completes. Do not start a second Hivemind wait while the first is pending." },
+    { where: "launch", phrase: "use its continuation/wait tool on that same call until it completes. Do not start a second Hivemind wait while the first is pending." },
+    { where: "wait", phrase: "keep awaiting any running host cell" },
+    { where: "wait-repeat", phrase: "keep awaiting any running host cell" }],
+  "wait.explicit-stop": [{ where: "orders", phrase: "Respect explicit stop/interruption instructions; a transient retry must not override them." },
+    { where: "launch", phrase: "Respect explicit stop/interruption instructions; a transient retry must not override them." },
+    { where: "wait", phrase: "Follow standing orders for explicit stops and interruptions." },
+    { where: "wait-repeat", phrase: "Follow standing orders for explicit stops and interruptions." }],
   "wait.no-polling": [{ where: "orders", phrase: "Never poll: no agents, history, channels or search calls while idle." }],
   "wait.superseded-stop": [{ where: "orders", phrase: "If your inbox session was superseded, stop waiting and acting on its mail; rejoin only when explicitly asked." },
     { where: "launch", phrase: "If your inbox session was superseded, stop waiting and acting on its mail; rejoin only when explicitly asked." }],
@@ -151,6 +163,8 @@ const COVERAGE: Record<AgentRuleId, readonly Evidence[]> = {
     { where: "search", phrase: "workers search only rooms they can see" }],
   "worker.ask-brain": [{ where: "orders", phrase: "Blocked, unsure or need a product decision? Ask a brain, never Human or this prompt." }],
   "worker.review-rejection": [{ where: "orders", phrase: "If a local automatic review rejects a patch, send the exact reason to the brain and wait; do not retry the same apply." }],
+  "worker.human-task-control": [{ where: "orders", phrase: "When Human pauses a task, save a checkpoint and stop task work; wait for an explicit resume. On cancellation, stop immediately. A hard pause closes the session after its grace period; resume requires rereading the saved handoff." }],
+  "brain.jobs": [{ where: "orders", phrase: "Group one Human request into one job with job_event, and pass its id to request_worker for each task. Preserve the Human origin message when available; job references grant no conversation access." }],
   "worker.clear-context": [{ where: "orders", phrase: "On a clear_context control message, discard all task memory, keep this identity and these orders, then wait." }],
   "worker.report": [{ where: "orders", phrase: "When a piece of work is done, report to the brain that assigned it, then wait." },
     { where: "launch", phrase: "When a task is done, report to the brain that assigned it." }],
@@ -158,12 +172,20 @@ const COVERAGE: Record<AgentRuleId, readonly Evidence[]> = {
   "worker.room-ack": [{ where: "orders", phrase: "In a room, read get_task/get_room and room_event acknowledge the current contractVersion before continuing (concurrent acknowledgements are safe)." }],
   "worker.peer-clarify": [{ where: "orders", phrase: "Clarify directly with addressed peers, but replying to a peer does not finish your own assigned task: continue it and submit its result before idling." }],
   "worker.stop-request": [{ where: "orders", phrase: "On a room stop request, stop incompatible activity and send room_event stopped, not a result. Hivemind cannot interrupt external tools for you." }],
+  "worker.task-bound-worktree": [{ where: "template-orders", phrase: "On receiving your task assignment, create a separate git worktree and branch for that task as your first work action." }],
+  "worker.task-bound-scope": [{ where: "template-orders", phrase: "Work only on your assigned task; do not take another task or start unrelated work in this identity." }],
+  "worker.task-bound-review": [{ where: "template-orders", phrase: "After submitting a result, wait for the assigning brain's review. If changes are requested, continue that task; once the result is accepted, stop acting and wait for release." }],
   "brain.coordinate": [{ where: "orders", phrase: "Coordinate and delegate to workers, or do the work yourself when that serves the request better: you decide." },
     { where: "launch", phrase: "Coordinate and delegate to workers, or do the work yourself when that serves the request better: you decide." }],
   "brain.talk": [{ where: "orders", phrase: "Talk with Human, brains (#brains) and workers; post progress publicly when the hive should see it." }],
   "brain.assign": [{ where: "orders", phrase: "Delegate by choosing a specific worker (you pick seniority) in a DM thread or an authorized scoped room: one task = one thread." }],
   "brain.offline-worker": [{ where: "orders", phrase: "If the worker is offline, leave the message there; do not try to wake it." }],
   "brain.prepare": [{ where: "orders", phrase: "Put the worktree, branch and files to open in the assignment; workers can read channel history for context." }],
+  "brain.reuse-idle-worker": [{ where: "orders", phrase: "Prefer an idle suitable worker already in your project before requesting a task-bound worker." }],
+  "brain.template-choice": [{ where: "orders", phrase: "When a new worker is needed, inspect worker_templates and choose an enabled template by its description and capacity; do not request a template you do not need." }],
+  "brain.one-task-bound-worker": [{ where: "orders", phrase: "Use request_worker for one task-bound worker per task. Pick one stable requestId and reuse the same requestId and payload after an uncertain response; inspect history or get_task when available before retrying." }],
+  "brain.release-task-bound": [{ where: "orders", phrase: "After the task is accepted-complete, cancelled or revised away, call release_worker for the task-bound worker you own." }],
+  "brain.no-mail-relaunch": [{ where: "orders", phrase: "Incoming mail alone never creates or relaunches a worker session; request_worker is an explicit brain action subject to Human's launch mode." }],
   "brain.task-owner": [{ where: "orders", phrase: "Only the assigning brain revises a task or reviews its result as accepted or changes_requested." },
     { where: "task_event", phrase: "Assigning brain: revise, review." }],
   "brain.ask-human": [{ where: "orders", phrase: "When a cycle of work is done, or you are unsure, ask @Human what is next." }],
@@ -211,11 +233,13 @@ const COVERAGE: Record<AgentRuleId, readonly Evidence[]> = {
 
 function textsFor(where: Where, role: AgentRole): string[] {
   if (where === "orders") return [orders[role]];
+  if (where === "template-orders") return role === "worker" ? [templateWorkerOrders] : [];
   if (where === "launch") return launch[role];
   if (where === "bot-launch") return role === "brain" ? botLaunch : [];
   if (where === "param") return [params.join("\n")];
   if (where === "join") return [[TOOL_DESCRIPTIONS.join, ...joinTexts].join("\n")];
   if (where === "wait") return [WAIT_NEXT];
+  if (where === "wait-repeat") return [WAIT_NEXT_REPEAT];
   return [TOOL_DESCRIPTIONS[where]];
 }
 
@@ -242,8 +266,13 @@ test("role-specific rules stay out of the other role's orders", () => {
     if (rule.roles.length !== 1) continue;
     const other: AgentRole = rule.roles[0] === "brain" ? "worker" : "brain";
     for (const { where, phrase } of COVERAGE[rule.id]) {
-      if (where !== "orders") continue;
+      if (where !== "orders" && where !== "template-orders") continue;
       assert.equal(orders[other].includes(phrase), false, `${rule.id} leaked into ${other} orders`);
+    }
+  }
+  for (const rule of AGENT_RULES.filter(rule => rule.id.startsWith("worker.task-bound-"))) {
+    for (const { phrase } of COVERAGE[rule.id]) {
+      assert.equal(orders.worker.includes(phrase), false, `${rule.id} leaked into fixed worker orders`);
     }
   }
 });
@@ -260,10 +289,10 @@ test("no sentence is duplicated between standing orders and MCP text, or within 
   }
   const repeatedInTools = [...toolSentences].filter(([, count]) => count > 1).map(([sentence]) => sentence);
   assert.deepEqual(repeatedInTools, [], "each MCP sentence has one home");
-  for (const role of ["brain", "worker"] as const) {
-    const own = sentences(orders[role]);
-    assert.deepEqual(own.filter((sentence, index) => own.indexOf(sentence) !== index), [], `${role} orders repeat a sentence`);
-    assert.deepEqual(own.filter(sentence => toolSentences.has(sentence)), [], `${role} orders repeat MCP text`);
+  for (const [name, order] of Object.entries({ ...orders, templateWorker: templateWorkerOrders })) {
+    const own = sentences(order);
+    assert.deepEqual(own.filter((sentence, index) => own.indexOf(sentence) !== index), [], `${name} orders repeat a sentence`);
+    assert.deepEqual(own.filter(sentence => toolSentences.has(sentence)), [], `${name} orders repeat MCP text`);
   }
 });
 
@@ -284,7 +313,9 @@ test("tool and parameter descriptions stay within their length budgets", () => {
     assert.ok(description.length <= 400, `${name} description is ${description.length} characters`);
   }
   for (const description of params) assert.ok(description.length <= 200, `parameter description too long: ${description}`);
-  assert.ok(WAIT_NEXT.length <= 300, "WAIT_NEXT is returned with every wait result");
+  // The first-wake reminder includes the host-continuation guard after observed empty-final stalls.
+  assert.ok(WAIT_NEXT.length <= 500, "first-wake reminder stays bounded");
+  assert.ok(WAIT_NEXT_REPEAT.length <= 350, "later wakes keep a shorter continuity reminder");
 });
 
 test("every registered MCP tool takes its description from TOOL_DESCRIPTIONS", () => {

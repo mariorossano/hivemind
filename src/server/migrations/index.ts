@@ -9,6 +9,13 @@ import { dropDecisionRequests } from "./drop-decision-requests.ts";
 import { botCapabilities } from './bot-capabilities.ts';
 import { jevAdvisory } from "./jev-advisory.ts";
 import { performanceRetention } from "./performance-retention.ts";
+import { workerTemplates } from "./worker-templates.ts";
+import { agentReservations } from "./agent-reservations.ts";
+import { launcherQueue } from "./launcher-queue.ts";
+import { taskViewIndexes } from './task-view-indexes.ts';
+import { jobsTaskControl } from './jobs-task-control.ts';
+import { brainWorkerOrchestration } from "./brain-worker-orchestration.ts";
+import { agentManagement } from './agent-management.ts';
 import { schemaShape, validateCoreStorage, validateSchema, type SchemaShape } from "./validate.ts";
 
 /**
@@ -64,10 +71,20 @@ export const MIGRATIONS: readonly Migration[] = [
   { version: 29, name: "agent_tombstones", up: agentTombstones },
   { version: 30, name: "drop_decision_requests", up: dropDecisionRequests },
   { version: 31, name: "agent_terminal_session", up: agentTerminalSession },
-  { version: 32, name: "bot_capabilities", up(db) {
-    // The local Bot preview also used version 31, before upstream shipped terminal sessions.
-    // Complete that schema without resetting its version or changing existing Bot grants.
+  { version: 32, name: "worker_templates", up: workerTemplates },
+  { version: 33, name: "agent_reservations", up: agentReservations },
+  { version: 34, name: "launcher_queue", up: launcherQueue },
+  { version: 35, name: "brain_worker_orchestration", up: brainWorkerOrchestration },
+  { version: 36, name: "jobs_task_control", up: jobsTaskControl },
+  { version: 37, name: "task_view_indexes", up: taskViewIndexes },
+  { version: 38, name: "agent_management", up: agentManagement },
+  { version: 39, name: "bot_capabilities", up(db) {
+    // Converge the shipped fork schemas (Bot preview 31 and Bot+terminal 32)
+    // with upstream 31–38 without resetting their version or existing grants.
+    // Fork 32 skipped upstream's worker_templates step; both helpers are
+    // idempotent and preserve existing labels/templates on upstream databases.
     agentTerminalSession(db);
+    workerTemplates(db);
     botCapabilities(db);
   } },
 ];

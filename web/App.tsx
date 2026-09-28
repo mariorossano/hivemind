@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { Agent } from "../src/shared/types.ts";
+import type { TaskOverview } from "../src/shared/task-views.ts";
 import { AdaptiveRoutingPanel } from "./AdaptiveRoutingPanel.tsx";
 import { AdaptiveRoutingSettings } from "./AdaptiveRoutingSettings.tsx";
 import { api } from "./api.ts";
@@ -7,15 +8,18 @@ import { ChannelDesk } from "./ChannelDesk.tsx";
 import { CreateChannelSheet, InviteSheet } from "./ChannelSheets.tsx";
 import { useDesktopNotifications } from "./desktop-notifications.ts";
 import { AgentConfirmSheet, HelpSheet } from "./HiveSheets.tsx";
+import { AgentPanel } from './AgentPanel.tsx';
 import { Inbox } from "./Inbox.tsx";
 import { JevLog } from "./JevLog.tsx";
 import { channelTitle } from "./labels.ts";
 import { LaunchSheet } from "./LaunchSheet.tsx";
+import { LaunchRequests, useLaunchRequests } from "./LaunchRequests.tsx";
 import { channelBack, mobileScreen, mobileTab, tabTarget, useMobile } from "./mobile-nav.ts";
 import { MobileDms, MobileTabs, projectDms } from "./MobileNav.tsx";
 import { useNativeBridge } from "./native-bridge.ts";
 import { attentionTotal, documentTitle, loadSelectedProject, projectLanding, saveProjectView, saveSelectedProject, type SwitchItem } from "./nav-model.ts";
 import { ProjectBots } from "./ProjectBots.tsx";
+import { WorkerTemplatesSheet } from "./WorkerTemplates.tsx";
 import { ProjectRail } from "./ProjectRail.tsx";
 import { CreateProjectSheet, ProjectSettingsSheet } from "./ProjectSheets.tsx";
 import { QuickSwitcher } from "./QuickSwitcher.tsx";
@@ -24,7 +28,9 @@ import { hashFor, type Sel } from "./selection.ts";
 import { Sidebar } from "./Sidebar.tsx";
 import { newerTelegramHealth } from "./telegram-health.ts";
 import { TelegramSheet } from "./TelegramSheet.tsx";
+import { TaskViews } from "./TaskViews.tsx";
 import { ThreadAside } from "./ThreadAside.tsx";
+import { ThreadResizer } from "./ThreadResizer.tsx";
 import { TopBar } from "./TopBar.tsx";
 import { useAdaptiveRouting } from "./use-adaptive-routing.ts";
 import { useChannelPane } from "./use-channel-pane.ts";
@@ -33,7 +39,6 @@ import { useDmNav } from "./use-dm-nav.ts";
 import { useHiveSnapshot } from "./use-hive-snapshot.ts";
 import { useInbox } from "./use-inbox.ts";
 import { useLayout } from "./use-layout.ts";
-import { useNavStatus } from "./use-nav-status.ts";
 import { useRealtime } from "./use-realtime.ts";
 import { useSearch } from "./use-search.ts";
 import { useChangeSelection, useSelection, useSelectionRepair } from "./use-selection.ts";
@@ -49,6 +54,7 @@ export function App() {
   // the first snapshot and WebSocket (useRealtime), which start before the
   // channel and thread loads (useConversationLoads).
   const [err, setErr] = useState<string | null>(null);
+  const shellRef = useRef<HTMLDivElement>(null);
   const selection = useSelection();
   const { sel, threadId, setThreadId, selRef } = selection;
   const hive = useHiveSnapshot(setErr);
@@ -73,7 +79,7 @@ export function App() {
   ));
   const brainNames = Object.fromEntries((snap?.agents ?? []).filter(agent => agent.role === "brain").map(agent => [agent.id, agent.name]));
   const storedProject = loadSelectedProject();
-  const selectedProject = sel.kind !== "channel" ? sel.project
+  const selectedProject = sel.kind !== "channel" ? sel.project ?? projects.find(p => p.slug === storedProject)?.slug ?? projects[0]?.slug ?? ""
     : (activeChannel?.project ?? projects.find(p => p.slug === storedProject)?.slug ?? projects[0]?.slug ?? "");
 
   const search = useSearch({ selectedProject, projects, setErr });
@@ -90,12 +96,23 @@ export function App() {
     if (search.query) search.setQuery("");
     go(next);
   };
-  const navStatus = useNavStatus();
   const notifications = useDesktopNotifications(channels, navigate);
+  const launchRequests = useLaunchRequests(projects, snap?.agents ?? []);
+  const [taskTick, setTaskTick] = useState(0);
+  const taskRefreshTimer = useRef<number | null>(null);
+  const requestTaskRefresh = () => {
+    if (taskRefreshTimer.current !== null) return;
+    taskRefreshTimer.current = window.setTimeout(() => { taskRefreshTimer.current = null; setTaskTick(value => value + 1); }, 80);
+  };
+  useEffect(() => () => { if (taskRefreshTimer.current !== null) window.clearTimeout(taskRefreshTimer.current); }, []);
   const { live, roomTick, jevTick, subscribeJev } = useRealtime({
     selection, hive, channel: channelPane, thread: threadState, inboxLoad: inbox.inboxLoad, changeSelection,
     reopenDm: dms.reopenDm, onActivity: inbox.receive, refreshRoutingView, onRoutingEvent, setErr,
-    onLiveEvent: event => { navStatus.onLiveEvent(event); notifications.onLiveEvent(event); },
+    onLiveEvent: event => {
+      notifications.onLiveEvent(event); launchRequests.onLiveEvent(event);
+      if (event.type === 'task' || event.type === 'job' || event.type === 'launch-requests' ||
+        event.type === 'agent' || event.type === 'hello') requestTaskRefresh();
+    },
   });
   useSelectionRepair(snap, sel, changeSelection);
   // Phones show one screen at a time with bottom tabs (#223); the hash stays the single source of navigation.
@@ -133,12 +150,17 @@ export function App() {
   const agentConfirm = useAgentConfirm(refreshSnap, setErr);
   const [botProject, setBotProject] = useState<string | null>(null);
   const [credentialBot, setCredentialBot] = useState<Agent | null>(null);
+  const [templatesProject, setTemplatesProject] = useState<string | null>(null);
   const [helpOpen, setHelpOpen] = useState(false);
   const [adaptiveRoutingOpen, setAdaptiveRoutingOpen] = useState(false);
   const [launchOpen, setLaunchOpen] = useState(false);
+  const [agentPanelId, setAgentPanelId] = useState<string | null>(null);
+  const [resumeAgentId, setResumeAgentId] = useState<string | null>(null);
+  const [resumeAliases, setResumeAliases] = useState<string[]>([]);
   /** Project preselected in the Launch sheet when it is opened from a project's roster. */
   const [launchProject, setLaunchProject] = useState<string | null>(null);
-  const openLaunch = (project: string | null = null) => { setLaunchProject(project); setLaunchOpen(true); };
+  const [taskDraft, setTaskDraft] = useState<{ channelId: string; token: string; text: string } | null>(null);
+  const openLaunch = (project: string | null = null) => { setResumeAgentId(null); setResumeAliases([]); setLaunchProject(project); setLaunchOpen(true); };
 
   const roomAgents = (snap?.agents ?? []).filter((a) => a.role === "human" || !a.project || a.project === selectedProject);
   const { inboxBox, inboxItems, inboxPage, inboxBusy } = inbox;
@@ -153,6 +175,21 @@ export function App() {
     } catch (error) {
       setErr(String((error as Error)?.message || error));
     }
+  };
+  const messageTaskBrain = async (item: TaskOverview) => {
+    try {
+      const { channel } = await api.openDm(item.brain.name);
+      dms.reopenDm(channel.id);
+      await refreshSnap();
+      const thread = `#/c/${encodeURIComponent(item.task.channelId)}/t/${encodeURIComponent(item.task.id)}`;
+      setTaskDraft({ channelId: channel.id, token: crypto.randomUUID(), text: `[Task ${item.task.id}](${thread})` });
+      navigate({ kind: 'channel', id: channel.id });
+    } catch (error) { setErr(String((error as Error)?.message || error)); }
+  };
+  const setAgentLaunchMode = async (agent: Agent, mode: "approval" | "auto") => {
+    const { agent: saved } = await api.setAgentLaunchMode(agent.name, mode);
+    setSnap(current => current ? { ...current,
+      agents: current.agents.map(item => item.id === saved.id ? saved : item) } : current);
   };
   /** Error banner retry: reload the snapshot and whatever conversation or inbox is on screen. */
   const retry = () => {
@@ -187,7 +224,8 @@ export function App() {
   useEffect(() => {
     if (!knownProject) return;
     saveSelectedProject(selectedProject);
-    saveProjectView(selectedProject, sel.kind === "channel" ? { kind: "channel", id: sel.id } : sel);
+    if (sel.kind !== 'tasks' || sel.project !== null)
+      saveProjectView(selectedProject, sel.kind === "channel" ? { kind: "channel", id: sel.id } : sel);
   }, [knownProject, selectedProject, sel]);
   const attention = snap ? attentionTotal(snap) : 0;
   useEffect(() => { document.title = documentTitle(attention); }, [attention]);
@@ -228,21 +266,26 @@ export function App() {
     onAdaptiveRouting: () => setAdaptiveRoutingOpen(true), onLaunch: () => openLaunch(), onHelp: () => setHelpOpen(true),
   };
   const railProject = projects.some(p => p.slug === selectedProject) ? selectedProject : projects[0]?.slug ?? "";
+  const threadVisible = Boolean(threadId && threadPane && sel.kind === "channel" &&
+    threadPane.channel.id === sel.id && threadPane.threadId === threadId);
 
   return (
-    <div className="shell" data-m={screen}>
+    <div className="shell" data-m={screen} ref={shellRef}>
       {unified ? (
         <TopBar live={live} projectName={projects.find(p => p.slug === railProject)?.name} onSwitcher={() => setSwitcher("all")}
+          onAllTasks={() => navigate({ kind: 'tasks', project: null })} allTasksActive={sel.kind === 'tasks' && sel.project === null}
           settings={settings} />
       ) : (
-        <ProjectRail snap={snap} selectedProject={railProject} onSelect={selectProject}
+        <ProjectRail snap={snap} selectedProject={sel.kind === 'tasks' && sel.project === null ? '' : railProject} onSelect={selectProject}
+          onAllTasks={() => navigate({ kind: 'tasks', project: null })} allTasksActive={sel.kind === 'tasks' && sel.project === null}
           onNewProject={() => projectSheets.setCreatingProject(true)} settings={settings} live={live} />
       )}
       {/* Settings lives at the foot of the rail or in the top bar, never in the sidebar. */}
       <Sidebar snap={snap} sel={sel} go={navigate} live={live} unified={unified} onUnread={openUnread}
+        resizable={!mobile} threadOpen={threadVisible}
         query={search.query} setQuery={search.setQuery} onSearchNow={search.searchNow} onLaunch={openLaunch}
         selectedProject={selectedProject} onSwitcher={() => setSwitcher("all")} onProjectSwitcher={() => setSwitcher("projects")}
-        agentWork={navStatus.agentWork}
+        agentWork={snap.agentWork ?? {}}
         inboxBox={inboxBox} projectSheets={projectSheets}
         onNewChannel={(project) => {
           channelSheets.setCreateIn(project);
@@ -250,8 +293,12 @@ export function App() {
         }}
         dms={dms}
         agentActions={{
-          onAgent, onCreateBot: id => { setCredentialBot(null); setBotProject(id); }, onManageBot: bot => { setCredentialBot(bot); setBotProject(bot.projectId!); },
-          onAskAgent: (name, kind) => agentConfirm.setAgentConfirm({ name, kind }),
+          onAgent, onOpenPanel: agent => setAgentPanelId(agent.id),
+          onCreateBot: id => { setCredentialBot(null); setBotProject(id); }, onManageBot: bot => { setCredentialBot(bot); setBotProject(bot.projectId!); },
+          onAskAgent: (name, kind) => kind === 'remove'
+            ? setAgentPanelId(snap.agents.find(agent => agent.name === name)?.id ?? null)
+            : agentConfirm.setAgentConfirm({ name, kind }),
+          onSetLaunchMode: setAgentLaunchMode,
         }} />
 
       <main className="desk">
@@ -283,6 +330,19 @@ export function App() {
             channelLabel={id => { const channel = channels.find(item => item.id === id); return channel ? channelTitle(channel) : "Deleted channel"; }}
             agentName={id => snap.agents.find(agent => agent.id === id)?.name ?? "Removed brain"}
             onOpenChannel={id => go({ kind: "channel", id })} />
+        ) : sel.kind === "tasks" ? (
+          <TaskViews project={sel.project} projects={projects} agents={snap.agents} traffic={snap.agentTraffic ?? {}}
+            tick={taskTick} onProject={slug => navigate({ kind: 'tasks', project: slug })}
+            onBack={() => navigate({ kind: 'home', project: sel.project ?? selectedProject })}
+            onAll={() => navigate({ kind: 'tasks', project: null })}
+            onOpenThread={item => navigate({ kind: 'channel', id: item.task.channelId, thread: item.task.id })}
+            onOpenWorker={item => setAgentPanelId(item.worker.id)}
+            onMessageBrain={item => void messageTaskBrain(item)}
+            requests={<LaunchRequests requests={sel.project
+              ? launchRequests.requests.filter(request => projects.find(project => project.id === request.projectId)?.slug === sel.project)
+              : launchRequests.requests} projects={projects} agents={snap.agents}
+              launcherAvailable={Boolean(snap.launcherAvailable)} error={launchRequests.error} loading={launchRequests.loading}
+              onRetry={() => void launchRequests.refresh()} onDecide={launchRequests.decide} />} />
         ) : sel.kind === "inbox" ? (
           <Inbox
             key={`${sel.project}:${inboxBox}`}
@@ -303,6 +363,9 @@ export function App() {
             }
             onOlder={inbox.loadOlder}
             onMarkSeen={inbox.markAllSeen}
+            requests={<LaunchRequests requests={launchRequests.requests} projects={projects} agents={snap.agents}
+              launcherAvailable={Boolean(snap.launcherAvailable)} error={launchRequests.error} loading={launchRequests.loading}
+              onRetry={() => void launchRequests.refresh()} onDecide={launchRequests.decide} />}
           />
         ) : sel.kind === "dms" ? (
           <MobileDms snap={snap} project={sel.project} onOpen={id => go({ kind: "channel", id })} onUnread={openUnread} />
@@ -311,9 +374,12 @@ export function App() {
             unreadTarget={unreadTarget}
             channel={channelPane} threadPaneId={threadPane?.threadId} stickBottom={stickBottom}
             threadOpenAnchor={threadOpenAnchor} go={go} roomTick={roomTick} routingView={routingView}
+            onReopenThread={threadState.refreshThread}
             activeBrainChannel={activeBrainChannel} brainNames={brainNames}
             onOpenRouting={() => setRoutingPanelOpen(true)} onInvite={() => channelSheets.setInviteOpen(true)}
-            compose={compose} setErr={setErr} onMarkUnread={async (channelId, seq) => {
+            compose={compose} draftInsert={taskDraft?.channelId === sel.id ? taskDraft : null}
+            onDraftInserted={token => setTaskDraft(current => current?.token === token ? null : current)}
+            setErr={setErr} onMarkUnread={async (channelId, seq) => {
               const ticket = hive.readFence.current.ticket();
               const next = await api.markUnread(channelId, seq);
               if (!hive.acceptRead(next, ticket)) hive.readRefresh.current?.request();
@@ -329,7 +395,8 @@ export function App() {
         )}
       </main>
 
-      {threadId && threadPane && sel.kind === "channel" && threadPane.channel.id === sel.id && threadPane.threadId === threadId && (
+      {threadVisible && !mobile && <ThreadResizer shellRef={shellRef} />}
+      {threadVisible && threadId && threadPane && sel.kind === "channel" && (
         <ThreadAside channelId={sel.id} threadId={threadId} threadPane={threadPane} thread={threadState}
           onClose={() => {
             if (sel.kind === "channel") go({ kind: "channel", id: sel.id });
@@ -373,7 +440,13 @@ export function App() {
 
       {projectSheets.editingProject && (
         <ProjectSettingsSheet form={projectSheets} project={projectSheets.editingProject} agents={snap?.agents ?? []}
-          onBots={() => { setCredentialBot(null); setBotProject(projects.find(p => p.slug === projectSheets.editingProject)!.id); projectSheets.setEditingProject(null); }} refreshSnap={refreshSnap} setErr={setErr} />
+          onBots={() => { setCredentialBot(null); setBotProject(projects.find(p => p.slug === projectSheets.editingProject)!.id); projectSheets.setEditingProject(null); }}
+          onWorkerTemplates={() => setTemplatesProject(projectSheets.editingProject)} refreshSnap={refreshSnap} setErr={setErr} />
+      )}
+
+      {templatesProject && projects.some((p) => p.slug === templatesProject) && (
+        <WorkerTemplatesSheet key={templatesProject} project={projects.find((p) => p.slug === templatesProject)!}
+          onClose={() => setTemplatesProject(null)} />
       )}
 
       {projectSheets.creatingProject && (
@@ -408,12 +481,24 @@ export function App() {
 
       {launchOpen && (
         <LaunchSheet
+          key={resumeAgentId ?? 'new'}
           projects={projects}
           agents={snap.agents}
           defaultProject={launchProject ?? selectedProject}
-          onClose={() => { setLaunchOpen(false); setLaunchProject(null); }}
+          resumeAgentId={resumeAgentId ?? undefined}
+          resumeAliases={resumeAliases}
+          onClose={() => { setLaunchOpen(false); setLaunchProject(null); setResumeAgentId(null); setResumeAliases([]); }}
         />
       )}
+
+      {agentPanelId && <AgentPanel key={agentPanelId} agentId={agentPanelId} agents={snap.agents} projects={projects} tick={taskTick}
+        onClose={() => setAgentPanelId(current => current === agentPanelId ? null : current)} onChanged={refreshSnap}
+        onMessage={agent => { setAgentPanelId(null); void onAgent(agent); }}
+        onClear={agent => { setAgentPanelId(null); agentConfirm.setAgentConfirm({ name: agent.name, kind: 'clear' }); }}
+        onResume={(agent, aliases) => { setAgentPanelId(null); setResumeAgentId(agent.id); setResumeAliases(aliases);
+          setLaunchProject(agent.project); setLaunchOpen(true); }}
+        onOpenTask={item => { setAgentPanelId(null); navigate({ kind: 'tasks', project: item.project }); }}
+        onOpenThread={item => { setAgentPanelId(null); navigate({ kind: 'channel', id: item.task.channelId, thread: item.task.id }); }} />}
 
       {agentConfirm.agentConfirm && (
         <AgentConfirmSheet target={agentConfirm.agentConfirm} busy={agentConfirm.agentBusy}

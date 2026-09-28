@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { terminalSessionName } from "../src/shared/terminal-session.ts";
 import { launchEnvironmentProblem } from "../src/shared/launch-environment.ts";
+import { workerSecretNameProblem } from "../src/shared/worker-templates.ts";
 import { hashFor, parseHash, type Sel } from "./selection.ts";
 
 // Hivemind.app on the Mac (macos/) and the iPhone/iPad app (ios/) load this UI
@@ -90,6 +91,9 @@ export type NativeMessage =
    * the device session). The app renews it with its device token and installs the new cookie; the page just retries.
    */
   | { type: "device-session-expired" }
+  /** Native app forwards approval decisions over its verified broker and signed launcher channel. */
+  | { type: "launcher-approve"; id: string; requestId: string; templateId?: string }
+  | { type: "launcher-reject"; id: string; requestId: string }
   | TerminalMessage;
 
 /** Posts to the app; false in a browser or when WebKit refuses the message. */
@@ -292,6 +296,8 @@ export type TerminalSessionLaunch = {
    * same private file as `secrets`, never argv. Ignored when the launch reuses a running session. Absent when none.
    */
   environment?: Record<string, string>;
+  /** The worker template launched: Hivemind Server adds the template's secrets from its Keychain (docs/terminal-broker.md#template-secrets). */
+  template?: string;
 };
 
 /** Page → app. `id` is the page's own request id (1–64 chars), echoed on the answer. */
@@ -321,7 +327,15 @@ export type TerminalMessage =
   | { type: "terminal-kill"; id?: string; sessions: string[] }
   /** terminal-status and sessions now, then sessions on every change. */
   | { type: "sessions-subscribe" }
-  | { type: "sessions-unsubscribe" };
+  | { type: "sessions-unsubscribe" }
+  /**
+   * Worker template secrets, kept by Hivemind Server.app in the Keychain (docs/worker-templates.md#secrets). Each is
+   * answered with template-secrets (the template's secret names, never a value) or terminal-error.
+   */
+  | { type: "template-secrets-list"; id: string; template: string }
+  | { type: "template-secrets-set"; id: string; template: string; name: string; value: string }
+  /** `name` null: every secret of the template. */
+  | { type: "template-secrets-delete"; id: string; template: string; name: string | null };
 
 export type TerminalSessionInfo = {
   name: string;
@@ -354,6 +368,10 @@ export type TerminalEvent =
   | { type: "terminal-killed"; id: string | null; session: string }
   /** The answer to a batch terminal-kill: the sessions that ended, in order, and why the others did not. */
   | { type: "terminal-killed"; id: string | null; sessions: string[]; errors: TerminalKillFailure[] }
+  /** A template's secret names, answering a template-secrets-* message. */
+  | { type: "template-secrets"; id: string | null; template: string; names: string[] }
+  /** The broker relayed a signed Human decision to the launcher channel. */
+  | { type: "launcher-decided"; id: string; requestId: string; action: "approve" | "reject" }
   /** `code` is a BrokerErrorCode (bad-message, no-such-session, tmux-missing, …). */
   | { type: "terminal-error"; id: string | null; code: string; message: string; stream: number | null };
 
@@ -371,6 +389,17 @@ function sessionInfo(value: unknown): TerminalSessionInfo | null {
       !Number.isInteger(value.attached) || (value.attached as number) < 0 || typeof value.createdAt !== "number" ||
       !Number.isFinite(value.createdAt)) return null;
   return { name, project, agent, alive: value.alive, attached: value.attached as number, createdAt: value.createdAt };
+}
+
+/** A worker template's id as the server issues it (crypto.randomUUID). */
+const TEMPLATE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/** Why a template secret's name would be refused (the app's TemplateSecrets.isValidName), or null. */
+export const templateSecretNameProblem = workerSecretNameProblem;
+
+/** Why the app would refuse a template secret's value (the OpenCode Go API key's rule), or null. Never quotes it. */
+export function templateSecretValueProblem(value: string): string | null {
+  return SECRET_VALUE.test(value) ? null : "A secret is 1–512 printable ASCII characters, without spaces.";
 }
 
 /** A terminal event the page can act on, or null for anything unknown or malformed. */
@@ -423,6 +452,16 @@ export function parseTerminalEvent(detail: unknown): TerminalEvent | null {
       const session = terminalSessionName(detail.session);
       return session ? { type: "terminal-killed", id, session } : null;
     }
+    case "template-secrets": {
+      const { template, names } = detail;
+      if (typeof template !== "string" || !TEMPLATE_ID.test(template)) return null;
+      if (!Array.isArray(names) || !names.every(name => typeof name === "string" && templateSecretNameProblem(name) === null)) return null;
+      return { type: "template-secrets", id, template, names: names as string[] };
+    }
+    case "launcher-decided":
+      return id !== null && typeof detail.requestId === "string" && detail.requestId.length > 0 &&
+        (detail.action === "approve" || detail.action === "reject")
+        ? { type: "launcher-decided", id, requestId: detail.requestId, action: detail.action } : null;
     case "terminal-error": {
       const stream = nullableStream(detail.stream);
       return typeof detail.code === "string" && typeof detail.message === "string" && stream !== undefined
@@ -513,6 +552,7 @@ export function terminalSessionLaunchProblem(launches: readonly TerminalSessionL
       const problem = launchEnvironmentProblem(launch.environment);
       if (problem) return problem;
     }
+    if (launch.template !== undefined && !TEMPLATE_ID.test(launch.template)) return "Not a worker template";
     const cwd = launch.cwd;
     if (cwd && (!(cwd.startsWith("/") || cwd === "~" || cwd.startsWith("~/")) || cwd.includes("\0") ||
         utf8Length(cwd) > limits.pathBytes)) {
@@ -529,7 +569,7 @@ export function terminalSessionLaunchProblem(launches: readonly TerminalSessionL
 
 /** The launches as a terminal-launch message carries them: absent fields left out. */
 export function terminalLaunchItems(launches: readonly TerminalSessionLaunch[]) {
-  return launches.map(({ project, agent, title, cwd, command, session, secrets, environment }) =>
+  return launches.map(({ project, agent, title, cwd, command, session, secrets, environment, template }) =>
     ({ project, agent, title, ...(cwd ? { cwd } : {}), command, ...(session ? { session } : {}), ...(secrets ? { secrets } : {}),
-      ...(environment ? { environment } : {}) }));
+      ...(environment ? { environment } : {}), ...(template ? { template } : {}) }));
 }

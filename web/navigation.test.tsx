@@ -44,10 +44,11 @@ function fixture(t: TestContext) {
   return { hive, human, home, other };
 }
 
-async function mount(t: TestContext, hive: Hive, hash: string) {
+async function mount(t: TestContext, hive: Hive, hash: string, onFetch?: (url: string, init?: RequestInit) => void) {
   const app = createApp(hive);
   window.happyDOM.setURL(`http://localhost/${hash}`);
   t.mock.method(globalThis, 'fetch', async (url: string, init?: RequestInit) => {
+    onFetch?.(url, init);
     if (url === '/api/ui/session') return Response.json({ ok: true });
     return app.request(url, init);
   });
@@ -55,7 +56,12 @@ async function mount(t: TestContext, hive: Hive, hash: string) {
   globalThis.WebSocket = BrowserSocket as unknown as typeof WebSocket;
   const events = ['message', 'agent', 'channel', 'task', 'queued', 'room'] as const;
   const listeners = events.map(type => {
-    const listener = (payload: unknown) => BrowserSocket.current?.event(type, payload);
+    const listener = (payload: unknown) => {
+      BrowserSocket.current?.event(type, payload);
+      // serve.ts sends a complete work map after each committed task or room event.
+      if (type === 'task' || type === 'room')
+        BrowserSocket.current?.event('agent-work', { agentWork: hive.tasks.workStatus() });
+    };
     hive.bus.on(type, listener); return listener;
   });
   const host = document.createElement('div'); document.body.append(host);
@@ -74,6 +80,31 @@ async function mount(t: TestContext, hive: Hive, hash: string) {
   return { host, sidebar, railButton, navButton };
 }
 
+test('Human changes only a brain launch mode through the saved PATCH route', async t => {
+  const { hive, home } = fixture(t);
+  const brain = hive.identity.join({ role: 'brain', project: home.slug }).agent;
+  const worker = hive.identity.join({ role: 'worker', project: home.slug, seniority: 'mid' }).agent;
+  const calls: Array<{ method: string; body: unknown }> = [];
+  const view = await mount(t, hive, `#/inbox/${home.slug}`, (url, init) => {
+    if (url === `/api/ui/agents/${brain.name}/launch-mode`)
+      calls.push({ method: init?.method ?? 'GET', body: JSON.parse(String(init?.body ?? 'null')) });
+  });
+  const row = (name: string) => [...view.host.querySelectorAll<HTMLElement>('.person')]
+    .find(item => item.querySelector('.pn')?.textContent === name)!;
+  assert.equal(hive.identity.getAgent(brain.id).launchMode, 'approval');
+  assert.match(row(brain.name).textContent!, /Approval/);
+  await act(async () => row(brain.name).querySelector<HTMLButtonElement>('.kebab')!.click());
+  const toggle = row(brain.name).querySelector<HTMLButtonElement>('[role="menuitemcheckbox"]')!;
+  assert.equal(toggle.getAttribute('aria-checked'), 'false');
+  await act(async () => toggle.click());
+  await settle();
+  assert.deepEqual(calls, [{ method: 'PATCH', body: { mode: 'auto' } }]);
+  assert.equal(hive.identity.getAgent(brain.id).launchMode, 'auto');
+  assert.match(row(brain.name).textContent!, /Auto/);
+  await act(async () => row(worker.name).querySelector<HTMLButtonElement>('.kebab')!.click());
+  assert.equal(row(worker.name).querySelector('[role="menuitemcheckbox"]'), null);
+});
+
 // happy-dom's event classes are not the DOM lib's; dispatch them untyped.
 const fire = (target: EventTarget, event: unknown) => target.dispatchEvent(event as Event);
 const keydown = (init: Record<string, unknown>) => new window.KeyboardEvent('keydown', { bubbles: true, ...init });
@@ -90,7 +121,8 @@ test('the project rail shows one project at a time and remembers the selection i
   localStorage.clear();
   const view = await mount(t, hive, `#/inbox/${home.slug}`);
   const rail = view.host.querySelector('nav.project-rail')!;
-  assert.equal(rail.querySelectorAll('.rail-project').length, 2, 'one icon per project');
+  assert.equal(rail.querySelectorAll('.rail-project').length, 3, 'one icon per project plus All tasks');
+  assert.ok(rail.querySelector('button[aria-label="All tasks"]'));
   assert.equal(view.railButton(new RegExp(home.name))?.getAttribute('aria-current'), 'page');
   assert.equal(view.sidebar().querySelector('.project-head h2')?.textContent, home.name, 'the sidebar shows only the selected project');
   assert.equal(view.navButton(/# other-room/), undefined);
@@ -184,17 +216,36 @@ test('the roster says what each agent is doing, and the sidebar has no Decisions
   assert.equal(view.navButton(/^Decisions/), undefined, 'the Human decision queue was removed');
   const status = (agent: Agent) => [...view.sidebar().querySelectorAll('.person')]
     .find(row => row.querySelector('.pn')?.textContent === agent.name)?.querySelector('.person-status')?.textContent;
-  assert.equal(status(worker), 'idle');
+  assert.equal(status(worker), 'offline', 'joining alone does not prove the agent is waiting or working');
 
   let n = 0;
-  const task = hive.tasks.assign(brain, { requestId: 'task', worker: worker.name, contract: { objective: 'Draft the API',
-    scope: [], nonGoals: [], acceptanceCriteria: ['Reviewed'], dependencies: [], evidenceSeqs: [] } }).task;
+  let task!: ReturnType<typeof hive.tasks.assign>['task'];
+  await act(async () => { task = hive.tasks.assign(brain, { requestId: 'task', worker: worker.name, contract: { objective: 'Draft the API',
+    scope: [], nonGoals: [], acceptanceCriteria: ['Reviewed'], dependencies: [], evidenceSeqs: [] } }).task; });
   const event = (actor: Agent, action: TaskAction) =>
     hive.tasks.event(actor, task.id, { requestId: `e-${++n}`, expectedRevision: hive.tasks.get(actor, task.id).revision, action });
   await act(async () => { event(worker, { type: 'accept' }); event(worker, { type: 'block', needed: 'API contract' }); });
   await settle();
-  assert.equal(status(worker), 'blocked: API contract');
-  assert.equal(status(brain), 'coordinating 1 task');
+  assert.equal(status(worker), 'offline · blocked: API contract');
+  assert.equal(status(brain), 'offline · coordinating 1 task');
+});
+
+test('project Tasks and rail All tasks open the scoped task views', async t => {
+  const { hive, home } = fixture(t);
+  const brain = hive.identity.join({ role: 'brain', project: home.slug }).agent;
+  const worker = hive.identity.join({ role: 'worker', project: home.slug, seniority: 'mid' }).agent;
+  hive.tasks.assign(brain, { requestId: 'tasks-nav', worker: worker.name, contract: { objective: 'Review the task navigation',
+    scope: [], nonGoals: [], acceptanceCriteria: ['Visible'], dependencies: [], evidenceSeqs: [] } });
+  const view = await mount(t, hive, `#/inbox/${home.slug}`);
+  await act(async () => view.navButton(/^Tasks$/)!.click());
+  await settle();
+  assert.equal(window.location.hash, `#/tasks/${home.slug}`);
+  assert.match(view.host.querySelector('main.desk')!.textContent!, /Review the task navigation/);
+  await act(async () => view.railButton(/^All tasks$/)!.click());
+  await settle();
+  assert.equal(window.location.hash, '#/tasks');
+  assert.equal(view.host.querySelector('main.desk h1')?.textContent, 'All tasks');
+  assert.match(view.host.querySelector('main.desk')!.textContent!, /Review the task navigation/);
 });
 
 test('the page title counts what is waiting for the Human', async t => {

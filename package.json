@@ -1,6 +1,6 @@
 {
   "name": "hivemind",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": true,
   "type": "module",
   "description": "Local hive for Human, brains, and workers",
@@ -91,6 +91,8 @@
     "CONTRIBUTING.md",
     "TESTING.md",
     "docs",
+    "!docs/images/*.png",
+    "!docs/images/*.gif",
     "LICENSE",
     "NOTICE"
   ],

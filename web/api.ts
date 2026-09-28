@@ -2,7 +2,8 @@ import type { JevCall, JevCallLogView } from '../src/shared/jev-calls.ts';
 import type { EvidenceCollectorHealth } from '../src/shared/evidence-health.ts';
 import type { RoutingRequest, RoutingSuggestions } from '../src/shared/routing.ts';
 import type { TelegramHealth } from "./telegram-health.ts";
-import type { Agent, BotCredentialView, AttachmentMeta, Channel, Message, Project, SearchHit, Thread, ThreadStatus, InboxStatus } from "../src/shared/types.ts";
+import type { WorkerTemplate, WorkerTemplateSpec } from "../src/shared/worker-templates.ts";
+import type { Agent, AgentTrafficView, BotCredentialView, AttachmentMeta, Channel, Message, Project, SearchHit, Thread, ThreadStatus, InboxStatus } from "../src/shared/types.ts";
 import type { ActivityPage, ActivityReason, MentionPage, ReadSnapshot } from "../src/shared/read-state.ts";
 import { resolveUploadMime } from "../src/shared/mime.ts";
 import type { LaunchContext } from "../src/shared/launch-prompt.ts";
@@ -10,9 +11,13 @@ import type { ProjectBotConfiguration, SettingsValues } from "../src/shared/bot-
 import type { BotAccess } from '../src/shared/bot-capabilities.ts';
 import { humanSession, connectHumanWs } from "./human-session.ts";
 import type { AgentWork, ChannelTaskPage, TaskSnapshot } from '../src/shared/tasks.ts';
+import type { TaskControlInput } from '../src/shared/task-control.ts';
+import type { TaskOverview, TaskViewsPage } from '../src/shared/task-views.ts';
 import type { RoomView, Room } from '../src/shared/rooms.ts';
 import type { TimelineExport, TimelineView } from '../src/shared/timeline.ts';
 import type { AdaptiveRoutingView } from '../src/shared/adaptive-topology.ts';
+import type { AgentOverview, AgentRemoveImpact, AgentLifecycleEvent } from '../src/shared/agent-management.ts';
+import type { CapabilityCard, CapabilityView } from '../src/shared/routing.ts';
 
 export class ApiError extends Error {
   /** `body` is the parsed error response, for errors that carry more than a message (e.g. a thread's real channel). */
@@ -38,9 +43,35 @@ export type Snapshot = ReadSnapshot & {
   archivedChannelIds?: string[];
   queued: Record<string, number>;
   inbox?: Record<string, InboxStatus>;
+  /** Complete current work per agent. Optional while old fixtures and servers are upgraded. */
+  agentWork?: Record<string, AgentWork>;
+  /** Bytes the agent API returned per brain/worker since the server started. */
+  agentTraffic?: Record<string, AgentTrafficView>;
   telegram?: { running: boolean; configured: boolean } & TelegramHealth;
   /** Whether Jev adaptive routing is on; the Routing log is offered only then. */
   jev?: { enabled: boolean };
+  /** A verified Hivemind Server.app can receive launcher commands. */
+  launcherAvailable?: boolean;
+};
+
+export type LaunchRequestView = {
+  id: string;
+  projectId: string;
+  brainId: string;
+  templateId: string;
+  /** Saved with the request so historical cards keep their label after the template is deleted. */
+  templateLabel: string;
+  taskId: string | null;
+  jobId: string | null;
+  agentId: string;
+  state: "awaiting_approval" | "approved" | "launching" | "launched" | "failed" | "rejected" | "cancelled" | "expired";
+  reason: string | null;
+  requestedAt: number;
+  decidedBy: string | null;
+  decidedAt: number | null;
+  session: string | null;
+  error: string | null;
+  capBlocked: boolean;
 };
 
 export type ProjectBotsView = {
@@ -130,7 +161,7 @@ export const api = {
   recordRoutingChoice: (id: string, body: { expectedRevision: number; workerId: string; reason: string; requestId: string }, signal?: AbortSignal) => req<{ assigned: false }>(`/api/ui/tasks/${encodeURIComponent(id)}/routing-override`, { method: 'POST', body: JSON.stringify(body), signal }),
   botCredential: (project: string, bot: string) => req<BotCredentialView>(
     `/api/ui/projects/${encodeURIComponent(project)}/bots/${encodeURIComponent(bot)}/credential`),
-  projectBots: (project: string) => req<ProjectBotsView>(`/api/ui/projects/${encodeURIComponent(project)}/bots`),
+  projectBots: (project: string, signal?: AbortSignal) => req<ProjectBotsView>(`/api/ui/projects/${encodeURIComponent(project)}/bots`, { signal }),
   setBotAccess: (project: string, bot: string, access: Omit<BotAccess, 'revision'> & { expectedRevision: number }) =>
     req<BotAccess>(`/api/ui/projects/${encodeURIComponent(project)}/bots/${encodeURIComponent(bot)}/access`, { method: 'PUT', body: JSON.stringify(access) }),
   setupBot: (project: string, name: string, definitionId: string) => req<{ bot: Agent; connected: boolean; error?: string }>(
@@ -144,6 +175,15 @@ export const api = {
       { method: 'POST', body: JSON.stringify({ action, expectedRevision }) }),
   channelTasks: (channel: string, signal?: AbortSignal) =>
     req<ChannelTaskPage>(`/api/ui/channels/${encodeURIComponent(channel)}/tasks`, { signal }),
+  tasks: (project: string | null, cursor?: string | null, signal?: AbortSignal) => {
+    const query = new URLSearchParams();
+    if (project) query.set('project', project);
+    if (cursor) query.set('cursor', cursor);
+    return req<TaskViewsPage>(`/api/ui/tasks${query.size ? `?${query}` : ''}`, { signal });
+  },
+  task: (id: string, signal?: AbortSignal) => req<{ item: TaskOverview }>(`/api/ui/tasks/${encodeURIComponent(id)}`, { signal }),
+  controlTask: (id: string, body: TaskControlInput) =>
+    req<{ task: TaskSnapshot }>(`/api/ui/tasks/${encodeURIComponent(id)}/control`, { method: 'POST', body: JSON.stringify(body) }),
   room: (channel: string) => req<RoomView>(`/api/ui/channels/${encodeURIComponent(channel)}/room`),
   roomHistory: (channel: string, before?: number) => req<{ history: Room[] }>(`/api/ui/channels/${encodeURIComponent(channel)}/room/history?before=${before ?? Number.MAX_SAFE_INTEGER}`),
   roomEvent: (channel: string, body: unknown) => req<RoomView>(`/api/ui/channels/${encodeURIComponent(channel)}/room`, { method: 'POST', body: JSON.stringify(body) }),
@@ -155,6 +195,19 @@ export const api = {
   saveProjectBotConfiguration: (slug: string, id: string, body: { enabled: boolean; values: SettingsValues; expectedRevision: number }) =>
     req<{ configuration: ProjectBotConfiguration }>(`/api/ui/projects/${encodeURIComponent(slug)}/bots/catalog/${encodeURIComponent(id)}`,
       { method: "PUT", body: JSON.stringify(body) }),
+  workerTemplates: (project: string) =>
+    req<{ templates: WorkerTemplate[] }>(`/api/ui/projects/${encodeURIComponent(project)}/worker-templates`),
+  launchRequests: () => req<{ requests: LaunchRequestView[] }>("/api/ui/launch-requests"),
+  createWorkerTemplate: (project: string, body: { slug: string; spec: WorkerTemplateSpec }) =>
+    req<WorkerTemplate>(`/api/ui/projects/${encodeURIComponent(project)}/worker-templates`, { method: "POST", body: JSON.stringify(body) }),
+  updateWorkerTemplate: (id: string, body: { expectedRevision: number; slug?: string; spec: WorkerTemplateSpec }) =>
+    req<WorkerTemplate>(`/api/ui/worker-templates/${encodeURIComponent(id)}`, { method: "PUT", body: JSON.stringify(body) }),
+  /** A reserved worker and its single-use launch ticket (docs/identity-lifecycle.md#reserved-workers). */
+  reserveWorker: (id: string, label: string | null) =>
+    req<{ agent: Agent; ticket: string }>(`/api/ui/worker-templates/${encodeURIComponent(id)}/reserve`,
+      { method: "POST", body: JSON.stringify({ label }) }),
+  deleteWorkerTemplate: (id: string, revision: number) =>
+    req<{ ok: true }>(`/api/ui/worker-templates/${encodeURIComponent(id)}?revision=${revision}`, { method: "DELETE" }),
   createBot: (projectId: string, name: string) => req<{ bot: Agent; token: string }>(
     `/api/ui/projects/${encodeURIComponent(projectId)}/bots`, { method: "POST", body: JSON.stringify({ name }) },
   ),
@@ -193,6 +246,29 @@ export const api = {
     req<{ ok: true }>(`/api/ui/projects/${encodeURIComponent(slug)}`, { method: "DELETE" }),
   removeAgent: (name: string) =>
     req<{ ok: true; name: string }>(`/api/ui/agents/${encodeURIComponent(name)}`, { method: "DELETE" }),
+  agentOverview: (id: string, signal?: AbortSignal) =>
+    req<AgentOverview>(`/api/ui/agents/${encodeURIComponent(id)}/overview`, { signal }),
+  editAgentIdentity: (id: string, body: { expectedRevision: number; name?: string; focus?: string | null;
+    seniority?: 'junior' | 'mid' | 'senior' }) =>
+    req<{ agent: Agent; identityRevision: number }>(`/api/ui/agents/${encodeURIComponent(id)}/identity`,
+      { method: 'PATCH', body: JSON.stringify(body) }),
+  editAgentCapability: (id: string, body: { expectedRevision: number; card: CapabilityCard }) =>
+    req<{ capability: CapabilityView & { lastEditorId: string | null } }>(
+      `/api/ui/agents/${encodeURIComponent(id)}/capability`, { method: 'PUT', body: JSON.stringify(body) }),
+  agentRemoveImpact: (id: string) => req<AgentRemoveImpact>(
+    `/api/ui/agents/${encodeURIComponent(id)}/remove-impact`),
+  removeAgentWithImpact: (id: string, impactToken: string) =>
+    req<{ agent: Agent }>(`/api/ui/agents/${encodeURIComponent(id)}/remove`,
+      { method: 'POST', body: JSON.stringify({ impactToken }) }),
+  agentLifecycle: (id: string, before?: number) => req<{ items: AgentLifecycleEvent[]; hasMore: boolean; nextBefore: number | null }>(
+    `/api/ui/agents/${encodeURIComponent(id)}/lifecycle${before === undefined ? '' : `?before=${before}`}`),
+  agentRuntimeEvent: (id: string, kind: 'stop_requested' | 'stop_observed', session: string) =>
+    req<{ event: AgentLifecycleEvent }>(`/api/ui/agents/${encodeURIComponent(id)}/runtime-event`,
+      { method: 'POST', body: JSON.stringify({ kind, session }) }),
+  setAgentLaunchMode: (name: string, mode: "approval" | "auto") =>
+    req<{ agent: Agent }>(`/api/ui/agents/${encodeURIComponent(name)}/launch-mode`, {
+      method: "PATCH", body: JSON.stringify({ mode }),
+    }),
   telegram: () => req<TelegramSettings>("/api/ui/telegram"),
   saveTelegram: (body: {
     botToken?: string;

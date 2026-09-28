@@ -15,7 +15,7 @@ export const INSTANCE_PROOF_CONTEXT = "hivemind-instance-v1";
 const HEX_32_BYTES = /^[0-9a-f]{64}$/;
 
 /**
- * Reads the instance secret once and deletes it from the environment, so nothing this server spawns (plugins,
+ * Reads the instance secret once and deletes it from the environment, so nothing this server spawns (bots,
  * agents, tmux via the CLI) inherits it. A value that is not 64 lowercase hex characters is dropped as if unset;
  * the value itself is never printed.
  */

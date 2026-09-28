@@ -17,17 +17,19 @@ export function ProjectBots({ project, initialBot, onClose, onChanged }: {
   const [selected, setSelected] = useState(initialBot ?? '');
   const [working, setWorking] = useState(false), [childWorking, setBusy] = useState(false), [loading, setLoading] = useState(true);
   const [error, setError] = useState(''), [notice, setNotice] = useState('');
-  const busy = working || childWorking || loading;
+  const dismissBlocked = working || childWorking;
+  const busy = dismissBlocked || loading;
   const [reload, setReload] = useState(0);
   const mounted = useRef(true);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   useEffect(() => {
     let active = true;
+    const controller = new AbortController();
     setLoading(true);
-    api.projectBots(project.id).then(result => { if (active) setView(result); })
+    api.projectBots(project.id, controller.signal).then(result => { if (active) setView(result); })
       .catch(error => { if (active) { setView(null); setError(error.message); } })
       .finally(() => { if (active) setLoading(false); });
-    return () => { active = false; };
+    return () => { active = false; controller.abort(); };
   }, [project.id, reload]);
   const refresh = () => { setLoading(true); setReload(value => value + 1); onChanged(); };
   const run = async (action: () => Promise<void>) => {
@@ -38,7 +40,7 @@ export function ProjectBots({ project, initialBot, onClose, onChanged }: {
     finally { if (mounted.current) setWorking(false); }
   };
   const current = view?.bots.find(entry => entry.bot.id === selected);
-  return <Modal onClose={() => { if (!busy) onClose(); }}>
+  return <Modal onClose={() => { if (!dismissBlocked) onClose(); }}>
     <div className="sheet sheet-wide bots-sheet" role="dialog" aria-modal="true" aria-label={`Bots for ${project.name}`} aria-busy={busy}>
       <header><h2>Bots <span className="bot-project">/ {project.name}</span></h2>
         <p>Connect services to this project. Combine capabilities; no agent or AI model is required.</p></header>
@@ -66,7 +68,7 @@ export function ProjectBots({ project, initialBot, onClose, onChanged }: {
             onChanged={refresh} onNotice={setNotice} onSavedDefinition={definition => setView(v => v && ({ ...v, definitions: v.definitions.map(a => a.id === definition.id ? definition : a) }))} />
         </> : <p role="status">Refreshing bot… <button type="button" disabled={busy} onClick={() => setSelected('')}>All bots</button></p>)}
       </div>
-      <div className="row"><button type="button" disabled={busy} onClick={() => { setError(''); refresh(); }}>Refresh</button><button type="button" disabled={busy} onClick={onClose}>Close</button></div>
+      <div className="row"><button type="button" disabled={busy} onClick={() => { setError(''); refresh(); }}>Refresh</button><button type="button" disabled={dismissBlocked} onClick={onClose}>Close</button></div>
     </div>
   </Modal>;
 }
