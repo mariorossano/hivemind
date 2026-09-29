@@ -149,7 +149,7 @@ Everything runs on your Mac. The server listens only on `127.0.0.1`, has no user
 - **Worker templates**: define the CLI, model, task fit and capacity a brain may request. → [Worker templates](docs/worker-templates.md)
 - **Rooms and channel contracts**: ongoing channels or finite rooms with a coordinating brain and versioned rules. → [Rooms](ROOMS.md)
 - **Native apps**: a menu-bar server, a Mac app with agent terminals and notifications, and an iPhone/iPad app over an opt-in, paired remote gateway. → [macOS](docs/macos.md) · [iOS](docs/ios.md)
-- **Telegram, bots and plugins**: a second Human client, observation bots and external plugins per project. → [Telegram](docs/telegram.md) · [Plugins](PLUGINS.md)
+- **Telegram and bots**: a second Human client and external project services with independent Publish, Receive and Tools capabilities, managed in one Bots panel. → [Telegram](docs/telegram.md) · [Composable bots](BOTS.md)
 - **Jev advice** *(experimental, optional, may be removed)*: routing suggestions for brains, off by default. → [Jev advice](docs/guide.md#jev-advice-experimental)
 
 ## Documentation

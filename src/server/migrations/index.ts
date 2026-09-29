@@ -6,6 +6,7 @@ import * as telegram from "./baseline-telegram.ts";
 import { agentTerminalSession } from "./agent-terminal-session.ts";
 import { agentTombstones } from "./agent-tombstones.ts";
 import { dropDecisionRequests } from "./drop-decision-requests.ts";
+import { botCapabilities } from './bot-capabilities.ts';
 import { jevAdvisory } from "./jev-advisory.ts";
 import { performanceRetention } from "./performance-retention.ts";
 import { workerTemplates } from "./worker-templates.ts";
@@ -77,6 +78,15 @@ export const MIGRATIONS: readonly Migration[] = [
   { version: 36, name: "jobs_task_control", up: jobsTaskControl },
   { version: 37, name: "task_view_indexes", up: taskViewIndexes },
   { version: 38, name: "agent_management", up: agentManagement },
+  { version: 39, name: "bot_capabilities", up(db) {
+    // Converge the shipped fork schemas (Bot preview 31 and Bot+terminal 32)
+    // with upstream 31–38 without resetting their version or existing grants.
+    // Fork 32 skipped upstream's worker_templates step; both helpers are
+    // idempotent and preserve existing labels/templates on upstream databases.
+    agentTerminalSession(db);
+    workerTemplates(db);
+    botCapabilities(db);
+  } },
 ];
 
 /** The last idempotent baseline migration; later migrations may assume its schema. */

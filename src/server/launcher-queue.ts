@@ -3,7 +3,7 @@ import { HiveError, type Agent, type Project } from "../shared/types.ts";
 import { buildLaunchCommand, projectLaunchTools } from "../shared/launch-prompt.ts";
 import { terminalSessionName } from "../shared/terminal-session.ts";
 import type { WorkerTemplate } from "../shared/worker-templates.ts";
-import { launchContext } from "./plugins.ts";
+import { launchContext } from "./bot-definitions.ts";
 import type { Core } from "./services/ports.ts";
 import { LauncherQueueCipher } from "./launcher-queue-crypto.ts";
 
@@ -388,7 +388,7 @@ export class LauncherQueue {
         if (!resuming && createHash("sha256").update(ticket!).digest("hex") !== row.ticket_hash)
           throw new HiveError(500, "Launch ticket integrity failed");
         const context = launchContext(this.deps.home, serverUrl, project);
-        if (context.pluginError) throw new HiveError(503, "Project launch context is unavailable");
+        if (context.botError) throw new HiveError(503, "Project launch context is unavailable");
         const built = buildLaunchCommand({ software: template.spec.software, model: template.spec.model,
           effort: template.spec.effort, extraFlags: template.spec.extraFlags,
           ...projectLaunchTools(context, project, "worker"), workspacePath: project.worktree,

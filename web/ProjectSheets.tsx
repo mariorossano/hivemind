@@ -3,12 +3,12 @@ import { api } from "./api.ts";
 import { Modal } from "./Modal.tsx";
 import type { ProjectSheets } from "./use-sheets.ts";
 
-export function ProjectSettingsSheet({ form, project, agents, onPlugins, onWorkerTemplates, refreshSnap, setErr }: {
+export function ProjectSettingsSheet({ form, project, agents, onBots, onWorkerTemplates, refreshSnap, setErr }: {
   form: ProjectSheets;
   /** Slug of the project being edited. */
   project: string;
   agents: Agent[];
-  onPlugins: () => void;
+  onBots: () => void;
   onWorkerTemplates: () => void;
   refreshSnap: () => Promise<unknown>;
   setErr: (error: string) => void;
@@ -45,7 +45,7 @@ export function ProjectSettingsSheet({ form, project, agents, onPlugins, onWorke
         }}
       >
         <h2>Project {project}</h2>
-        <button type="button" className="text-btn" onClick={onPlugins}>Plugins…</button>
+        <button type="button" className="text-btn" onClick={onBots}>Bots…</button>
         <button type="button" className="text-btn" onClick={onWorkerTemplates}>Worker templates…</button>
         <label>
           Name

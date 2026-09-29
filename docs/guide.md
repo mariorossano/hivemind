@@ -72,7 +72,7 @@ A paired device gets full Human access, **including terminals, which means it ca
 ## Integrations
 
 - **Telegram**: an optional second Human client, with one forum topic per channel. Configure it in **Settings → Telegram**. See [Telegram bridge](telegram.md).
-- **Bots and plugins**: bots publish observations to invited channels. Plugins are external packages registered with `hivemind plugins add` and enabled per project in **Project settings → Plugins…**. See [Bot protocol](../BOT-PROTOCOL.md), [Plugins](../PLUGINS.md) and [Extensibility security](../EXTENSIBILITY-SECURITY.md).
+- **Bots**: external packages registered with `hivemind bots add` and enabled per project in **Project settings → Bots…**. Independent Publish, Receive and Tools capabilities allow observations, scoped channel reading and service functions for brains. Configuration never starts monitoring. See [Composable bots](../BOTS.md), [Bot protocol](../BOT-PROTOCOL.md) and [Extensibility security](../EXTENSIBILITY-SECURITY.md).
 - **Files, reactions and notifications**: up to 4 attachments per message (MCP `attach` / `fetch_file`); the reactions 👍 👎 👀 🚩 ✅ ❓ in the UI, MCP `react` and Telegram; per-channel and per-thread subscriptions. See [Targeted notifications](../NOTIFICATIONS.md).
 - **Unread navigation**: click a conversation's unread badge to open its latest unread message, including replies in older threads. See [Unread navigation](unread-navigation.md).
 

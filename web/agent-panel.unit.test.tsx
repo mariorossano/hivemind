@@ -176,7 +176,7 @@ test('fixed Stop waits for native kill acknowledgement before logging the observ
 
 test('targeted fixed resume selects exactly one agent and requires an explicit software choice', async () => {
   const originalContext = api.launchContext;
-  api.launchContext = async () => ({ project: { id: 'p1', slug: 'acme' }, plugins: [], pluginInstructions: '',
+  api.launchContext = async () => ({ project: { id: 'p1', slug: 'acme' }, botDefinitions: [], botInstructions: '',
     hivemindMcp: { command: 'hivemind', args: ['mcp'], env: {} } });
   const host = document.createElement('div'); document.body.append(host);
   const root = createRoot(host as unknown as Element);

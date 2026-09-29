@@ -115,8 +115,8 @@ export function WorkerTemplatesSheet({ project, onClose }: { project: Project; o
               <p className="help-p">No templates yet. Add one for each kind of worker brains should be able to launch.</p>
             )}
             {templates?.map(template => (
-              <section key={template.id} className="plugin-card" aria-label={template.spec.label}>
-                <div className="plugin-heading">
+              <section key={template.id} className="bot-settings-card" aria-label={template.spec.label}>
+                <div className="bot-settings-heading">
                   <strong>{template.spec.label}</strong>
                   <code>{template.slug}</code>
                   <span>{template.spec.enabled ? describe(template.spec) : `Disabled · ${describe(template.spec)}`}</span>

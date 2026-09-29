@@ -90,10 +90,10 @@ export function AgentList({
       )}
       {brains.map((a) => row(a, false))}
       {workers.map((a) => row(a, true))}
-      <div className="group-h bot-h" title="Integrations that post updates into channels. Bots never take tasks.">
+      <div className="group-h bot-h" title="Services with Publish, Receive and Tools capabilities. Bots never take agent tasks.">
         <span>Bots</span>
-        <button type="button" className="plus" title={`Create bot in ${projectName}`}
-          aria-label={`Create bot in ${projectName}`} onClick={onCreateBot}><Plus size={14} aria-hidden="true" /></button>
+        <button type="button" className="plus" title={`Manage bots in ${projectName}`}
+          aria-label={`Manage bots in ${projectName}`} onClick={onCreateBot}><Plus size={14} aria-hidden="true" /></button>
       </div>
       {bots.map((a) => (
         <PersonRow key={a.id} agent={a} onOpen={() => undefined} self status={botChannels[a.id]}
@@ -235,9 +235,9 @@ function PersonRow({
           onKeyDown={(event) => menuKeyDown(event, actionRef, () => onCloseMenu?.())}>
           {onPanel && <button type="button" role="menuitem" onClick={onPanel}>Agent details</button>}
           {onManageCredential && (
-            <button type="button" role="menuitem" aria-label={`Manage credentials for ${agent.name}`}
+            <button type="button" role="menuitem" aria-label={`Manage bot ${agent.name}`}
               onClick={() => { onCloseMenu?.(); onManageCredential(); }}>
-              Credentials
+              Manage bot
             </button>
           )}
           {onAskClear && (

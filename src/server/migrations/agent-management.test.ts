@@ -37,6 +37,10 @@ test('agent_management upgrades populated v37 identities and cards without chang
   rerunMigration(db, 'agent_management');
   assert.deepEqual(listRows(db, 'agent_name_aliases'), savedAlias);
   assert.deepEqual(listRows(db, 'agent_lifecycle_events'), savedEvent);
+  assert.deepEqual(applyMigrations(db, { target: VERSION }), []);
+  applyMigrations(db);
+  assert.deepEqual(listRows(db, 'agent_name_aliases'), savedAlias);
+  assert.deepEqual(listRows(db, 'agent_lifecycle_events'), savedEvent);
   assert.deepEqual(applyMigrations(db), []);
   assert.equal(schemaVersion(db), LATEST_VERSION);
 });

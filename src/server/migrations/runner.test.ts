@@ -122,7 +122,7 @@ test("a populated current-main (user_version 2) hive upgrades with every row and
   const rewritten = ["adaptive_topology_executions", "adaptive_topology_events", "agents", "task_records", "worker_capabilities"];
   // #217 (performance_retention) adds the per-message receipt index, backfilled from the delivery ledger;
   // worker_templates (#276) adds an empty table.
-  const added = ["inbox_receipts", "worker_templates", "launch_requests", "launcher_commands", "jobs", "job_events",
+  const added = ["inbox_receipts", "bot_access", "worker_templates", "launch_requests", "launcher_commands", "jobs", "job_events",
     "agent_name_aliases", "agent_lifecycle_events"];
   type AgentRow = { id: string; token_hash: string; removed_at?: number | null; terminal_session?: string | null };
   const beforeAgents = before.rows.agents as AgentRow[], afterAgents = after.rows.agents as AgentRow[];

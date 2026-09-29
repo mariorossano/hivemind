@@ -91,7 +91,7 @@ function schemaFor(path: string, method: string): z.ZodType | undefined {
   // Only the envelope here: WorkerTemplateStore validates the spec itself, reporting each field's reason.
   if (/^\/api\/ui\/projects\/[^/]+\/worker-templates$/.test(path) || /^\/api\/ui\/worker-templates\/[^/]+$/.test(path)) return workerTemplateEnvelope;
   if (/\/(?:ping|leave)$/.test(path) || /\/(?:retry|discard)$/.test(path)) return empty;
-  // Bot/plugin/recovery schemas have their own narrower ingress readers.
+  // Bot/configuration/recovery schemas have their own narrower ingress readers.
   return undefined;
 }
 /** Agent coordination routes where older clients may still send the removed `executionId` (#211, #218). */

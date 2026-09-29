@@ -7,7 +7,7 @@ import { api } from "./api.ts";
 import { ChannelDesk } from "./ChannelDesk.tsx";
 import { CreateChannelSheet, InviteSheet } from "./ChannelSheets.tsx";
 import { useDesktopNotifications } from "./desktop-notifications.ts";
-import { AgentConfirmSheet, BotSheet, CredentialSheet, HelpSheet } from "./HiveSheets.tsx";
+import { AgentConfirmSheet, HelpSheet } from "./HiveSheets.tsx";
 import { AgentPanel } from './AgentPanel.tsx';
 import { Inbox } from "./Inbox.tsx";
 import { JevLog } from "./JevLog.tsx";
@@ -18,7 +18,7 @@ import { channelBack, mobileScreen, mobileTab, tabTarget, useMobile } from "./mo
 import { MobileDms, MobileTabs, projectDms } from "./MobileNav.tsx";
 import { useNativeBridge } from "./native-bridge.ts";
 import { attentionTotal, documentTitle, loadSelectedProject, projectLanding, saveProjectView, saveSelectedProject, type SwitchItem } from "./nav-model.ts";
-import { ProjectPlugins } from "./ProjectPlugins.tsx";
+import { ProjectBots } from "./ProjectBots.tsx";
 import { WorkerTemplatesSheet } from "./WorkerTemplates.tsx";
 import { ProjectRail } from "./ProjectRail.tsx";
 import { CreateProjectSheet, ProjectSettingsSheet } from "./ProjectSheets.tsx";
@@ -149,10 +149,7 @@ export function App() {
   const telegramSheet = useTelegramSheet(setErr);
   const agentConfirm = useAgentConfirm(refreshSnap, setErr);
   const [botProject, setBotProject] = useState<string | null>(null);
-  const [botBusy, setBotBusy] = useState(false);
   const [credentialBot, setCredentialBot] = useState<Agent | null>(null);
-  const [credentialBusy, setCredentialBusy] = useState(false);
-  const [pluginsProject, setPluginsProject] = useState<string | null>(null);
   const [templatesProject, setTemplatesProject] = useState<string | null>(null);
   const [helpOpen, setHelpOpen] = useState(false);
   const [adaptiveRoutingOpen, setAdaptiveRoutingOpen] = useState(false);
@@ -296,7 +293,8 @@ export function App() {
         }}
         dms={dms}
         agentActions={{
-          onAgent, onOpenPanel: agent => setAgentPanelId(agent.id), onCreateBot: setBotProject, onManageBot: setCredentialBot,
+          onAgent, onOpenPanel: agent => setAgentPanelId(agent.id),
+          onCreateBot: id => { setCredentialBot(null); setBotProject(id); }, onManageBot: bot => { setCredentialBot(bot); setBotProject(bot.projectId!); },
           onAskAgent: (name, kind) => kind === 'remove'
             ? setAgentPanelId(snap.agents.find(agent => agent.name === name)?.id ?? null)
             : agentConfirm.setAgentConfirm({ name, kind }),
@@ -426,14 +424,10 @@ export function App() {
       )}
 
       {botProject && projects.some((p) => p.id === botProject) && (
-        <BotSheet project={projects.find((p) => p.id === botProject)!} busy={botBusy} onBusy={setBotBusy}
-          onCreated={() => { void refreshSnap().catch((e) => setErr(String(e.message || e))); }}
-          onClose={() => setBotProject(null)} />
+        <ProjectBots key={botProject} project={projects.find((p) => p.id === botProject)!} initialBot={credentialBot?.id}
+          onChanged={() => { void refreshSnap().catch((e) => setErr(String(e.message || e))); }}
+          onClose={() => { setBotProject(null); setCredentialBot(null); }} />
       )}
-
-      {credentialBot && snap.agents.some(a => a.id === credentialBot.id) &&
-        <CredentialSheet bot={credentialBot} busy={credentialBusy} onBusy={setCredentialBusy}
-          onClose={() => setCredentialBot(null)} />}
 
       {channelSheets.inviteOpen && activeChannel && (
         <InviteSheet form={channelSheets} channel={activeChannel} agents={snap.agents}
@@ -446,18 +440,13 @@ export function App() {
 
       {projectSheets.editingProject && (
         <ProjectSettingsSheet form={projectSheets} project={projectSheets.editingProject} agents={snap?.agents ?? []}
-          onPlugins={() => setPluginsProject(projectSheets.editingProject)}
+          onBots={() => { setCredentialBot(null); setBotProject(projects.find(p => p.slug === projectSheets.editingProject)!.id); projectSheets.setEditingProject(null); }}
           onWorkerTemplates={() => setTemplatesProject(projectSheets.editingProject)} refreshSnap={refreshSnap} setErr={setErr} />
       )}
 
       {templatesProject && projects.some((p) => p.slug === templatesProject) && (
         <WorkerTemplatesSheet key={templatesProject} project={projects.find((p) => p.slug === templatesProject)!}
           onClose={() => setTemplatesProject(null)} />
-      )}
-
-      {pluginsProject && projects.some((p) => p.slug === pluginsProject) && (
-        <ProjectPlugins key={pluginsProject} project={projects.find((p) => p.slug === pluginsProject)!}
-          onClose={() => setPluginsProject(null)} />
       )}
 
       {projectSheets.creatingProject && (

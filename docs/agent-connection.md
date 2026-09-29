@@ -166,7 +166,7 @@ npx tsx src/cli.ts doctor
 
 `clear_context` cannot reset the Codex/Claude/Cursor runtime. It tells the worker to drop task memory and `wait`. Never send it automatically at `done`.
 
-Run `npx tsx src/cli.ts help` for the full command list (tasks, rooms, subscriptions, search, plugins).
+Run `npx tsx src/cli.ts help` for the full command list (tasks, rooms, subscriptions, search, bots).
 
 ## Host discovery and role visibility
 

@@ -12,6 +12,7 @@ import { childEnv } from '../test-support/child-process.ts';
 import { configuredToolRole } from './index.ts';
 
 const BRAIN_ONLY = [
+  'bot_tools', 'call_bot_tool',
   'assign_task', 'job_event', 'worker_templates', 'request_worker', 'release_worker',
   'worker_match_suggest', 'worker_match_outcome', 'worker_match_override',
   'preview_task_claim', 'create_channel', 'invite', 'clear_context',

@@ -33,6 +33,13 @@ Required Human review still applies to protected-main PRs even when all checks a
 | 36 (A4) | Jobs, job request ledger, task job links and claim/resume launch kind. |
 | 37 (A5) | Task cursor and saved launch lookup indexes; task data unchanged. |
 | 38 (Phase 3) | Identity revisions/overrides, reserved name aliases, lifecycle log and capability editor attribution. |
+| 39 (Bot integration) | Composable Bot grants; convergence with the fork's previously shipped schema 31/32. |
+
+This fork previously used version 32 for Bot grants, while upstream uses it for worker templates.
+Version 39 converges both layouts without lowering `user_version`: existing Bot grants and revisions,
+terminal labels and worker templates are preserved. The older fork's missing worker-template table is
+created before startup validation. A database upgraded to 39 requires this matching build; do not open it
+with upstream 38 or an older fork build. Keep the complete stopped-home backup for rollback.
 
 The migration runner applies pending versions when the new server opens the database. Do not open a migrated home with
 an older build; restore its matching backup instead. See [Storage and backup](storage-and-backup.md).
