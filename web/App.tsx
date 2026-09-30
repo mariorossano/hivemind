@@ -54,7 +54,6 @@ export function App() {
   // the first snapshot and WebSocket (useRealtime), which start before the
   // channel and thread loads (useConversationLoads).
   const [err, setErr] = useState<string | null>(null);
-  const shellRef = useRef<HTMLDivElement>(null);
   const selection = useSelection();
   const { sel, threadId, setThreadId, selRef } = selection;
   const hive = useHiveSnapshot(setErr);
@@ -264,13 +263,20 @@ export function App() {
     theme, onToggleTheme: toggleTheme, layout, onLayout: setLayout, notifications, openRequest: settingsRequest,
     telegram: snap.telegram, onTelegram: () => telegramSheet.openTelegram(snap?.projects ?? []),
     onAdaptiveRouting: () => setAdaptiveRoutingOpen(true), onLaunch: () => openLaunch(), onHelp: () => setHelpOpen(true),
+    autoArchive: snap.autoArchiveTaskChannels === undefined ? undefined : {
+      enabled: snap.autoArchiveTaskChannels,
+      // Channels it archives arrive as room events; only the flag is patched here.
+      onToggle: () => api.setAutoArchiveTaskChannels(!snap.autoArchiveTaskChannels)
+        .then(({ enabled }) => setSnap(previous => previous ? { ...previous, autoArchiveTaskChannels: enabled } : previous))
+        .catch(error => setErr(String(error))),
+    },
   };
   const railProject = projects.some(p => p.slug === selectedProject) ? selectedProject : projects[0]?.slug ?? "";
   const threadVisible = Boolean(threadId && threadPane && sel.kind === "channel" &&
     threadPane.channel.id === sel.id && threadPane.threadId === threadId);
 
   return (
-    <div className="shell" data-m={screen} ref={shellRef}>
+    <div className="shell" data-m={screen}>
       {unified ? (
         <TopBar live={live} projectName={projects.find(p => p.slug === railProject)?.name} onSwitcher={() => setSwitcher("all")}
           onAllTasks={() => navigate({ kind: 'tasks', project: null })} allTasksActive={sel.kind === 'tasks' && sel.project === null}
@@ -370,7 +376,7 @@ export function App() {
         ) : sel.kind === "dms" ? (
           <MobileDms snap={snap} project={sel.project} onOpen={id => go({ kind: "channel", id })} onUnread={openUnread} />
         ) : sel.kind === "home" ? null : (
-          <ChannelDesk channelId={sel.id} activeChannel={activeChannel} agents={snap.agents} roomAgents={roomAgents}
+          <ChannelDesk channelId={sel.id} activeChannel={activeChannel} archived={snap.archivedChannelIds?.includes(sel.id) ?? false} agents={snap.agents} roomAgents={roomAgents}
             unreadTarget={unreadTarget}
             channel={channelPane} threadPaneId={threadPane?.threadId} stickBottom={stickBottom}
             threadOpenAnchor={threadOpenAnchor} go={go} roomTick={roomTick} routingView={routingView}
@@ -395,7 +401,7 @@ export function App() {
         )}
       </main>
 
-      {threadVisible && !mobile && <ThreadResizer shellRef={shellRef} />}
+      {threadVisible && !mobile && <ThreadResizer />}
       {threadVisible && threadId && threadPane && sel.kind === "channel" && (
         <ThreadAside channelId={sel.id} threadId={threadId} threadPane={threadPane} thread={threadState}
           onClose={() => {

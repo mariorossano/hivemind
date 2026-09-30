@@ -131,6 +131,27 @@ test("approval queues once, encrypted claim survives restart, result scrubs payl
   assert.equal(f.hive.launcherQueue.get(id).state, "launched");
 });
 
+test("native worker launch checks the renamed Bot context and fails closed on a broken catalog", async t => {
+  const f = fixture(t), request = f.request(false);
+  const catalog = path.join(f.dir, 'bot-definitions.json');
+  writeFileSync(catalog, '{broken');
+  const denied = await f.signed('GET', '/api/launcher/next?timeoutMs=0');
+  assert.equal(denied.status, 503);
+  assert.deepEqual(await denied.json(), { error: 'Project launch context is unavailable' });
+  assert.equal(f.hive.launcherQueue.get(request.id).state, 'approved');
+  assert.equal(readValue(f.hive, 'launcher_commands', 'state', { request_id: request.id }), 'queued');
+  // Repair only this fixture's catalog. The same queued request can then prepare
+  // its original worker command; no replacement identity or claim is needed.
+  writeFileSync(catalog, '[]');
+  const response = await f.signed('GET', '/api/launcher/next?timeoutMs=0');
+  assert.equal(response.status, 200);
+  const { command } = await response.json() as { command: { kind: string; requestId: string; command: string } };
+  assert.equal(command.kind, 'launch');
+  assert.equal(command.requestId, request.id);
+  assert.ok(command.command.includes(request.ticket));
+  assert.equal(f.hive.launcherQueue.get(request.id).state, 'launching');
+});
+
 test("signed launch wire omits an empty template environment and keeps nonempty variables", async t => {
   const f = fixture(t), withVariables = f.request(false);
   const target = "/api/launcher/next?timeoutMs=0";

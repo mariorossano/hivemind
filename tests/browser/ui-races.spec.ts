@@ -403,7 +403,7 @@ async function installSnapshot(page: Page, current: () => Snapshot) {
     readInstance: "browser-fixture", readRevision: harness.revision, readSeq: harness.seq,
     items: [], hasMore: false,
   }));
-  const room: RoomView = { room: null, tasks: [], activeTaskCount: 0, tasksHasMore: false,
+  const room: RoomView = { room: null, archived: false, tasks: [], activeTaskCount: 0, tasksHasMore: false,
     nextTaskCursor: null, links: [], unmanagedBots: [] };
   await page.route("**/api/ui/channels/*/room", async route => fulfillJson(route, room));
   // The Tasks tab counts the channel's tasks.
@@ -480,6 +480,56 @@ test('composable bots have one accessible panel, scoped Receive and explicit mon
     await page.screenshot({ path: testInfo.outputPath(`bots-detail-${width}.png`) });
   }
 });
+
+for (const phase of ['initial', 'refresh'] as const) {
+  for (const dismissal of ['Close', 'Escape', 'backdrop'] as const) {
+    test(`Bots ${phase} loading can be dismissed with ${dismissal} and ignores its late response`, async ({ page }) => {
+      const p = project('bot-loading', 'Loading Bots'), ch = channel('loading-room', 'updates', p);
+      const staleBot: Agent = { ...human, id: 'stale-feed', name: 'StaleFeed', role: 'bot', projectId: p.id, project: p.slug };
+      const started = deferred(), release = deferred(), finished = deferred();
+      const pendingRead = phase === 'initial' ? 1 : 2;
+      let reads = 0;
+      await installSnapshot(page, () => snapshot([p], [ch]));
+      await installSocketHarness(page);
+      await installMessages(page, route => fulfillJson(route, payload(ch, [])));
+      await page.route(`**/api/ui/projects/${p.id}/bots`, async route => {
+        if (++reads !== pendingRead) return fulfillJson(route, { bots: [], channels: [ch], definitions: [] });
+        started.resolve();
+        await release.promise;
+        try {
+          await fulfillJson(route, { bots: [{ bot: staleBot,
+            access: { capabilities: ['publish'], receiveChannels: [], definitionId: null, revision: 1 },
+            credential: { revision: 1, revoked: false } }], channels: [ch], definitions: [] });
+        } catch { /* Closing the sheet cancels the outstanding read. */ }
+        finally { finished.resolve(); }
+      });
+      await page.goto(`/#/c/${ch.id}`);
+      const open = page.getByRole('button', { name: 'Manage bots in Loading Bots', exact: true });
+      const panel = page.getByRole('dialog', { name: 'Bots for Loading Bots', exact: true });
+      try {
+        await open.click();
+        if (phase === 'refresh') {
+          await expect(panel.getByRole('button', { name: 'Add bot', exact: true })).toBeEnabled();
+          await panel.getByRole('button', { name: 'Refresh', exact: true }).click();
+        }
+        await started.promise;
+        await expect(panel).toHaveAttribute('aria-busy', 'true');
+        await expect(panel.getByRole('button', { name: 'Close', exact: true })).toBeEnabled();
+        if (dismissal === 'Close') await panel.getByRole('button', { name: 'Close', exact: true }).click();
+        else if (dismissal === 'Escape') await page.keyboard.press('Escape');
+        else await page.locator('[data-modal-root]').click({ position: { x: 2, y: 2 } });
+        await expect(panel).toHaveCount(0);
+        await open.click();
+        await expect(panel.getByRole('button', { name: 'Add bot', exact: true })).toBeEnabled();
+        release.resolve();
+        await finished.promise;
+        await expect(panel.getByText('No bots yet', { exact: true })).toBeVisible();
+        await expect(panel.getByRole('button', { name: /^StaleFeed/ })).toHaveCount(0);
+        await expect(panel.getByRole('alert')).toHaveCount(0);
+      } finally { release.resolve(); }
+    });
+  }
+}
 
 test('unavailable bot catalog preserves bindings and credential controls until an explicit refresh recovers it', async ({ page }) => {
   const p = project('bot-catalog', 'Catalog recovery'), ch = channel('catalog-room', 'updates', p);
@@ -632,6 +682,10 @@ test('bot credentials cannot overlap an in-flight access update, including openi
     await expect(panel.getByRole('button', { name: 'Rotate token', exact: true })).toBeDisabled();
     await expect(panel.getByRole('button', { name: 'Reload credential state', exact: true })).toBeDisabled();
     await expect(panel.getByRole('button', { name: 'Close', exact: true })).toBeDisabled();
+    await page.keyboard.press('Escape');
+    await expect(panel).toBeVisible();
+    await page.locator('[data-modal-root]').click({ position: { x: 2, y: 2 } });
+    await expect(panel).toBeVisible();
   } finally { secondRelease.resolve(); }
 });
 

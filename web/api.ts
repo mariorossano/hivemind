@@ -41,6 +41,8 @@ export type Snapshot = ReadSnapshot & {
   channels: Channel[];
   /** Room lifecycle metadata; all channels remain addressable, including archived ones. */
   archivedChannelIds?: string[];
+  /** Human policy: archive a task-bound worker's channel once its task finishes. */
+  autoArchiveTaskChannels?: boolean;
   queued: Record<string, number>;
   inbox?: Record<string, InboxStatus>;
   /** Complete current work per agent. Optional while old fixtures and servers are upgraded. */
@@ -161,7 +163,7 @@ export const api = {
   recordRoutingChoice: (id: string, body: { expectedRevision: number; workerId: string; reason: string; requestId: string }, signal?: AbortSignal) => req<{ assigned: false }>(`/api/ui/tasks/${encodeURIComponent(id)}/routing-override`, { method: 'POST', body: JSON.stringify(body), signal }),
   botCredential: (project: string, bot: string) => req<BotCredentialView>(
     `/api/ui/projects/${encodeURIComponent(project)}/bots/${encodeURIComponent(bot)}/credential`),
-  projectBots: (project: string) => req<ProjectBotsView>(`/api/ui/projects/${encodeURIComponent(project)}/bots`),
+  projectBots: (project: string, signal?: AbortSignal) => req<ProjectBotsView>(`/api/ui/projects/${encodeURIComponent(project)}/bots`, { signal }),
   setBotAccess: (project: string, bot: string, access: Omit<BotAccess, 'revision'> & { expectedRevision: number }) =>
     req<BotAccess>(`/api/ui/projects/${encodeURIComponent(project)}/bots/${encodeURIComponent(bot)}/access`, { method: 'PUT', body: JSON.stringify(access) }),
   setupBot: (project: string, name: string, definitionId: string) => req<{ bot: Agent; connected: boolean; error?: string }>(
@@ -187,6 +189,10 @@ export const api = {
   room: (channel: string) => req<RoomView>(`/api/ui/channels/${encodeURIComponent(channel)}/room`),
   roomHistory: (channel: string, before?: number) => req<{ history: Room[] }>(`/api/ui/channels/${encodeURIComponent(channel)}/room/history?before=${before ?? Number.MAX_SAFE_INTEGER}`),
   roomEvent: (channel: string, body: unknown) => req<RoomView>(`/api/ui/channels/${encodeURIComponent(channel)}/room`, { method: 'POST', body: JSON.stringify(body) }),
+  setAutoArchiveTaskChannels: (enabled: boolean) =>
+    req<{ enabled: boolean; archived: number }>('/api/ui/settings/auto-archive-task-channels', { method: enabled ? 'POST' : 'DELETE' }),
+  setChannelArchived: (channel: string, archived: boolean) =>
+    req<{ archived: boolean }>(`/api/ui/channels/${encodeURIComponent(channel)}/archive`, { method: archived ? 'POST' : 'DELETE' }),
   launchContext: (project: string) => req<LaunchContext>(`/api/ui/launch-context?project=${encodeURIComponent(project)}`),
   projectBotConfigurations: (slug: string) => req<{ configurations: ProjectBotConfiguration[] }>(`/api/ui/projects/${encodeURIComponent(slug)}/bots/catalog`),
   setBotAvailability: (slug: string, id: string, body: { enabled: boolean; expectedRevision: number }) =>
