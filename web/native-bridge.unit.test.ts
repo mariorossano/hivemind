@@ -293,9 +293,9 @@ const launchContext: LaunchContext = { project: { id: "p1", slug: "acme" }, botD
 const seat = (id: string, name: string, role: "brain" | "worker"): Agent => ({ id, name, role, seniority: role === "worker" ? "mid" : null,
   focus: role === "brain" ? "coord" : "frontend", online: false, lastSeenAt: 0, createdAt: 0, projectId: "p1", project: "acme" });
 
-async function mountLaunchSheet(agents: Agent[] = []) {
+async function mountLaunchSheet(agents: Agent[] = [], context = launchContext) {
   const original = api.launchContext;
-  api.launchContext = async () => launchContext;
+  api.launchContext = async () => context;
   const view = await mount(() => createElement(LaunchSheet, { projects: [project], agents, defaultProject: "acme", onClose() {} }));
   await act(async () => {});
   unmounts.push(() => { api.launchContext = original; });
@@ -368,6 +368,62 @@ test("Resume same employees starts one session per employee at once, each named 
   await fromApp({ type: "terminal-launched", id, names: ["hm-acme-new-1", "hm-acme-bea"], created: ["hm-acme-bea"], errors: [] });
   assert.match(sheet.view.host.querySelector(".launch-note")?.textContent ?? "", /1 already running/);
   assert.ok(sheet.button(/^Opened$/));
+});
+
+test('mixed resume uses per-employee providers, conversation IDs, models and environments in one native batch', async () => {
+  localStorage.setItem('hivemind-launch', JSON.stringify({ resume: true, software: 'codex',
+    environments: { codex: 'CODEX_HOME=/tmp/codex-fixture', claude: 'CLAUDE_CONFIG_DIR=/tmp/claude-fixture' } }));
+  installBridge();
+  const codexId = '67d735d1-9e33-4a61-9645-a931afc97f2b', claudeId = '456734b7-51a8-47cf-b541-146ac0b3cc36';
+  const sheet = await mountLaunchSheet([seat('a1', 'Atlas', 'brain'), seat('a2', 'Bea', 'worker')], {
+    ...launchContext, nativeSessions: {
+      a1: { software: 'codex', model: 'gpt-6-sol', effort: 'high', sessionId: codexId },
+      a2: { software: 'claude', model: 'claude-opus-5-5', effort: 'xhigh', sessionId: claudeId },
+    },
+  });
+  await ready();
+  await act(async () => sheet.button(/^Start 2 in background$/)!.click());
+  const [batch] = launchesPosted();
+  assert.match(batch.launches[0].command, new RegExp(`codex resume '${codexId}' -m gpt-6-sol`));
+  assert.match(batch.launches[1].command, new RegExp(`claude --resume '${claudeId}' --model claude-opus-5-5 --effort xhigh`));
+  assert.deepEqual(batch.launches.map(l => l.environment), [
+    { CODEX_HOME: '/tmp/codex-fixture' }, { CLAUDE_CONFIG_DIR: '/tmp/claude-fixture' },
+  ]);
+  assert.equal(batch.launches[1].command.includes(codexId), false);
+  assert.equal(batch.launches[0].command.includes(claudeId), false);
+  assert.equal(localStorage.getItem('hivemind-launch')!.includes(codexId), false);
+});
+
+test('online agents are not restarted and task-bound, archived and pending seats use their existing lifecycle controls', async () => {
+  localStorage.setItem('hivemind-launch', JSON.stringify({ resume: true }));
+  installBridge();
+  const sheet = await mountLaunchSheet([
+    { ...seat('a1', 'Atlas', 'brain'), online: true }, seat('a2', 'Bea', 'worker'),
+    { ...seat('a3', 'TaskWorker', 'worker'), templateId: 'template-1' },
+    { ...seat('a4', 'Archived', 'worker'), archivedAt: 123 },
+    { ...seat('a5', 'Pending', 'worker'), pending: { until: Date.now() + 60000 } },
+  ]);
+  await ready();
+  assert.equal(sheet.view.host.querySelectorAll('.launch-card').length, 2);
+  assert.match(sheet.view.host.textContent!, /Already online or running/);
+  await act(async () => sheet.button(/^Start in background$/)!.click());
+  assert.deepEqual(launchesPosted()[0].launches.map(l => l.agent), ['Bea']);
+});
+
+test('switching a resume card to another provider explicitly clears native recovery and keeps other cards intact', async () => {
+  localStorage.setItem('hivemind-launch', JSON.stringify({ resume: true }));
+  const id = '67d735d1-9e33-4a61-9645-a931afc97f2b';
+  const sheet = await mountLaunchSheet([seat('a1', 'Atlas', 'brain'), seat('a2', 'Bea', 'worker')], {
+    ...launchContext, nativeSessions: { a1: { software: 'codex', model: 'gpt-6-sol', effort: 'high', sessionId: id } },
+  });
+  const cards = sheet.view.host.querySelectorAll('.launch-card');
+  const input = cards[0].querySelector('input[list="launch-software"]') as HTMLInputElement;
+  await typeInto(input, 'claude');
+  await act(async () => { input.dispatchEvent(new window.FocusEvent('focusout', { bubbles: true }) as unknown as Event); });
+  assert.match(cards[0].querySelector('pre')!.textContent!, /HIVEMIND_ROLE='brain' claude /);
+  assert.doesNotMatch(cards[0].querySelector('pre')!.textContent!, /gpt-6-sol|--resume/);
+  assert.match(cards[0].textContent!, /previous transcript is not restored/);
+  assert.match(cards[1].querySelector('pre')!.textContent!, /codex /);
 });
 
 test("the launch buttons wait for Hivemind Server and tmux, and say what is missing", async () => {

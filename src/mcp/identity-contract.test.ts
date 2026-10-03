@@ -62,8 +62,14 @@ test("an MCP client launched in a Hivemind tmux session reports it on join; the 
       HIVEMIND_TMUX_SESSION: "hm-acme-new-1" }), stderr: "pipe" });
   t.after(async () => { await client.close(); await transport.close(); await service.shutdown(); hive.db.close(); rmSync(dir,{ recursive:true,force:true }); });
   await client.connect(transport);
-  const result = await client.callTool({ name: "join", arguments: { role: "worker", seniority: "mid" } });
+  const nativeSession = { software: "codex", sessionId: "019b2800-1234-7000-8000-000000000001", model: "test-model", effort: "high" };
+  const result = await client.callTool({ name: "join", arguments: { role: "worker", seniority: "mid", nativeSession } });
   assert.notEqual(result.isError, true, JSON.stringify(result));
   const { name } = JSON.parse((result.content as Array<{ type: string; text: string }>)[0]!.text) as { name: string };
   assert.equal(hive.identity.getAgentByName(name)!.terminalSession, "hm-acme-new-1");
+  assert.deepEqual(hive.identity.nativeSession(hive.identity.getAgentByName(name)!.id), nativeSession);
+  const repeated = await client.callTool({ name: "join", arguments: { role: "worker", seniority: "mid" } });
+  assert.notEqual(repeated.isError, true, JSON.stringify(repeated));
+  assert.deepEqual(hive.identity.nativeSession(hive.identity.getAgentByName(name)!.id), nativeSession,
+    "an idempotent join without metadata preserves the current native conversation");
 });

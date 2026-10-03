@@ -189,7 +189,11 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
   });
   ui.get("/launch-context", c => {
     const slug = c.req.query("project");
-    return c.json(launchContext(hive.home, serverOrigin(c.req.url), slug ? hive.projects.getProjectBySlug(slug) : undefined));
+    const project = slug ? hive.projects.getProjectBySlug(slug) : undefined;
+    const nativeSessions = Object.fromEntries(hive.identity.listAgents()
+      .filter(a => project && a.projectId === project.id && !a.removedAt && !a.archivedAt && (a.role === 'brain' || a.role === 'worker'))
+      .flatMap(a => { const session = hive.identity.nativeSession(a.id); return session ? [[a.id, session]] : []; }));
+    return c.json({ ...launchContext(hive.home, serverOrigin(c.req.url), project), nativeSessions });
   });
   ui.get("/adaptive-routing", c => {
     hive.identity.getAgent("human");
@@ -521,7 +525,7 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
     const bearer = (c.req.header('authorization') ?? '').replace(/^Bearer\s+/i, '').trim();
     const result = hive.identity.join({ role: body.role, seniority: body.seniority ?? null, focus: body.focus ?? null,
       token: bearer || body.token || null, resumeName: body.resume || body.resumeName || null, project: body.project ?? null, cwd: body.cwd ?? null,
-      terminalSession: body.terminalSession ?? null, claim: body.claim ?? null });
+      terminalSession: body.terminalSession ?? null, claim: body.claim ?? null, nativeSession: body.nativeSession });
     return c.json({ ...result, describe: describeAgent(result.agent), standingOrders: result.created ? standingOrders(result.agent) : undefined,
       ordersRef: result.created ? undefined : 'unchanged', handoffs: hive.tasks.handoffs(result.agent) });
   });

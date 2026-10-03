@@ -6,6 +6,7 @@ import { canonicalWorktree, resolveJoinProject } from "../../shared/project.ts";
 import { pickName } from "../names.ts";
 import type { AgentDirectory, Core, MessagePoster, WaiterRegistry } from "./ports.ts";
 import { now, type AgentRow } from "./rows.ts";
+import { nativeSessionSchema, type NativeSession } from '../../shared/native-session.ts';
 
 export function hashToken(token: string): string {
   return createHash("sha256").update(token).digest("hex");
@@ -33,6 +34,7 @@ export type JoinInput = {
   cwd?: string | null;
   /** The Hivemind tmux session the joining process runs in; null or absent clears the agent's label. */
   terminalSession?: string | null;
+  nativeSession?: NativeSession | null;
   /** A reserved worker's single-use launch ticket (reserve): joins as that worker. */
   claim?: string | null;
 };
@@ -318,6 +320,18 @@ export class IdentityService implements AgentDirectory {
     }
   }
 
+  /** Human launch context / task launcher only; never added to the agents' roster. */
+  nativeSession(id: string): NativeSession | null {
+    const row = this.db.prepare('SELECT metadata FROM agent_native_sessions WHERE agent_id=?').get(id) as { metadata: string } | undefined;
+    return row ? nativeSessionSchema.parse(JSON.parse(row.metadata)) : null;
+  }
+
+  private recordNativeSession(id: string, metadata: NativeSession | null | undefined) {
+    if (!metadata) this.db.prepare('DELETE FROM agent_native_sessions WHERE agent_id=?').run(id);
+    else this.db.prepare('INSERT INTO agent_native_sessions(agent_id,metadata) VALUES (?,?) ON CONFLICT(agent_id) DO UPDATE SET metadata=excluded.metadata')
+      .run(id, JSON.stringify(metadata));
+  }
+
   join(input: JoinInput): { agent: Agent; token: string; created: boolean } {
     validated(joinInputSchema, input);
     if (input.role !== "brain" && input.role !== "worker") {
@@ -356,6 +370,7 @@ export class IdentityService implements AgentDirectory {
       return storage.transaction(() => {
         this.touch(agent.id, true);
         this.claimTerminalSession(agent.id, input.terminalSession ?? null);
+        if (input.nativeSession !== undefined) this.recordNativeSession(agent.id, input.nativeSession);
         return { agent: this.getAgent(agent.id), token: input.token!, created: false };
       });
     }
@@ -390,6 +405,7 @@ export class IdentityService implements AgentDirectory {
       }
       return storage.transaction(() => {
         const token = this.replaceAgentSession(agent.id);
+        this.recordNativeSession(agent.id, input.nativeSession);
         this.touch(agent.id, true);
         this.claimTerminalSession(agent.id, input.terminalSession ?? null);
         this.deps.lifecycleLog?.record({ agentId: agent.id, projectId: agent.projectId, actorId: null,
@@ -442,6 +458,7 @@ export class IdentityService implements AgentDirectory {
       const maxSeq = this.db.prepare("SELECT COALESCE(MAX(seq), 0) AS n FROM messages").get() as { n: number };
       this.db.prepare("UPDATE agents SET inbox_cursor = ? WHERE id = ?").run(maxSeq.n, id);
       this.claimTerminalSession(id, input.terminalSession ?? null, false);
+      this.recordNativeSession(id, input.nativeSession);
       this.deps.lifecycleLog?.record({ agentId: id, projectId: project.id, actorId: null,
         kind: 'joined', summary: 'Agent joined the hive.', source: 'server' });
       storage.afterCommit(() => bus.emit("agent", this.getAgent(id)));
@@ -531,6 +548,7 @@ export class IdentityService implements AgentDirectory {
     return storage.transaction(() => {
       const token = this.replaceAgentSession(agent.id);
       this.db.prepare("UPDATE agents SET pending_until = NULL, claim_hash = NULL WHERE id = ?").run(agent.id);
+      this.recordNativeSession(agent.id, input.nativeSession);
       this.touch(agent.id, true);
       this.claimTerminalSession(agent.id, input.terminalSession ?? null, false);
       this.deps.lifecycleLog?.record({ agentId: agent.id, projectId: agent.projectId, actorId: null,

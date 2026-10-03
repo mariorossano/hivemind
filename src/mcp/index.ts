@@ -25,6 +25,7 @@ import { packageVersion } from "../shared/package-root.ts";
 import { attachablePath } from "./attach-guard.ts";
 import { MESSAGE_EVENT_TYPES } from "../shared/types.ts";
 import { terminalSessionFields } from "../shared/terminal-session.ts";
+import { nativeSessionSchema } from '../shared/native-session.ts';
 import { JOIN_SESSION, PARAM_DESCRIPTIONS, SEARCH_NEXT, TOOL_DESCRIPTIONS, joinNext } from "./tool-text.ts";
 import { MCP_HEARTBEAT_MS, MCP_WAIT_POLL_MS, type Agent, type Channel, type WaitResult } from "../shared/types.ts";
 
@@ -106,8 +107,9 @@ export async function startMcp() {
       resume: z.string().optional(),
       project: z.string().optional(),
       claim: z.string().optional().describe(PARAM_DESCRIPTIONS.claim),
+      nativeSession: nativeSessionSchema.optional().describe('Optional host-reported CLI/model and exact conversation UUID. Not the Hivemind identity or tmux name. Never guess an ID; use null when unavailable.'),
     },
-    async ({ role, seniority, focus, resume, project, claim }) => joinSerial(async () => {
+    async ({ role, seniority, focus, resume, project, claim, nativeSession }) => joinSerial(async () => {
       if (toolRole && role !== toolRole)
         throw new Error(`This MCP process is configured for ${toolRole}; join with role=${toolRole} or start another MCP process`);
       if (joinedName && claim)
@@ -143,6 +145,7 @@ export async function startMcp() {
           cwd: process.cwd(),
           ...(claim ? { claim } : {}),
           ...terminalSessionFields(process.env),
+          ...(nativeSession ? { nativeSession } : {}),
         },
         claim ? null : auth ?? null,
       );

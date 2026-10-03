@@ -424,6 +424,83 @@ async function installMessages(
 
 type FixtureSocket = Pick<WebSocketRoute, "close"> & { send: (data: string) => void };
 
+test('mixed native resume preserves each employee’s CLI and UUID, validates selection and fits the viewport', async ({ page }, testInfo) => {
+  const p = project('alpha', 'Example Hive'), ch = channel('a', 'general', p);
+  const snap = snapshot([p], [ch]);
+  snap.agents.push(...['Atlas', 'Birch', 'Online'].map((name, i): Agent => ({ ...human,
+    id: `employee-${i}`, name, role: 'worker', seniority: 'senior', focus: 'mobile',
+    online: i === 2, projectId: p.id, project: p.slug,
+  })));
+  const ids = ['019b2800-1234-7000-8000-000000000001', '019b2800-1234-7000-8000-000000000002'];
+  await installSnapshot(page, () => snap); await installSocketHarness(page);
+  await installMessages(page, route => fulfillJson(route, payload(ch, [])));
+  await page.route('**/api/ui/launch-context?*', route => fulfillJson(route, {
+    project: { id: p.id, slug: p.slug }, botDefinitions: [], botInstructions: '',
+    hivemindMcp: { command: 'hivemind', args: ['mcp'], env: {} },
+    nativeSessions: {
+      'employee-0': { software: 'codex', sessionId: ids[0], model: 'test-codex-model', effort: 'high' },
+      'employee-1': { software: 'claude', sessionId: ids[1], model: 'test-claude-model', effort: 'low' },
+    },
+  }));
+  await page.setViewportSize({ width: 1180, height: 900 });
+  await page.goto('/#/c/a');
+  await page.getByRole('button', { name: 'Launch agent', exact: true }).click();
+  const sheet = page.getByRole('dialog', { name: 'Launch agent' });
+  await sheet.getByLabel('Resume same employees').check();
+  const atlas = sheet.locator('.launch-card').filter({ has: page.getByText('Atlas', { exact: true }) });
+  const birch = sheet.locator('.launch-card').filter({ has: page.getByText('Birch', { exact: true }) });
+  const online = sheet.locator('.launch-card').filter({ has: page.getByText('Online', { exact: true }) });
+  await expect(atlas.getByLabel('Software for Atlas')).toHaveValue('codex');
+  await expect(birch.getByLabel('Software for Birch')).toHaveValue('claude');
+  await expect(atlas.getByLabel('Conversation UUID')).toHaveValue(ids[0]!);
+  await expect(birch.getByLabel('Conversation UUID')).toHaveValue(ids[1]!);
+  await expect(atlas.locator('.launch-pre')).toContainText(`codex resume '${ids[0]}' -m test-codex-model`);
+  await expect(birch.locator('.launch-pre')).toContainText(`claude --resume '${ids[1]}' --model test-claude-model`);
+  await expect(online.getByLabel('Include in batch')).not.toBeChecked();
+  await expect(online.getByLabel('Include in batch')).toBeDisabled();
+  const copyAll = sheet.getByRole('button', { name: 'Copy all', exact: true });
+  await expect(copyAll).toBeEnabled();
+  await birch.getByLabel('Conversation UUID').fill('not-a-uuid');
+  await expect(copyAll).toBeDisabled();
+  await expect(atlas.getByRole('button', { name: 'Copy', exact: true })).toBeEnabled();
+  await birch.getByLabel('Include in batch').uncheck();
+  await expect(copyAll).toBeEnabled();
+  await birch.getByLabel('Conversation UUID').fill(ids[1]!);
+  await birch.getByLabel('Include in batch').check();
+  await atlas.getByLabel('Software for Atlas').fill('');
+  await atlas.getByLabel('Software for Atlas').pressSequentially('codex-work');
+  await atlas.getByLabel('Software for Atlas').press('Tab');
+  await expect(atlas.getByLabel('Conversation UUID')).toHaveValue(ids[0]!);
+  await expect(atlas.locator('.launch-pre')).toContainText(`codex-work resume '${ids[0]}' -m test-codex-model`);
+  await birch.getByLabel('Software for Birch').fill('');
+  await expect(birch.getByLabel('Conversation UUID')).toHaveValue(ids[1]!);
+  for (const char of 'claude-work') {
+    await birch.getByLabel('Software for Birch').pressSequentially(char);
+    await expect(birch.getByLabel('Conversation UUID'), `ID retained while typing ${char}`).toHaveValue(ids[1]!);
+  }
+  await birch.getByLabel('Software for Birch').press('Tab');
+  await expect(birch.getByLabel('Conversation UUID')).toHaveValue(ids[1]!);
+  await atlas.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: testInfo.outputPath('mixed-resume-desktop.png') });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await atlas.getByLabel('Conversation UUID').scrollIntoViewIfNeeded();
+  await expect(copyAll).toBeInViewport();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390);
+  await page.screenshot({ path: testInfo.outputPath('mixed-resume-mobile.png') });
+  await atlas.getByLabel('Software for Atlas').fill('claude-work');
+  await atlas.getByLabel('Software for Atlas').press('Tab');
+  await expect(atlas.getByLabel('Recovery')).toHaveValue('handoff');
+  await expect(atlas.getByLabel('Conversation UUID')).toHaveCount(0);
+  await expect(atlas.getByRole('combobox', { name: /^Model/ })).toHaveValue('');
+  await expect(birch.getByLabel('Conversation UUID')).toHaveValue(ids[1]!);
+  await expect(atlas.locator('.launch-pre')).toContainText("HIVEMIND_ROLE='worker' claude-work");
+  await expect(atlas.locator('.launch-pre')).not.toContainText('--resume');
+  const saved = await page.evaluate(() => localStorage.getItem('hivemind-launch'));
+  expect(saved).toContain('claude-work');
+  expect(saved).not.toContain(ids[0]!);
+  expect(saved).not.toContain(ids[1]!);
+});
+
 test('composable bots have one accessible panel, scoped Receive and explicit monitor controls', async ({ page }, testInfo) => {
   const p = project('bots', 'Example'), ch = channel('bot-channel', 'review-updates', p);
   const custom: Agent = { ...human, id: 'feed', name: 'BuildFeed', role: 'bot', projectId: p.id, project: p.slug };

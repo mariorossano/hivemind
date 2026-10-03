@@ -14,12 +14,12 @@ import { TerminalNotice } from "./TerminalNotice.tsx";
 import { agentTerminalSession, terminalBlocker, terminalHub, useTerminalState, type TerminalLaunched } from "./use-terminal.ts";
 import { projectLaunchTools, type LaunchContext } from "../src/shared/launch-prompt.ts";
 import { parseLaunchEnvironment } from "../src/shared/launch-environment.ts";
+import { readResumePreferences, resumeSettings, type ResumePreferences, type ResumeEdits } from './resume-settings.ts';
 import {
   EFFORTS,
   buildLaunchCommand,
   buildRosterPaste,
   codexSessionTitle,
-  resolveLaunchTune,
   launchBlockText,
   softwareFamily,
   type LaunchRole,
@@ -43,6 +43,7 @@ type Saved = {
   resumeName: string;
   allHives: boolean;
   tunes: Record<string, { model: string; effort: string }>;
+  resumePreferences: Record<string, ResumePreferences>;
   /** The Environment variables field's text per software (the Software field, trimmed). */
   environments: Record<string, string>;
 };
@@ -63,6 +64,7 @@ const defaults: Saved = {
   resumeName: "",
   allHives: false,
   tunes: {},
+  resumePreferences: {},
   environments: {},
 };
 
@@ -130,6 +132,7 @@ function loadSaved(): Saved {
       resumeName: typeof parsed.resumeName === "string" ? parsed.resumeName : "",
       allHives: parsed.allHives === true,
       tunes,
+      resumePreferences: readResumePreferences(parsed.resumePreferences),
       environments,
     };
   } catch {
@@ -161,6 +164,17 @@ async function copyText(text: string) {
   const ok = document.execCommand("copy");
   el.remove();
   if (!ok) throw new Error("Could not copy");
+}
+
+/** Commit an edited executable as one choice, not the intermediate letters of an alias. */
+function ResumeSoftware({ name, value, onChange }: { name: string; value: string; onChange(value: string): void }) {
+  const [draft, setDraft] = useState<string | null>(null);
+  return <label>Software for {name}<input value={draft ?? value} list="launch-software" spellCheck={false}
+    onChange={e => setDraft(e.target.value)}
+    onBlur={e => {
+      if (draft !== null) onChange(e.target.value);
+      setDraft(null);
+    }} /></label>;
 }
 
 export function LaunchSheet({
@@ -198,7 +212,10 @@ export function LaunchSheet({
   const [focus, setFocus] = useState(initial.focus);
   const [resume, setResume] = useState(Boolean(resumeAgentId) || initial.resume);
   const [allHives, setAllHives] = useState(initial.allHives);
-  const [tunes, setTunes] = useState<Record<string, { model: string; effort: string }>>(resumeAgentId ? {} : initial.tunes);
+  const [tunes] = useState<Record<string, { model: string; effort: string }>>(resumeAgentId ? {} : initial.tunes);
+  const [resumePreferences, setResumePreferences] = useState(initial.resumePreferences);
+  // Conversation IDs and environment edits are not persisted in browser preferences.
+  const [resumeEdits, setResumeEdits] = useState<Record<string, ResumeEdits>>({});
   // Kept per software in this browser (never sent anywhere but with a launch); restored when that software is chosen.
   const [environments, setEnvironments] = useState<Record<string, string>>(initial.environments);
   const envKey = environmentKey(software);
@@ -257,6 +274,7 @@ export function LaunchSheet({
     const slug = project?.slug ?? projectSlug;
     return agents
       .filter((a) => a.role === "brain" || a.role === "worker")
+      .filter((a) => !a.removedAt && !a.archivedAt && !a.pending && !a.templateId)
       .filter((a) => !resumeAgentId || a.id === resumeAgentId)
       .filter((a) => allHives || a.project === slug)
       .slice()
@@ -305,14 +323,27 @@ export function LaunchSheet({
         pathDirty && hive?.slug === selectedSlug
           ? workspacePath
           : (hive?.worktree ?? (hive?.slug === selectedSlug ? workspacePath : ""));
-      const seat = resolveLaunchTune({ model, effort }, tunes[agent.name]);
+      const reported = contexts[hive?.slug ?? '']?.nativeSessions?.[agent.id];
+      const preferences = resumePreferences[agent.id] ?? (!reported && tunes[agent.name]?.model ? tunes[agent.name] : undefined);
+      const seat = resumeSettings(shared, reported, preferences, resumeEdits[agent.id]);
+      const seatEnvText = resumeEdits[agent.id]?.environment ?? environments[environmentKey(seat.software)] ?? '';
+      const seatEnv = parseLaunchEnvironment(seatEnvText);
+      const running = agent.online || Boolean(verifiedStopSession(agent, agents, terminals, resumeAgentId ? resumeAliases : []));
+      const included = resumeEdits[agent.id]?.included ?? !running;
+      const card = { agent, hive, seat, included, running, seatEnvText };
       try {
+        if (running) throw new Error('Already online or running. Stop this agent explicitly before resuming.');
+        if (!seat.software.trim()) throw new Error('Choose software for this employee.');
+        if (seatEnv.errors.length) throw new Error('Fix this employee’s environment variables first.');
         if (agent.role !== "brain" && agent.role !== "worker") {
-          return { agent, hive, ok: false as const, error: "not an agent", text: "" };
+          return { ...card, ok: false as const, error: "not an agent", text: "" };
         }
         if (contextErrors[hive?.slug ?? ""]) throw new Error(contextErrors[hive!.slug]);
+        if (!contexts[hive?.slug ?? '']) throw new Error('Loading this employee’s launch context…');
         const launch = buildLaunchCommand({
           ...shared,
+          software: seat.software,
+          extraFlags: seat.extraFlags,
           ...projectLaunchTools(contexts[hive?.slug ?? ""], hive, agent.role),
           model: seat.model,
           effort: seat.effort,
@@ -324,14 +355,14 @@ export function LaunchSheet({
           focus: agent.focus,
           resume: true,
           resumeName: agent.name,
+          ...(seat.native ? { nativeResume: { software: softwareFamily(seat.software) as 'codex' | 'claude', sessionId: seat.sessionId } } : {}),
         });
-        if (envError) throw new Error(envError);
-        return { agent, hive, ok: true as const, launch, text: launchBlockText(launch, environment) };
+        return { ...card, ok: true as const, launch, environment: seatEnv.environment, text: launchBlockText(launch, seatEnv.environment) };
       } catch (e) {
-        return { agent, hive, ok: false as const, error: String((e as Error).message || e), text: "" };
+        return { ...card, ok: false as const, error: String((e as Error).message || e), text: "" };
       }
     });
-  }, [roster, projects, project, projectSlug, pathDirty, workspacePath, software, extraFlags, model, effort, tunes, cdWorktree, passProject, adoptUntrusted, contexts, contextErrors, environment, envError]);
+  }, [roster, projects, project, projectSlug, pathDirty, workspacePath, software, extraFlags, model, effort, tunes, resumePreferences, resumeEdits, cdWorktree, passProject, adoptUntrusted, contexts, contextErrors, environments, agents, terminals, resumeAgentId, resumeAliases]);
 
   const remember = (patch: Partial<Saved> = {}) => {
     const next: Saved = {
@@ -350,6 +381,7 @@ export function LaunchSheet({
       resumeName: "",
       allHives: patch.allHives ?? allHives,
       tunes: patch.tunes ?? tunes,
+      resumePreferences: patch.resumePreferences ?? resumePreferences,
       environments: patch.environments ?? environments,
     };
     persist(next);
@@ -365,14 +397,13 @@ export function LaunchSheet({
     remember({ environments: trimmed });
   };
 
-  const setTune = (name: string, patch: Partial<{ model: string; effort: string }>) => {
-    const next = {
-      ...tunes,
-      [name]: { model: tunes[name]?.model ?? "", effort: tunes[name]?.effort ?? "", ...patch },
-    };
-    setTunes(next);
-    remember({ tunes: next });
+  const setResumePreference = (id: string, patch: ResumePreferences) => {
+    const next = { ...resumePreferences, [id]: { ...resumePreferences[id], ...patch } };
+    setResumePreferences(next);
+    remember({ resumePreferences: next });
   };
+  const setResumeEdit = (id: string, patch: ResumeEdits) =>
+    setResumeEdits(old => ({ ...old, [id]: { ...old[id], ...patch } }));
 
   const rememberSoftware = () => {
     const name = software.trim() || "codex";
@@ -403,7 +434,7 @@ export function LaunchSheet({
   const seatTitle = (hive: string, agent: string) => codexSessionTitle(hive, agent) || agent;
   const allText = buildRosterPaste(
     resumeBlocks
-      .filter((b) => b.ok)
+      .filter((b) => b.included && b.ok)
       .map((b) => ({
         title: seatTitle(b.hive?.name ?? "", b.agent.name),
         text: b.text,
@@ -428,20 +459,19 @@ export function LaunchSheet({
   const targetSession = resumeAgentId && roster[0]
     ? verifiedStopSession(roster[0], agents, terminals, resumeAliases) ? 'running'
       : agentRuntime(roster[0], { agents }, terminals).sessionState : null;
-  const canCopyAll = resume && resumeBlocks.length > 0 && resumeBlocks.every((b) => b.ok) &&
-    (!resumeAgentId || Boolean(software.trim()) && targetSession !== 'running');
-  const canCopyResumeCard = !resumeAgentId || Boolean(software.trim()) && targetSession !== 'running';
+  const selectedBlocks = resumeBlocks.filter(b => b.included);
+  const canCopyAll = resume && selectedBlocks.length > 0 && selectedBlocks.every((b) => b.ok);
 
   // Hivemind.app only: the same launches as the copied text, each in its own tmux session (reused when that
   // employee's is still running), optionally with a Terminal window attached.
   const terminalLaunches: TerminalSessionLaunch[] = resume
-    ? (canCopyAll ? resumeBlocks.flatMap((b) => b.ok ? [{
+    ? (canCopyAll ? selectedBlocks.flatMap((b) => b.ok ? [{
         project: b.hive?.slug ?? b.agent.project ?? projectSlug, agent: b.agent.name,
         title: seatTitle(b.hive?.name ?? "", b.agent.name), ...b.launch,
         // The session this employee already runs in, even one named hm-<project>-new-<n>, is reused.
         session: agentTerminalSession(b.agent),
-        ...secrets,
-        ...launchEnv,
+        ...(softwareFamily(b.seat.software) === 'opencode' ? secrets : {}),
+        ...(Object.keys(b.environment).length ? { environment: b.environment } : {}),
       }] : []) : [])
     : (canCopyOne && built.ok
       ? [{ project: project?.slug ?? projectSlug, agent: null, title: seatTitle(hiveName, `new ${role}`), ...built.launch, ...secrets,
@@ -584,7 +614,7 @@ export function LaunchSheet({
               autoFocus
             />
           </label>
-          {resumeAgentId && <p className="help-p">Choose the CLI and model for this launch. The fixed agent has no saved model or software in its identity.</p>}
+          {resume && <p className="help-p">Defaults for employees without a reported launch. Choose each employee’s CLI, model and conversation below. Task-bound workers resume through their task controls.</p>}
           {resumeAgentId && targetSession === 'running' && <p className="err" role="alert">This agent already has a running session. Close it before resuming.</p>}
           <datalist id="launch-software">
             {softwareUsed.map((name) => (
@@ -820,7 +850,8 @@ export function LaunchSheet({
             ) : (
               <>
                 <p className="help-p">
-                  {resumeAgentId ? `Resume ${roster[0]?.name} only. Choose software above; this agent's last CLI and model are not known.` : 'The model at the top (with effort in the name) applies to everyone. Override it on a card if that employee should differ.'}
+                  {resumeAgentId && `Resume ${roster[0]?.name} only. `}
+                  Resume selected employees, each with their own CLI and model. Reported launch settings may differ from changes made inside a running CLI. A conversation UUID restores that host’s transcript; without it, only Hivemind tasks/checkpoints are recovered.
                   Copy all pastes a zsh script that opens one macOS Terminal window per employee (title Hive - Name). macOS may ask to control Terminal the first time.
                   {native && " Open terminals starts each employee in its own tmux session instead (an employee whose session still runs keeps it) and opens a Terminal window on each."}
                 </p>
@@ -837,28 +868,43 @@ export function LaunchSheet({
                       <button
                         type="button"
                         className="btn btn-ghost"
-                        disabled={!block.ok || !canCopyResumeCard}
+                        disabled={!block.ok}
                         onClick={() => void onCopy(block.text, block.agent.id)}
                       >
                         <Copy size={13} aria-hidden="true" />
                         {copied === block.agent.id ? "Copied" : "Copy"}
                       </button>
                     </div>
+                    <label className="check"><input type="checkbox" checked={block.included} disabled={block.running}
+                      onChange={e => setResumeEdit(block.agent.id, { included: e.target.checked })} /> Include in batch</label>
+                    <ResumeSoftware name={block.agent.name} value={block.seat.software}
+                      onChange={value => {
+                        const changedFamily = softwareFamily(value) !== softwareFamily(block.seat.software);
+                        setResumePreference(block.agent.id, { software: value, ...(changedFamily ? { model: '', effort: '', extraFlags: '' } : {}) });
+                        if (changedFamily) setResumeEdit(block.agent.id, { sessionId: '', native: false, environment: '' });
+                      }} />
                     <ModelSelect
-                      software={software}
-                      model={tunes[block.agent.name]?.model ?? ""}
-                      effort={tunes[block.agent.name]?.effort ?? ""}
-                      inherit={
-                        model
-                          ? softwareFamily(software) !== "cursor" && effort
-                            ? `${model} · ${effort}`
-                            : model
-                          : "default"
-                      }
-                      onChange={(next) => setTune(block.agent.name, next)}
+                      software={block.seat.software}
+                      model={block.seat.model}
+                      effort={block.seat.effort}
+                      onChange={(next) => setResumePreference(block.agent.id, next)}
                     />
-                    {resumeAgentId && !software.trim() ? <p className="help-p">Choose software to build this launch command.</p> :
-                      block.ok ? <pre className="launch-pre">{block.text}</pre> : <p className="help-p">{block.error}</p>}
+                    <label>Recovery<select value={block.seat.native ? 'native' : 'handoff'}
+                      onChange={e => setResumeEdit(block.agent.id, { native: e.target.value === 'native' })}>
+                      <option value="handoff">New conversation · recover Hivemind checkpoints</option>
+                      {['codex', 'claude'].includes(softwareFamily(block.seat.software)) && <option value="native">Resume original conversation</option>}
+                    </select></label>
+                    {block.seat.native ? <label>Conversation UUID<input value={block.seat.sessionId} spellCheck={false}
+                      onChange={e => setResumeEdit(block.agent.id, { sessionId: e.target.value })} /></label>
+                      : <p className="help-p">The previous transcript is not restored. Existing unfinished tasks and saved checkpoints will be read after joining; unsaved context may be missing.</p>}
+                    <details><summary>Employee launch options</summary>
+                      <label>CLI flags<input value={block.seat.extraFlags} onChange={e => setResumePreference(block.agent.id, { extraFlags: e.target.value })} /></label>
+                      <label>Environment variables<textarea value={block.seatEnvText} spellCheck={false}
+                        onChange={e => setResumeEdit(block.agent.id, { environment: e.target.value })} /></label>
+                      <p className="help-p">Use the original CLI installation and profile/home for native resume. Per-employee environment edits are not saved here; they are included in copied commands. No credentials or conversation files are imported.</p>
+                    </details>
+                    {block.ok ? <details><summary>Command preview</summary><pre className="launch-pre">{block.text}</pre></details>
+                      : <p className="err" role="alert">{block.error}</p>}
                   </article>
                 ))}
               </>

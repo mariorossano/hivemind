@@ -546,8 +546,9 @@ the script loads before the `cd` and deletes (steps 4 and 5 above). They are
 never in argv (tmux's or the shell's), never in `tmux -e` or tmux's
 environment, and never in the script text.
 
-**Resume same employees** applies the same variables to every employee it
-launches. The whole `terminal-launch` has to fit in one broker line (1 MiB), so
+**Resume same employees** resolves variables per employee's selected software and
+optional per-card environment edit; it does not share one provider's profile with
+another. See [Agent resume](agent-resume.md). The whole `terminal-launch` has to fit in one broker line (1 MiB), so
 the sheet refuses to send one that would not (24 employees with the largest
 variables full of characters JSON escapes), and asks to launch fewer at once.
 

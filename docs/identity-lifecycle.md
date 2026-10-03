@@ -69,8 +69,10 @@ still resolves to the current stored identity.
 
 The panel combines identity, current template settings when available, current work/checkpoint, inbox, API response bytes,
 native terminal evidence and lifecycle history. Current template settings are labelled separately from the running process;
-they may have changed since launch. A deleted template retains only its saved label. Fixed agents have no persisted software/model profile: Resume asks
-Human to choose the launch settings. Stop is an explicit native broker action, available only for a verified running
+they may have changed since launch. A deleted template retains only its saved label. Resume pre-fills reported
+Codex/Claude launch settings when available; these are not live model telemetry. Human can choose software/model per
+employee and supply the exact native conversation UUID. See [Agent resume](agent-resume.md).
+Stop is an explicit native broker action, available only for a verified running
 session. A missing broker connection means unknown, not stopped. Resume/Stop do not change an identity's role or
 silently launch a task-bound worker outside its task controls.
 

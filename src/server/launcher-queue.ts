@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { HiveError, type Agent, type Project } from "../shared/types.ts";
-import { buildLaunchCommand, projectLaunchTools } from "../shared/launch-prompt.ts";
+import { buildLaunchCommand, projectLaunchTools, softwareFamily } from "../shared/launch-prompt.ts";
+import type { NativeSession } from '../shared/native-session.ts';
 import { terminalSessionName } from "../shared/terminal-session.ts";
 import type { WorkerTemplate } from "../shared/worker-templates.ts";
 import { launchContext } from "./bot-definitions.ts";
@@ -28,6 +29,7 @@ export type LauncherCommand = { id: string; kind: "launch"; requestId: string; t
 export type LauncherQueueDeps = Core & { readonly home: string;
   readonly identity: { getAgent(id: string): Agent; archiveTaskWorker(agentId: string): Agent; suspendSession(agentId: string): Agent;
     templateWorkerCount(templateId: string): number;
+    nativeSession(id: string): NativeSession | null;
     retargetReservation(actor: Agent, agentId: string, template: WorkerTemplate): Agent };
   readonly projects: { getProject(id: string): Project };
   readonly workerTemplates: { get(id: string): WorkerTemplate };
@@ -389,13 +391,16 @@ export class LauncherQueue {
           throw new HiveError(500, "Launch ticket integrity failed");
         const context = launchContext(this.deps.home, serverUrl, project);
         if (context.botError) throw new HiveError(503, "Project launch context is unavailable");
+        const previous = resuming ? this.deps.identity.nativeSession(agent.id) : null;
+        const nativeResume = previous?.sessionId && previous.software === softwareFamily(template.spec.software)
+          ? { software: previous.software, sessionId: previous.sessionId } : undefined;
         const built = buildLaunchCommand({ software: template.spec.software, model: template.spec.model,
           effort: template.spec.effort, extraFlags: template.spec.extraFlags,
           ...projectLaunchTools(context, project, "worker"), workspacePath: project.worktree,
           cdWorktree: Boolean(project.worktree), projectSlug: project.slug, hiveName: project.name,
           passProject: true, role: "worker", seniority: template.spec.seniority, focus: template.spec.focus || null,
           adoptUntrusted: true, claim: ticket, claimName: agent.name,
-          resume: resuming, resumeName: resuming ? agent.name : undefined });
+          resume: resuming, resumeName: resuming ? agent.name : undefined, nativeResume });
         if (!built.cwd) throw new HiveError(409, "Project needs a worktree before a worker can launch");
         const session = workerSession(project.slug, agent.name);
         payload = { id: command.id, kind: "launch", requestId: row.id, templateId: template.id,

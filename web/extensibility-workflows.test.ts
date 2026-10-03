@@ -88,7 +88,7 @@ async function fixture(t: TestContext) {
   const onClose = () => { closed++; };
   const renderLaunch = async (projects = [a, b], defaultProject = a.slug) => {
     await act(async () => root.render(createElement(LaunchSheet, {
-      projects, agents: hive.identity.listAgents(human), defaultProject, onClose,
+      projects, agents: hive.identity.listAgents(human).map(agent => ({ ...agent, online: false })), defaultProject, onClose,
     })));
   };
   const context = (slug: string): LaunchContext => {
@@ -391,7 +391,7 @@ test("launch preferences and per-seat overrides survive remount without persisti
   const saved = JSON.parse(window.localStorage.getItem("hivemind-launch")!);
   assert.equal(saved.software, "claude");
   assert.equal(saved.resume, true);
-  assert.ok(Object.keys(saved.tunes).length > 0);
+  assert.ok(Object.keys(saved.resumePreferences).length > 0);
   assert.ok(!JSON.stringify(saved).includes("ONLY_PROJECT"));
   await act(async () => f.root.render(null));
   await f.renderLaunch();
