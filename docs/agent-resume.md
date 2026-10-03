@@ -1,60 +1,89 @@
 # Agent resume
 
-Three identifiers have different jobs: the employee's Hivemind identity, the native Codex/Claude conversation UUID,
-and the tmux session label. A tmux label or employee name cannot restore a model conversation.
+Resume belongs to Hivemind's integrated launcher. It restores each employee's last successful launch choices, not one
+common model for the whole roster. The Hivemind employee ID, provider conversation ID and tmux label are different
+identifiers; an employee name or terminal label cannot restore a provider transcript.
 
-## Resume a fixed employee or a mixed roster
+## Quick start
 
-1. Open **Launch agent → Resume same employees**, or the fixed employee's **Resume** action.
-2. Review each card's software, model and effort. Reported Codex/Claude launch settings pre-fill the cards independently;
-   Human's per-employee overrides are remembered in this browser by immutable agent ID, so a rename does not lose them.
-3. Choose **Resume original conversation** and check the exact conversation UUID. This builds `codex resume UUID`
-   or `claude --resume UUID`, with that employee's model/effort. It never uses `--last`, a name-based picker or another
-   provider's ID. CLI flags containing competing session selectors are rejected.
-4. Include the employees to restart, then copy the selected commands or launch the selected native sessions together.
-   Online/verified-running employees are blocked. Removed, archived, pending and task-bound identities are not in this
-   roster. A browser without native process evidence cannot prove that an offline agent's old process has exited;
-   check it before launching. The native broker retains its existing session-reuse safeguards.
+1. Launch an employee normally from **Launch agent** or a worker template. After its first successful join, Hivemind
+   saves the selected software/alias, model, effort, CLI flags, workspace and profile environment for that employee.
+2. When the employee is stopped, open **Resume same employees**, or its **Resume** action. Each card restores its own
+   choices and, for Codex, Claude Code and Cursor CLI, selects **Resume original conversation** with the recorded ID.
+3. Check the cards, include the employees you want and launch or copy the batch. Different clients/models can be resumed
+   together. A rename does not lose the settings because they belong to the immutable employee ID.
 
-Use **Employee launch options** for each employee's CLI flags and environment. Software accepts the existing launcher
-aliases (for example `codex-work` or `claude-work`); defaults recovered from reported metadata identify the provider,
-not a custom executable or account. Select the original installation/alias and profile/home when needed. Environment
-defaults belong to the exact software string; changing provider clears that card's native ID, model/effort, flags and
-environment edits. Other cards are unaffected. No account authentication or credential migration is performed.
-Per-card environment edits and manually entered UUIDs live only while this sheet is open, not in browser storage;
-environment values do appear in copied shell commands. Do not enter secrets there.
+The settings are saved on successful **join**, not when previewing, copying or starting a terminal. An unsuccessful launch
+does not replace the previous settings. Explicit edits in the sheet apply to the next launch; after it joins, those become
+the defaults. Stale browser preferences and later template changes do not replace the saved choices. Choosing `default`
+restores that choice, not a snapshot of the provider's changing default model. Model changes made inside a CLI are not
+tracked: Resume restores what was selected in Hivemind.
 
-Native resume depends on the original provider's saved session being accessible under the selected profile/home.
-An unavailable session is a CLI error, not permission to silently create a new conversation. Launch acknowledgement
-only proves that the terminal process started, not that the CLI restored the transcript or joined Hivemind.
+Online/verified-running employees cannot be restarted here. Pending reservations, archived/removed identities and
+task-bound workers keep their existing lifecycle controls. A browser cannot prove an offline employee's old process has
+exited; check before launching. The native broker still checks terminal reuse. A terminal-start acknowledgement does not
+prove successful transcript recovery or join.
 
-## Recording conversation IDs
+## Native conversations
 
-Generated Codex/Claude prompts ask the agent to include `nativeSession` in its real MCP join: provider, exact conversation
-UUID (or null), requested model and effort. The host may expose `CODEX_THREAD_ID` or `CLAUDE_CODE_SESSION_ID` to its shell
-tool; the prompt asks to read only that variable, never scan transcripts or guess an ID. This is best-effort reporting:
-hosts that do not expose an ID still join normally and show checkpoint recovery instead. Older sessions have no automatic
-backfill; Human may enter their known UUID. Changing a model inside the CLI does not update the recorded launch choice.
+Hivemind records IDs programmatically, without asking the model to discover IDs or read conversation files:
 
-Migration 41 adds a separate metadata table without changing identities, tasks or credentials. Only Human's project-scoped
-launch context exposes these records; agent rosters and UI snapshots do not include conversation IDs. The metadata is
-self-reported, not authentication, task authority or verified process liveness. A new join without metadata clears the
-previous record so it cannot silently reuse a stale conversation. A repeated authenticated join that omits it preserves
-the current record. No transcript or secret is stored here.
+| Client | New conversation | Resume |
+| --- | --- | --- |
+| Codex | A `SessionStart` command hook reports `session_id` | `codex resume ID` |
+| Claude Code | Hivemind assigns a UUID with `--session-id` | `claude --resume ID` |
+| Cursor CLI (`agent`, `cursor-agent`, aliases) | `create-chat` returns a chat ID before the interactive launch | `agent --resume ID` |
 
-## Task-bound workers and changing provider
+Codex needs a version supporting inline `SessionStart` hooks, with hooks enabled and the Hivemind hook reviewed in `/hooks`.
+Native trust and approvals are not bypassed. If capture is unavailable, join fails with an explicit diagnostic; no ID is
+guessed. After trusting a previously skipped startup hook, restart/resume the CLI so its startup event runs again.
+The hook definition is stable across launches; a Hivemind executable/path change may require review again.
 
-Task-bound workers resume through the existing task controls, including hard-pause approval and the native kill/launch
-acknowledgements. The task launcher uses the saved UUID only if its provider matches the current template. It retains
-the current template's executable, flags, environment, model and effort; it does not let a saved report replace executable
-configuration or bypass task lifecycle checks.
+Claude receives the per-launch Hivemind MCP binding. Codex receives that binding plus the hook through CLI configuration,
+without editing the user's config files. Cursor uses its normally configured Hivemind stdio MCP server and inherits the
+launch environment; it must point to the same Hivemind instance. Cursor support concerns **CLI chats**, not IDE chat tabs.
+Cursor's chat-creation and resume commands use the same alias, flags, working directory and profile environment.
 
-**New conversation · recover Hivemind checkpoints** starts a new host conversation with the same employee identity.
-The generated prompt calls for reading `get_handoffs`, all relevant pages and current task checkpoints/contracts before
-acting. This also covers an explicit provider change. Existing task controls decide whether work may resume; old context
-does not override stops or replay completed actions. Saved checkpoints can be absent or stale, and unsaved decisions or
-work outside Hivemind are not automatically reconstructed. There is no provider-to-provider transcript conversion or
-model-generated summarization service. Missing context is reported rather than invented.
+Use the original installed CLI/alias and profile/home. Hivemind does not copy transcripts, credentials or accounts.
+A missing provider session remains a CLI error: there is no silent `--last`, conversation picker or fresh-chat fallback.
+Conflicting resume/fork selectors in extra CLI flags are rejected. Exact native recovery does not convert transcripts
+between providers. Custom aliases must forward the generated arguments and environment.
 
-CLI references: [Codex resume](https://developers.openai.com/codex/cli/reference/#codex-resume),
-[Claude Code CLI](https://code.claude.com/docs/en/cli-reference).
+## Existing employees and checkpoint recovery
+
+Older launches have no automatic configuration/ID backfill. Legacy reported metadata can prefill model and effort, but
+cannot reconstruct a custom profile or executable. Human can enter a known conversation ID and review the other choices
+once; a successful tracked join records them for subsequent resumes. Do not guess IDs or scan unrelated transcripts.
+
+**New conversation · recover Hivemind checkpoints** explicitly starts fresh with the same Hivemind identity. This is also
+the recovery path after selecting another provider. The prompt asks for unfinished handoffs, paginated checkpoints and
+current contracts before work resumes. Missing or unsaved context is not reconstructed automatically. Current stops,
+permissions and completed work take precedence over old conversation instructions.
+
+## Task-bound workers
+
+Use task Resume, including the existing hard-pause/kill acknowledgements and launch approval. Once a worker has joined a
+tracked launch, task Resume uses **that worker's saved launch snapshot**, not the current template's model, effort,
+software, flags or environment. Template availability, capacity, task lifecycle and current secret access still gate the
+operation. Secret values come from the native credential store, not a historical snapshot. Legacy workers without a saved
+launch retain the old template-based checkpoint-recovery behavior; matching legacy native IDs may still be resumed.
+
+## Storage and safety
+
+Migration 41 stores legacy provider metadata. Migration 42 adds encrypted launch settings and single-launch capabilities.
+Only Human's project-scoped launcher API and the approved task queue prepare executable configuration. The MCP process
+passes the capability automatically; a model's `nativeSession` cannot overwrite tracked launch choices. Binding settings
+and joining happen atomically. Expired commands, mismatched identities/projects, replayed launches and prepared resumes
+superseded by a newer join are rejected. Preparing/copying a command is not permission to perform its assigned work.
+
+The Human launch context exposes only that project's settings. Agent rosters and ordinary UI snapshots omit them.
+Configuration is encrypted using the private `launcher-queue.key`; protect it together with the database and do not delete
+it during upgrades. Callback capabilities are stored as hashes. No transcripts, native API-key fields or Keychain values
+are imported. Arbitrary environment values can nevertheless contain secrets: they are encrypted on the server but appear
+in copied shell commands. Use the native secret fields instead. Unused prepared commands expire after 24 hours; copy again
+if necessary. Untracked replacement joins clear the tracked association to avoid restoring a stale conversation.
+
+Provider references: [Codex hooks](https://learn.chatgpt.com/docs/hooks),
+[Codex resume](https://developers.openai.com/codex/cli/reference/#codex-resume),
+[Claude Code CLI](https://code.claude.com/docs/en/cli-reference),
+[Cursor CLI parameters](https://cursor.com/docs/cli/reference/parameters).

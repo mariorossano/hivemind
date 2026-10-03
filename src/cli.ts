@@ -123,7 +123,13 @@ export async function runCli(argv: string[]): Promise<void> {
 
   if (cmd === "mcp") {
     const { startMcp } = await import("./mcp/index.ts");
-    await startMcp();
+    await startMcp(arg(argv, '--launch-ticket'));
+    return;
+  }
+
+  if (cmd === '_capture-session') {
+    const { captureSession } = await import('./client/capture-session.ts');
+    await captureSession(argv.slice(1));
     return;
   }
 

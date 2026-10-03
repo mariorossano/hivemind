@@ -18,6 +18,7 @@ import { brainWorkerOrchestration } from "./brain-worker-orchestration.ts";
 import { agentManagement } from './agent-management.ts';
 import { channelArchives } from './channel-archives.ts';
 import { agentNativeSessions } from './agent-native-sessions.ts';
+import { launchSessions } from './launch-sessions.ts';
 import { schemaShape, validateCoreStorage, validateSchema, type SchemaShape } from "./validate.ts";
 
 /**
@@ -91,6 +92,7 @@ export const MIGRATIONS: readonly Migration[] = [
   } },
   { version: 40, name: "channel_archives", up: channelArchives },
   { version: 41, name: "agent_native_sessions", up: agentNativeSessions },
+  { version: 42, name: 'launch_sessions', up: launchSessions },
 ];
 
 /** The last idempotent baseline migration; later migrations may assume its schema. */

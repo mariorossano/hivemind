@@ -229,6 +229,39 @@ test("missing, corrupt and non-private escrow keys fail closed while a command i
   assert.equal(f.hive.launcherQueue.get(id).state, "approved");
 });
 
+test('task resume restores its original launch choices after its template changes', async t => {
+  const f = fixture(t), target = '/api/launcher/next?timeoutMs=0';
+  f.hive.identity.setLaunchMode(f.human, f.brain.name, 'auto');
+  const request = f.hive.workerOrchestration.request(f.hive.identity.getAgent(f.brain.id), { requestId: randomUUID(),
+    template: f.template.slug, contract: { objective: 'Original settings test', scope: [], nonGoals: [], acceptanceCriteria: ['ok'],
+      dependencies: [], evidenceSeqs: [] } });
+  const first = (await (await f.signed('GET', target)).json() as { command: Record<string, any> }).command;
+  const launchTicket = /hml_[a-f0-9]{64}/.exec(first.command)![0], claim = /hmc_[a-f0-9]{48}/.exec(first.command)![0];
+  const sessionId = '67d735d1-9e33-4a61-9645-a931afc97f2b';
+  f.hive.launchSessions.capture(launchTicket, sessionId);
+  const response = await f.app.request('/api/agent/join', { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ role: 'worker', project: f.project.slug, seniority: 'mid', claim, launchTicket }) });
+  assert.equal(response.status, 200, await response.text());
+  await f.signed('POST', `/api/launcher/${first.id}/result`, { status: 'launched', session: first.session });
+  f.hive.workerTemplates.update(f.human, f.template.id, { expectedRevision: f.template.revision,
+    spec: { ...spec(), software: 'claude-other', model: 'other-model', effort: 'low', extraFlags: '--verbose',
+      environment: { DIFFERENT_PROFILE: 'changed' } } });
+  const task = () => f.hive.tasks.get(f.human, request.task.id);
+  const pause = f.hive.tasks.control(f.human, request.task.id,
+    { requestId: randomUUID(), expectedRevision: task().revision, action: { type: 'pause', mode: 'hard' } });
+  f.hive.tasks.sweepHardPauses(pause.task.pause!.graceUntil!);
+  const kill = (await (await f.signed('GET', target)).json() as { command: Record<string, any> }).command;
+  await f.signed('POST', `/api/launcher/${kill.id}/result`, { status: 'killed' });
+  f.hive.tasks.control(f.human, request.task.id,
+    { requestId: randomUUID(), expectedRevision: task().revision, action: { type: 'resume' } });
+  const resumed = (await (await f.signed('GET', target)).json() as { command: Record<string, any> }).command;
+  assert.match(resumed.command, new RegExp(`codex2 resume '${sessionId}' -m gpt-6-sol -c model_reasoning_effort=high`));
+  assert.doesNotMatch(resumed.command, /claude-other|other-model|--verbose/);
+  assert.deepEqual(resumed.environment, spec().environment);
+  assert.equal(resumed.cwd, f.project.worktree);
+  assert.equal(resumed.agent, first.agent);
+});
+
 test("Human approval cards retain older pending requests beyond the settled history page", async t => {
   const f = fixture(t), pending = f.request();
   for (let i = 0; i < 201; i++) {

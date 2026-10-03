@@ -13,7 +13,7 @@ import type { LaunchContext } from "../src/shared/launch-prompt.ts";
 import { api } from "./api.ts";
 import { App } from "./App.tsx";
 import { LaunchSheet } from "./LaunchSheet.tsx";
-import { countRows, hasRow, listRows, seedMessages } from "../src/server/test-fixtures.ts";
+import { countRows, hasRow, listRows, seedMessages, setAgentPresence } from "../src/server/test-fixtures.ts";
 
 const window = new Window({ url: "http://localhost/" });
 Object.assign(globalThis, { window, document: window.document, location: window.location,
@@ -161,6 +161,7 @@ test("App renders a bot observation once under duplicate delivery and keeps its 
 
 test("mounted launch switches project tools safely, excludes bot seats and only copies scoped commands", async t => {
   const f = await fixture(t);
+  for (const agent of [f.brainA, f.brainB, f.worker]) setAgentPresence(f.hive, agent.id, { online: false, lastSeenAt: 0 });
   t.mock.method(api, "launchContext", async (slug: string) => f.context(slug));
   await f.renderLaunch();
   assert.match(f.host.querySelector("pre")!.textContent!, new RegExp(f.context(f.a.slug).botInstructions));
@@ -195,6 +196,8 @@ test("mounted launch switches project tools safely, excludes bot seats and only 
   await f.click(f.button("Copy all"));
   assert.equal(f.copies.length, 1);
   assert.match(f.copies[0]!, /#!\/bin\/zsh/);
+  assert.equal(new Set(f.copies[0]!.match(/hml_[a-f0-9]{64}/g)).size, 3, 'each copied employee gets its own server-prepared launch');
+  assert.doesNotMatch(f.copies[0]!, /Include nativeSession=/);
   assert.doesNotMatch(f.copies[0]!, /FeedA|FeedB/);
   assert.ok(!f.copies[0]!.includes(f.botA.token));
   assert.ok(!window.localStorage.getItem("hivemind-launch")!.includes("ONLY_PROJECT"));

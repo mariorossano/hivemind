@@ -54,7 +54,7 @@ export function resolveVisibleWorkerReference(reference: string, roster: Agent[]
   throw new Error(`Worker name ${value} is ambiguous; pass the worker UUID from agents/worker_match_suggest`);
 }
 
-export async function startMcp() {
+export async function startMcp(launchTicket = process.env.HIVEMIND_LAUNCH_TICKET) {
   let sessionToken = process.env.HIVEMIND_TOKEN;
   const toolRole = configuredToolRole(process.env);
   let heartbeat: ReturnType<typeof setInterval> | undefined;
@@ -107,7 +107,7 @@ export async function startMcp() {
       resume: z.string().optional(),
       project: z.string().optional(),
       claim: z.string().optional().describe(PARAM_DESCRIPTIONS.claim),
-      nativeSession: nativeSessionSchema.optional().describe('Optional host-reported CLI/model and exact conversation UUID. Not the Hivemind identity or tmux name. Never guess an ID; use null when unavailable.'),
+      nativeSession: nativeSessionSchema.optional().describe('Legacy optional CLI/model and exact conversation ID. Integrated launches record these automatically. Not the Hivemind identity or tmux name. Never guess an ID; use null when unavailable.'),
     },
     async ({ role, seniority, focus, resume, project, claim, nativeSession }) => joinSerial(async () => {
       if (toolRole && role !== toolRole)
@@ -146,6 +146,7 @@ export async function startMcp() {
           ...(claim ? { claim } : {}),
           ...terminalSessionFields(process.env),
           ...(nativeSession ? { nativeSession } : {}),
+          ...(launchTicket ? { launchTicket } : {}),
         },
         claim ? null : auth ?? null,
       );

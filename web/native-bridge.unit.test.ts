@@ -4,7 +4,7 @@ import { Window } from "happy-dom";
 import { act, createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { Agent, Channel, Message, Project } from "../src/shared/types.ts";
-import { launchBlockText, type LaunchContext } from "../src/shared/launch-prompt.ts";
+import { buildLaunchCommand, launchBlockText, projectLaunchTools, softwareFamily, type LaunchContext } from "../src/shared/launch-prompt.ts";
 import type { DesktopNotifications } from "./desktop-notifications.ts";
 import {
   appLinks, badgeSync, inNativeApp, nativeBridge, notifyNative, postNative, reportedNativePlatform, resetNativePlatform, runNativeCommand,
@@ -294,11 +294,18 @@ const seat = (id: string, name: string, role: "brain" | "worker"): Agent => ({ i
   focus: role === "brain" ? "coord" : "frontend", online: false, lastSeenAt: 0, createdAt: 0, projectId: "p1", project: "acme" });
 
 async function mountLaunchSheet(agents: Agent[] = [], context = launchContext) {
-  const original = api.launchContext;
+  const original = api.launchContext, originalPrepare = api.prepareLaunch;
   api.launchContext = async () => context;
+  // Unit boundary: server-issued tracking is covered by the HTTP/MCP integration tests.
+  // Preserve the submitted configuration here so these tests exercise bridge batching and secrets.
+  api.prepareLaunch = async request => ({ ...buildLaunchCommand({ ...request.settings,
+    ...projectLaunchTools(context, project, request.settings.role), projectSlug: project.slug, hiveName: project.name,
+    resume: Boolean(request.agentId), resumeName: agents.find(a => a.id === request.agentId)?.name,
+    ...(request.native ? { nativeResume: { software: softwareFamily(request.settings.software) as 'codex' | 'claude' | 'cursor', sessionId: request.sessionId! } } : {}) }),
+    environment: request.settings.environment });
   const view = await mount(() => createElement(LaunchSheet, { projects: [project], agents, defaultProject: "acme", onClose() {} }));
   await act(async () => {});
-  unmounts.push(() => { api.launchContext = original; });
+  unmounts.push(() => { api.launchContext = original; api.prepareLaunch = originalPrepare; });
   const buttons = () => Array.from(view.host.querySelectorAll(".launch-footer button")) as unknown as HTMLButtonElement[];
   const button = (label: RegExp) => buttons().find(b => label.test(b.textContent ?? ""));
   const blocks = () => Array.from(view.host.querySelectorAll(".launch-pre")).map(pre => pre.textContent ?? "");
@@ -408,6 +415,70 @@ test('online agents are not restarted and task-bound, archived and pending seats
   assert.match(sheet.view.host.textContent!, /Already online or running/);
   await act(async () => sheet.button(/^Start in background$/)!.click());
   assert.deepEqual(launchesPosted()[0].launches.map(l => l.agent), ['Bea']);
+});
+
+test('saved launch choices beat stale browser preferences and explicit edits start from the saved card', async () => {
+  localStorage.setItem('hivemind-launch', JSON.stringify({ resume: true, software: 'claude',
+    resumePreferences: { a1: { software: 'claude', model: 'stale-model', effort: 'low', extraFlags: '--stale' } } }));
+  installBridge();
+  const id = '67d735d1-9e33-4a61-9645-a931afc97f2b';
+  const sheet = await mountLaunchSheet([seat('a1', 'Atlas', 'brain')], { ...launchContext, savedLaunches: { a1: {
+    settings: { software: 'codex-work', model: 'saved-model', effort: 'high', extraFlags: '--search',
+      workspacePath: '/fixture/original-worktree', cdWorktree: true, passProject: true, adoptUntrusted: true,
+      role: 'brain', seniority: null, focus: 'coord', environment: { CODEX_HOME: '/fixture/original-profile' } },
+    sessionId: id, captured: true,
+  } } });
+  const card = sheet.view.host.querySelector('.launch-card')!;
+  assert.match(card.querySelector('pre')!.textContent!, /codex-work resume/);
+  assert.match(card.querySelector('pre')!.textContent!, /saved-model/);
+  const flags = Array.from(card.querySelectorAll('label')).find(label => label.textContent?.startsWith('CLI flags'))!.querySelector('input')!;
+  await typeInto(flags as unknown as HTMLInputElement, '--search --color never');
+  await ready();
+  await act(async () => sheet.button(/^Start in background$/)!.click());
+  const launch = launchesPosted()[0].launches[0];
+  assert.match(launch.command, new RegExp(`codex-work resume '${id}' -m saved-model -c model_reasoning_effort=high --search --color never`));
+  assert.equal(launch.cwd, '/fixture/original-worktree');
+  assert.deepEqual(launch.environment, { CODEX_HOME: '/fixture/original-profile' });
+  assert.doesNotMatch(launch.command, /stale-model|--stale/);
+});
+
+test('a failed prepare never launches any part of a selected batch', async () => {
+  localStorage.setItem('hivemind-launch', JSON.stringify({ resume: true }));
+  installBridge();
+  const sheet = await mountLaunchSheet([seat('a1', 'Atlas', 'brain'), seat('a2', 'Bea', 'worker')]);
+  const prepare = api.prepareLaunch;
+  api.prepareLaunch = async request => {
+    if (request.agentId === 'a2') throw new Error('Employee resumed since this command was prepared');
+    return prepare(request);
+  };
+  await ready();
+  await act(async () => sheet.button(/^Start 2 in background$/)!.click());
+  assert.deepEqual(launchesPosted(), []);
+  assert.match(sheet.view.host.querySelector('[role=alert]')!.textContent!, /Employee resumed/);
+});
+
+test('Copy requests clipboard access during the click, before async preparation completes (Safari)', async t => {
+  const sheet = await mountLaunchSheet();
+  let release!: () => void, requested = false, copied = '';
+  const gate = new Promise<void>(resolve => { release = resolve; }), prepare = api.prepareLaunch;
+  api.prepareLaunch = async request => { await gate; return prepare(request); };
+  const oldItem = Object.getOwnPropertyDescriptor(globalThis, 'ClipboardItem');
+  const oldClipboard = Object.getOwnPropertyDescriptor(globalThis.navigator, 'clipboard');
+  class Item { constructor(readonly data: Record<string, Promise<Blob>>) {} }
+  Object.defineProperty(globalThis, 'ClipboardItem', { configurable: true, value: Item });
+  Object.defineProperty(globalThis.navigator, 'clipboard', { configurable: true, value: {
+    write: async (items: Item[]) => { requested = true; copied = await (await items[0].data['text/plain']).text(); },
+  } });
+  t.after(() => {
+    if (oldItem) Object.defineProperty(globalThis, 'ClipboardItem', oldItem); else Reflect.deleteProperty(globalThis, 'ClipboardItem');
+    if (oldClipboard) Object.defineProperty(globalThis.navigator, 'clipboard', oldClipboard); else Reflect.deleteProperty(globalThis.navigator, 'clipboard');
+  });
+  await act(async () => sheet.button(/^Copy command$/)!.click());
+  assert.equal(requested, true, 'permission requested before network completion');
+  assert.equal(copied, '');
+  await act(async () => { release(); await gate; });
+  assert.match(copied, /HIVEMIND_ROLE='brain' codex/);
+  assert.ok(sheet.button(/^Copied$/));
 });
 
 test('switching a resume card to another provider explicitly clears native recovery and keeps other cards intact', async () => {

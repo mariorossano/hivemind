@@ -10,6 +10,7 @@ import { Hive } from "../server/hive.ts";
 import { startServer } from "../server/serve.ts";
 import type { WaitResult } from "../shared/types.ts";
 import { childEnv } from "../test-support/child-process.ts";
+import { captureSession } from '../client/capture-session.ts';
 
 test("real concurrent/repeated MCP joins reuse the active identity without exposing its token or resetting delivery", { timeout: 20_000 }, async t => {
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
@@ -73,3 +74,37 @@ test("an MCP client launched in a Hivemind tmux session reports it on join; the 
   assert.deepEqual(hive.identity.nativeSession(hive.identity.getAgentByName(name)!.id), nativeSession,
     "an idempotent join without metadata preserves the current native conversation");
 });
+
+for (const software of ['codex', 'claude', 'cursor'] as const)
+  test(`real MCP join binds the launch automatically with no model-supplied metadata (${software})`, { timeout: 20_000 }, async t => {
+    const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'hive-auto-session-'));
+    const hive = new Hive(path.join(dir, 'hive.db')), service = startServer({ hive, port: 0, telegram: false });
+    const project = hive.projects.listProjects()[0]!, url = `http://127.0.0.1:${await service.ready}`;
+    const settings = { software, model: 'fixture', effort: 'high', extraFlags: '', environment: {},
+      workspacePath: dir, cdWorktree: true, passProject: true, adoptUntrusted: true,
+      role: 'brain' as const, seniority: null, focus: 'coord' };
+    const launch = hive.launchSessions.prepare(project.id, settings, null);
+    const client = new Client({ name: 'tracked-fixture', version: '0' });
+    const transport = new StdioClientTransport({ command: process.execPath,
+      args: ['--import', path.join(root, 'node_modules/tsx/dist/loader.mjs'), path.join(root, 'src/cli.ts'), 'mcp',
+        ...(software === 'cursor' ? [] : ['--launch-ticket', launch.ticket])], cwd: dir,
+      env: childEnv({ PATH: process.env.PATH ?? '', HIVEMIND_HOME: path.join(dir, 'client'), HIVEMIND_URL: url,
+        HIVEMIND_TOKEN: '', ...(software === 'cursor' ? { HIVEMIND_LAUNCH_TICKET: launch.ticket } : {}) }), stderr: 'pipe' });
+    t.after(async () => { await client.close(); await transport.close(); await service.shutdown(); hive.db.close();
+      rmSync(dir, { recursive: true, force: true }); });
+    const id = launch.sessionId ?? '019b2800-1234-7000-8000-000000000001';
+    if (software !== 'claude') {
+      async function* input() { yield software === 'codex'
+        ? JSON.stringify({ hook_event_name: 'SessionStart', source: 'startup', session_id: id }) : id; }
+      await captureSession(['--url', url, '--ticket', launch.ticket, ...(software === 'codex' ? ['--hook'] : [])], input());
+    }
+    await client.connect(transport);
+    const result = await client.callTool({ name: 'join', arguments: { role: 'brain', project: project.slug } });
+    assert.notEqual(result.isError, true, JSON.stringify(result));
+    const text = (result.content as Array<{ type: string; text: string }>)[0]!.text;
+    assert.ok(!text.includes(launch.ticket), 'private launch capability never reaches model output');
+    const agent = hive.identity.getAgentByName(JSON.parse(text).name)!;
+    assert.deepEqual(hive.launchSessions.saved(agent.id), { settings, sessionId: id, captured: true });
+    assert.equal(hive.identity.nativeSession(agent.id)!.sessionId, id);
+  });
