@@ -76,7 +76,7 @@ test("an MCP client launched in a Hivemind tmux session reports it on join; the 
 });
 
 for (const software of ['codex', 'claude', 'cursor'] as const)
-  test(`real MCP join binds the launch automatically with no model-supplied metadata (${software})`, { timeout: 20_000 }, async t => {
+  test(`real MCP join and process reconnect preserve the tracked launch and unacknowledged mail (${software})`, { timeout: 20_000 }, async t => {
     const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
     const dir = mkdtempSync(path.join(os.tmpdir(), 'hive-auto-session-'));
     const hive = new Hive(path.join(dir, 'hive.db')), service = startServer({ hive, port: 0, telegram: false });
@@ -85,13 +85,21 @@ for (const software of ['codex', 'claude', 'cursor'] as const)
       workspacePath: dir, cdWorktree: true, passProject: true, adoptUntrusted: true,
       role: 'brain' as const, seniority: null, focus: 'coord' };
     const launch = hive.launchSessions.prepare(project.id, settings, null);
-    const client = new Client({ name: 'tracked-fixture', version: '0' });
-    const transport = new StdioClientTransport({ command: process.execPath,
-      args: ['--import', path.join(root, 'node_modules/tsx/dist/loader.mjs'), path.join(root, 'src/cli.ts'), 'mcp',
-        ...(software === 'cursor' ? [] : ['--launch-ticket', launch.ticket])], cwd: dir,
-      env: childEnv({ PATH: process.env.PATH ?? '', HIVEMIND_HOME: path.join(dir, 'client'), HIVEMIND_URL: url,
-        HIVEMIND_TOKEN: '', ...(software === 'cursor' ? { HIVEMIND_LAUNCH_TICKET: launch.ticket } : {}) }), stderr: 'pipe' });
-    t.after(async () => { await client.close(); await transport.close(); await service.shutdown(); hive.db.close();
+    const clients: Client[] = [], transports: StdioClientTransport[] = [];
+    const connect = async () => {
+      const client = new Client({ name: 'tracked-fixture', version: '0' });
+      const transport = new StdioClientTransport({ command: process.execPath,
+        args: ['--import', path.join(root, 'node_modules/tsx/dist/loader.mjs'), path.join(root, 'src/cli.ts'), 'mcp',
+          ...(software === 'cursor' ? [] : ['--launch-ticket', launch.ticket])], cwd: dir,
+        env: childEnv({ PATH: process.env.PATH ?? '', HIVEMIND_HOME: path.join(dir, 'client'), HIVEMIND_URL: url,
+          HIVEMIND_TOKEN: '', ...(software === 'cursor' ? { HIVEMIND_LAUNCH_TICKET: launch.ticket } : {}) }), stderr: 'pipe' });
+      clients.push(client); transports.push(transport);
+      await client.connect(transport);
+      return client;
+    };
+    t.after(async () => { for (const client of clients) await client.close();
+      for (const transport of transports) await transport.close();
+      await service.shutdown(); hive.db.close();
       rmSync(dir, { recursive: true, force: true }); });
     const id = launch.sessionId ?? '019b2800-1234-7000-8000-000000000001';
     if (software !== 'claude') {
@@ -99,7 +107,7 @@ for (const software of ['codex', 'claude', 'cursor'] as const)
         ? JSON.stringify({ hook_event_name: 'SessionStart', source: 'startup', session_id: id }) : id; }
       await captureSession(['--url', url, '--ticket', launch.ticket, ...(software === 'codex' ? ['--hook'] : [])], input());
     }
-    await client.connect(transport);
+    const client = await connect();
     const result = await client.callTool({ name: 'join', arguments: { role: 'brain', project: project.slug } });
     assert.notEqual(result.isError, true, JSON.stringify(result));
     const text = (result.content as Array<{ type: string; text: string }>)[0]!.text;
@@ -107,4 +115,28 @@ for (const software of ['codex', 'claude', 'cursor'] as const)
     const agent = hive.identity.getAgentByName(JSON.parse(text).name)!;
     assert.deepEqual(hive.launchSessions.saved(agent.id), { settings, sessionId: id, captured: true });
     assert.equal(hive.identity.nativeSession(agent.id)!.sessionId, id);
+    const dm = hive.channels.openDm(hive.identity.getAgent('human'), agent.name);
+    hive.messages.postMessage(hive.identity.getAgent('human'), { channel: dm.id, body: 'Keep this pending across reconnect' });
+    const offered = await client.callTool({ name: 'wait', arguments: {} });
+    assert.notEqual(offered.isError, true);
+    const mail = JSON.parse((offered.content as Array<{ text: string }>)[0]!.text) as WaitResult;
+    assert.ok(mail.delivery);
+    assert.ok(mail.mail?.length);
+    const fingerprint = hive.identity.sessionFingerprint(agent.id);
+    await client.close();
+    const restarted = await connect();
+    const rejoined = await restarted.callTool({ name: 'join', arguments: { role: 'brain', project: project.slug, resume: agent.name } });
+    assert.notEqual(rejoined.isError, true, JSON.stringify(rejoined));
+    const rejoinedText = (rejoined.content as Array<{ text: string }>)[0]!.text;
+    assert.equal(JSON.parse(rejoinedText).name, agent.name);
+    assert.doesNotMatch(rejoinedText, /hm_[a-f0-9]{48}|hml_[a-f0-9]{64}/);
+    assert.notEqual(hive.identity.sessionFingerprint(agent.id), fingerprint);
+    assert.deepEqual(hive.launchSessions.saved(agent.id), { settings, sessionId: id, captured: true });
+    const redelivered = await restarted.callTool({ name: 'wait', arguments: {} });
+    assert.notEqual(redelivered.isError, true);
+    const nextMail = JSON.parse((redelivered.content as Array<{ text: string }>)[0]!.text) as WaitResult;
+    assert.ok(nextMail.mail?.length);
+    assert.deepEqual(nextMail.mail.map(m => m.messageId), mail.mail.map(m => m.messageId));
+    const acknowledged = await restarted.callTool({ name: 'ack_delivery', arguments: { deliveryId: nextMail.delivery!.id } });
+    assert.notEqual(acknowledged.isError, true);
   });

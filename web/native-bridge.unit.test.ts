@@ -14,6 +14,7 @@ import {
   type TerminalSessionLaunch,
 } from "./native-bridge.ts";
 import type { Sel } from "./selection.ts";
+import type { LaunchSettings } from '../src/shared/launch-settings.ts';
 
 const window = new Window({ url: "http://127.0.0.1:7420/" });
 Object.assign(globalThis, { window, document: window.document, localStorage: window.localStorage,
@@ -293,9 +294,9 @@ const launchContext: LaunchContext = { project: { id: "p1", slug: "acme" }, botD
 const seat = (id: string, name: string, role: "brain" | "worker"): Agent => ({ id, name, role, seniority: role === "worker" ? "mid" : null,
   focus: role === "brain" ? "coord" : "frontend", online: false, lastSeenAt: 0, createdAt: 0, projectId: "p1", project: "acme" });
 
-async function mountLaunchSheet(agents: Agent[] = [], context = launchContext) {
+async function mountLaunchSheet(agents: Agent[] = [], context = launchContext, pendingContext?: Promise<LaunchContext>) {
   const original = api.launchContext, originalPrepare = api.prepareLaunch;
-  api.launchContext = async () => context;
+  api.launchContext = async () => pendingContext ?? context;
   // Unit boundary: server-issued tracking is covered by the HTTP/MCP integration tests.
   // Preserve the submitted configuration here so these tests exercise bridge batching and secrets.
   api.prepareLaunch = async request => ({ ...buildLaunchCommand({ ...request.settings,
@@ -417,6 +418,50 @@ test('online agents are not restarted and task-bound, archived and pending seats
   assert.deepEqual(launchesPosted()[0].launches.map(l => l.agent), ['Bea']);
 });
 
+test('resume ignores edits made before saved settings load, then changes only the explicitly selected model', async () => {
+  localStorage.setItem('hivemind-launch', JSON.stringify({ resume: true, software: 'codex',
+    model: 'stale-model', effort: 'high', extraFlags: '--search' }));
+  installBridge();
+  const id = '67d735d1-9e33-4a61-9645-a931afc97f2b';
+  const settings: LaunchSettings = { software: 'claude-work', model: 'saved-model', effort: 'xhigh', extraFlags: '--verbose',
+    environment: { CLAUDE_CONFIG_DIR: '/fixture/original-profile' }, workspacePath: '/fixture/original-worktree',
+    cdWorktree: true, passProject: true, adoptUntrusted: true, role: 'brain', seniority: null, focus: 'coord' };
+  const context = { ...launchContext, savedLaunches: { a1: { settings, sessionId: id, captured: true } } };
+  let resolveContext!: (context: LaunchContext) => void;
+  const pending = new Promise<LaunchContext>(resolve => { resolveContext = resolve; });
+  const sheet = await mountLaunchSheet([seat('a1', 'Atlas', 'brain')], context, pending);
+  const card = sheet.view.host.querySelector('.launch-card')!;
+  const model = Array.from(card.querySelectorAll('label')).find(label => label.textContent?.startsWith('Model'))!
+    .querySelector('select')!;
+  const recovery = Array.from(card.querySelectorAll('label')).find(label => label.textContent?.startsWith('Recovery'))!
+    .querySelector('select')!;
+  assert.match(card.textContent!, /Loading this employee/);
+  // Synthetic/late events must be harmless too, not just pointer/keyboard input.
+  await act(async () => {
+    model.value = ''; model.dispatchEvent(new window.Event('change', { bubbles: true }) as unknown as Event);
+    recovery.value = 'handoff'; recovery.dispatchEvent(new window.Event('change', { bubbles: true }) as unknown as Event);
+  });
+  await act(async () => resolveContext(context));
+  assert.match(card.querySelector('pre')!.textContent!, /claude-work --resume/);
+  assert.match(card.querySelector('pre')!.textContent!, /saved-model/);
+  assert.equal(recovery.value, 'native');
+  await act(async () => { model.value = ''; model.dispatchEvent(new window.Event('change', { bubbles: true }) as unknown as Event); });
+  const submitted: LaunchSettings[] = [], prepare = api.prepareLaunch;
+  api.prepareLaunch = async request => {
+    assert.equal(request.native, true);
+    assert.equal(request.sessionId, id);
+    submitted.push(request.settings);
+    return prepare(request);
+  };
+  await ready();
+  await act(async () => sheet.button(/^Start in background$/)!.click());
+  assert.deepEqual(submitted, [{ ...settings, model: '', effort: '' }]);
+  const batch = launchesPosted()[0];
+  assert.match(batch.launches[0].command, new RegExp(`claude-work --resume '${id}'`));
+  assert.deepEqual(batch.launches[0].environment, settings.environment);
+  await fromApp({ type: 'terminal-launched', id: batch.id, names: ['hm-acme-atlas'], created: ['hm-acme-atlas'], errors: [] });
+});
+
 test('saved launch choices beat stale browser preferences and explicit edits start from the saved card', async () => {
   localStorage.setItem('hivemind-launch', JSON.stringify({ resume: true, software: 'claude',
     resumePreferences: { a1: { software: 'claude', model: 'stale-model', effort: 'low', extraFlags: '--stale' } } }));
@@ -440,6 +485,114 @@ test('saved launch choices beat stale browser preferences and explicit edits sta
   assert.equal(launch.cwd, '/fixture/original-worktree');
   assert.deepEqual(launch.environment, { CODEX_HOME: '/fixture/original-profile' });
   assert.doesNotMatch(launch.command, /stale-model|--stale/);
+});
+
+for (const savedValue of [true, false]) test(`resume launch checkboxes restore saved ${savedValue}, and explicit edits reach Copy and Start`, async () => {
+  localStorage.setItem('hivemind-launch', JSON.stringify({ resume: true,
+    cdWorktree: !savedValue, passProject: !savedValue, adoptUntrusted: !savedValue }));
+  installBridge();
+  const settings: LaunchSettings = { software: 'claude', model: '', effort: '', extraFlags: '', environment: {},
+    workspacePath: '/fixture/original-worktree', cdWorktree: savedValue, passProject: savedValue, adoptUntrusted: savedValue,
+    role: 'brain', seniority: null, focus: 'coord' };
+  const context = { ...launchContext, savedLaunches: { a1: { settings, sessionId: null, captured: true } } };
+  const sheet = await mountLaunchSheet([seat('a1', 'Atlas', 'brain')], context);
+  const checks = Array.from(sheet.view.host.querySelectorAll('fieldset.checks input')) as unknown as HTMLInputElement[];
+  assert.equal(checks.length, 3);
+  assert.deepEqual(checks.map(c => [c.checked, c.indeterminate]), Array(3).fill([savedValue, false]));
+  for (const check of checks) await act(async () => check.click());
+  assert.deepEqual(checks.map(c => c.checked), Array(3).fill(!savedValue));
+  const submitted: LaunchSettings[] = [], prepare = api.prepareLaunch;
+  api.prepareLaunch = async request => { submitted.push(request.settings); return prepare(request); };
+  const copies: string[] = [];
+  const oldClipboard = Object.getOwnPropertyDescriptor(globalThis.navigator, 'clipboard');
+  Object.defineProperty(globalThis.navigator, 'clipboard', { configurable: true,
+    value: { writeText: async (text: string) => { copies.push(text); } } });
+  try {
+    await act(async () => sheet.button(/^Copy all$/)!.click());
+    assert.deepEqual(submitted[0], { ...settings, cdWorktree: !savedValue, passProject: !savedValue, adoptUntrusted: !savedValue });
+    assert.equal(copies[0]!.includes("cd -- '/fixture/original-worktree'"), !savedValue);
+    assert.equal(copies[0]!.includes('project=acme'), !savedValue);
+    assert.equal(copies[0]!.includes('authorizes the assigned work'), !savedValue);
+    await ready();
+    await act(async () => sheet.button(/^Start in background$/)!.click());
+    assert.deepEqual(submitted[1], submitted[0]);
+    const batch = launchesPosted()[0], launch = batch.launches[0];
+    assert.equal(launch.cwd ?? null, savedValue ? null : settings.workspacePath);
+    assert.equal(launch.command.includes('project=acme'), !savedValue);
+    assert.equal(launch.command.includes('authorizes the assigned work'), !savedValue);
+    await fromApp({ type: 'terminal-launched', id: batch.id, names: ['hm-acme-atlas'], created: ['hm-acme-atlas'], errors: [] });
+    sheet.view.unmount();
+    const reopened = await mountLaunchSheet([seat('a1', 'Atlas', 'brain')], context);
+    const restored = Array.from(reopened.view.host.querySelectorAll('fieldset.checks input')) as unknown as HTMLInputElement[];
+    assert.deepEqual(restored.map(c => c.checked), Array(3).fill(savedValue), 'unsaved browser defaults never replace the last successful launch');
+  } finally {
+    if (oldClipboard) Object.defineProperty(globalThis.navigator, 'clipboard', oldClipboard);
+    else Reflect.deleteProperty(globalThis.navigator, 'clipboard');
+  }
+});
+
+test('mixed resume options remain per employee until that exact launch checkbox is edited', async () => {
+  localStorage.setItem('hivemind-launch', JSON.stringify({ resume: true, cdWorktree: false, passProject: false, adoptUntrusted: false }));
+  const settings: LaunchSettings = { software: 'claude', model: '', effort: '', extraFlags: '', environment: {},
+    workspacePath: project.worktree, cdWorktree: true, passProject: true, adoptUntrusted: true,
+    role: 'brain', seniority: null, focus: 'coord' };
+  const sheet = await mountLaunchSheet([seat('a1', 'Atlas', 'brain'), seat('a2', 'Bea', 'worker'), seat('a3', 'Cedar', 'worker')], {
+    ...launchContext, savedLaunches: {
+      a1: { settings, sessionId: null, captured: true },
+      a2: { settings: { ...settings, role: 'worker', seniority: 'mid', cdWorktree: false, passProject: false, adoptUntrusted: false }, sessionId: null, captured: true },
+    },
+  });
+  const checks = Array.from(sheet.view.host.querySelectorAll('fieldset.checks input')) as unknown as HTMLInputElement[];
+  assert.deepEqual(checks.map(c => [c.checked, c.indeterminate]), Array(3).fill([false, true]));
+  const submitted: LaunchSettings[] = [], prepare = api.prepareLaunch;
+  api.prepareLaunch = async request => { submitted.push(request.settings); return prepare(request); };
+  const oldClipboard = Object.getOwnPropertyDescriptor(globalThis.navigator, 'clipboard');
+  Object.defineProperty(globalThis.navigator, 'clipboard', { configurable: true, value: { writeText: async () => {} } });
+  try {
+    await act(async () => sheet.button(/^Copy all$/)!.click());
+    assert.deepEqual(submitted.map(s => [s.cdWorktree, s.passProject, s.adoptUntrusted]), [[true, true, true], [false, false, false], [false, false, false]]);
+    // A mixed checkbox first selects all; explicitly clearing it revokes the prompt authorization for every card.
+    await act(async () => checks[2]!.click());
+    await act(async () => checks[2]!.click());
+    assert.deepEqual(checks.map(c => [c.checked, c.indeterminate]), [[false, true], [false, true], [false, false]]);
+    await act(async () => sheet.button(/^(Copy all|Copied)$/)!.click());
+    assert.deepEqual(submitted.slice(3).map(s => [s.cdWorktree, s.passProject, s.adoptUntrusted]), [[true, true, false], [false, false, false], [false, false, false]]);
+    assert.ok(sheet.blocks().every(block => !block.includes('authorizes the assigned work')));
+  } finally {
+    if (oldClipboard) Object.defineProperty(globalThis.navigator, 'clipboard', oldClipboard);
+    else Reflect.deleteProperty(globalThis.navigator, 'clipboard');
+  }
+});
+
+test('resume preserves literal quotes and whitespace in saved environment values, including after editing', async () => {
+  localStorage.setItem('hivemind-launch', JSON.stringify({ resume: true }));
+  installBridge();
+  const environment = { JSON_STRING: '"enabled"', SINGLE_QUOTES: "'literal'", SPACES: '  keep  ', EMPTY: '',
+    CODEX_HOME: '/fixture/profile with spaces', SHELL_TEXT: '$HOME `id` \\n' };
+  const sheet = await mountLaunchSheet([seat('a1', 'Atlas', 'brain')], { ...launchContext, savedLaunches: { a1: {
+    settings: { software: 'codex', model: '', effort: '', extraFlags: '', environment,
+      workspacePath: project.worktree, cdWorktree: true, passProject: true, adoptUntrusted: true,
+      role: 'brain', seniority: null, focus: 'coord' },
+    sessionId: '67d735d1-9e33-4a61-9645-a931afc97f2b', captured: true,
+  } } });
+  const submitted: Record<string, string>[] = [], prepare = api.prepareLaunch;
+  api.prepareLaunch = async request => { submitted.push(request.settings.environment); return prepare(request); };
+  const copies: string[] = [];
+  Object.defineProperty(globalThis.navigator, 'clipboard', { configurable: true,
+    value: { writeText: async (text: string) => { copies.push(text); } } });
+  try {
+    await act(async () => sheet.button(/^Copy all$/)!.click());
+    assert.deepEqual(submitted[0], environment, 'the copied command receives exactly the saved values');
+    assert.ok(copies[0]!.includes(`JSON_STRING='"enabled"'`));
+    const editor = sheet.view.host.querySelector('.launch-card textarea')! as unknown as HTMLTextAreaElement;
+    await typeInto(editor, editor.value + '\nADDED=edited');
+    await ready();
+    await act(async () => sheet.button(/^Start in background$/)!.click());
+    assert.deepEqual(submitted[1], { ...environment, ADDED: 'edited' });
+    assert.deepEqual(launchesPosted()[0].launches[0].environment, { ...environment, ADDED: 'edited' });
+  } finally {
+    delete (globalThis.navigator as { clipboard?: unknown }).clipboard;
+  }
 });
 
 test('a failed prepare never launches any part of a selected batch', async () => {
@@ -760,6 +913,90 @@ test("an empty key sends nothing, a malformed one blocks the launch without quot
   await typeInto(keyInput(sheet.view.host)!, OPENCODE_KEY);
   await act(async () => { start().click(); });
   assert.deepEqual(launchesPosted()[0]!.launches.map(l => l.secrets), [{ OPENCODE_API_KEY: OPENCODE_KEY }, { OPENCODE_API_KEY: OPENCODE_KEY }]);
+});
+
+const savedResumeContext = (software: string): LaunchContext => ({ ...launchContext, savedLaunches: { a1: {
+  settings: { software, model: '', effort: '', extraFlags: '', environment: {}, workspacePath: project.worktree,
+    cdWorktree: true, passProject: true, adoptUntrusted: true, role: 'brain', seniority: null, focus: 'coord' },
+  sessionId: null, captured: true,
+} } });
+
+test('mixed resume offers the OpenCode key independently of defaults and sends it only to OpenCode', async t => {
+  localStorage.setItem('hivemind-launch', JSON.stringify({ resume: true, software: 'codex' }));
+  installBridge();
+  const copies: string[] = [], requests: unknown[] = [];
+  Object.defineProperty(globalThis.navigator, 'clipboard', { configurable: true,
+    value: { writeText: async (text: string) => { copies.push(text); } } });
+  t.after(() => { delete (globalThis.navigator as { clipboard?: unknown }).clipboard; });
+  const sheet = await mountLaunchSheet([seat('a1', 'Atlas', 'brain'), seat('a2', 'Bea', 'worker')], savedResumeContext('opencode-work'));
+  const prepare = api.prepareLaunch;
+  api.prepareLaunch = async request => { requests.push(request); return prepare(request); };
+  await ready();
+  assert.ok(keyInput(sheet.view.host), 'saved OpenCode seat, despite the Codex browser default');
+  const start = () => sheet.button(/^Start 2 in background$/)!;
+  await typeInto(keyInput(sheet.view.host)!, `${OPENCODE_KEY} invalid`);
+  assert.equal(start().disabled, true, 'invalid key still blocks a mixed launch');
+  await typeInto(keyInput(sheet.view.host)!, ` ${OPENCODE_KEY} `);
+  assert.equal(start().disabled, false);
+  await act(async () => sheet.button(/^Copy all$/)!.click());
+  assert.equal(copies.length, 1);
+  assert.ok(!copies[0]!.includes(OPENCODE_KEY));
+  await act(async () => start().click());
+  const batch = launchesPosted()[0]!;
+  assert.match(batch.launches[0]!.command, /opencode-work/);
+  assert.match(batch.launches[1]!.command, /codex/);
+  assert.deepEqual(batch.launches.map(launch => launch.secrets), [{ OPENCODE_API_KEY: OPENCODE_KEY }, undefined]);
+  assert.ok(!JSON.stringify(requests).includes(OPENCODE_KEY), 'never sent to launch preparation');
+  for (const launch of batch.launches) assert.ok(!launch.command.includes(OPENCODE_KEY));
+  for (const text of everywhereButTheLaunch(sheet.view.host)) assert.ok(!text.includes(OPENCODE_KEY));
+  await fromApp({ type: 'terminal-launched', id: batch.id, names: ['hm-acme-atlas', 'hm-acme-bea'],
+    created: ['hm-acme-atlas', 'hm-acme-bea'], errors: [] });
+  assert.equal(keyInput(sheet.view.host)!.value, '', 'cleared after a successful launch');
+});
+
+test('resume key visibility waits for saved settings and follows selection and explicit software edits', async () => {
+  localStorage.setItem('hivemind-launch', JSON.stringify({ resume: true, software: 'opencode' }));
+  installBridge();
+  const context = savedResumeContext('claude-work');
+  let resolve!: (context: LaunchContext) => void;
+  const pending = new Promise<LaunchContext>(done => { resolve = done; });
+  const sheet = await mountLaunchSheet([seat('a1', 'Atlas', 'brain')], context, pending);
+  assert.equal(keyInput(sheet.view.host), null, 'provisional defaults cannot expose the key field');
+  await act(async () => resolve(context));
+  assert.equal(keyInput(sheet.view.host), null, 'the saved Claude seat overrides the OpenCode default');
+  const card = sheet.view.host.querySelector('.launch-card')!;
+  const software = card.querySelector('input[list]') as unknown as HTMLInputElement;
+  const changeSoftware = async (value: string) => {
+    await act(async () => software.focus());
+    await typeInto(software, value);
+    await act(async () => software.blur());
+  };
+  await changeSoftware('opencode-work');
+  assert.ok(keyInput(sheet.view.host));
+  await typeInto(keyInput(sheet.view.host)!, OPENCODE_KEY);
+  await typeInto(softwareInput(sheet.view.host), 'codex');
+  assert.equal(keyInput(sheet.view.host)!.value, OPENCODE_KEY, 'changing unrelated defaults does not erase the selected seat key');
+  const include = card.querySelector<HTMLInputElement>('input[type=checkbox]')!;
+  await act(async () => include.click());
+  assert.equal(keyInput(sheet.view.host), null);
+  await act(async () => include.click());
+  assert.equal(keyInput(sheet.view.host)!.value, '', 'excluding the last OpenCode seat clears the key');
+  await typeInto(keyInput(sheet.view.host)!, OPENCODE_KEY);
+  await changeSoftware('claude-work');
+  assert.equal(keyInput(sheet.view.host), null);
+  await changeSoftware('opencode-work');
+  assert.equal(keyInput(sheet.view.host)!.value, '', 'switching away from OpenCode also clears the key');
+});
+
+test('saved OpenCode resumes do not offer secrets in a browser or for an online employee', async () => {
+  localStorage.setItem('hivemind-launch', JSON.stringify({ resume: true, software: 'opencode' }));
+  const context = savedResumeContext('opencode-work');
+  const browser = await mountLaunchSheet([seat('a1', 'Atlas', 'brain')], context);
+  assert.equal(keyInput(browser.view.host), null);
+  for (const unmount of unmounts.splice(0).reverse()) unmount();
+  installBridge();
+  const native = await mountLaunchSheet([{ ...seat('a1', 'Atlas', 'brain'), online: true }], context);
+  assert.equal(keyInput(native.view.host), null, 'no selected launch target needs the key');
 });
 
 // Environment variables (docs/terminal-broker.md#launch-environment): remembered per software, prefixed to the copied

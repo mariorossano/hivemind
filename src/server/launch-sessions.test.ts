@@ -5,7 +5,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { Hive } from './hive.ts';
 import { createApp } from './app.ts';
-import { listRows, setAgentPresence } from './test-fixtures.ts';
+import { listRows, setAgentPresence, updateRows } from './test-fixtures.ts';
 import type { LaunchSettings } from '../shared/launch-settings.ts';
 
 const uuid = '67d735d1-9e33-4a61-9645-a931afc97f2b';
@@ -84,6 +84,40 @@ test('Claude has an assigned exact UUID and Cursor captures create-chat output w
   assert.equal(f.hive.identity.nativeSession(cursorJoin.body.agent.id)!.sessionId, 'chat_fixture-123');
 });
 
+test('an explicit reconnect keeps the current launch and fences the old process without admitting a different identity', async t => {
+  const f = fixture(t), { ticket } = await f.prepare('claude-work');
+  const first = await f.join(ticket), agent = first.body.agent;
+  const saved = f.hive.launchSessions.saved(agent.id);
+  const other = f.hive.identity.join({ role: 'brain', project: f.project.slug }).agent;
+  assert.equal((await f.join(ticket)).status, 409, 'replaying a new-agent launch cannot allocate another employee');
+  assert.equal((await f.join(ticket, { resume: other.name })).status, 409);
+  assert.equal((await f.join(ticket, { resume: agent.name, role: 'worker' })).status, 409);
+  const reconnect = await f.join(ticket, { resume: agent.name });
+  assert.equal(reconnect.status, 200, JSON.stringify(reconnect.body));
+  assert.equal(reconnect.body.agent.id, agent.id);
+  assert.equal(reconnect.body.created, false);
+  assert.notEqual(reconnect.body.token, first.body.token);
+  assert.deepEqual(f.hive.launchSessions.saved(agent.id), saved);
+  assert.equal((await f.join(ticket, { resume: agent.name }, first.body.token)).status, 401, 'a stale authenticated process cannot reconnect itself');
+  assert.equal((await f.join(ticket, { resume: agent.name }, reconnect.body.token)).status, 200);
+  const renamed = f.hive.identity.editIdentity(f.hive.identity.getAgent('human'), agent.id,
+    { expectedRevision: agent.identityRevision, name: 'ReconnectedBrain' });
+  const viaAlias = await f.join(ticket, { resume: agent.name });
+  assert.equal(viaAlias.status, 200, JSON.stringify(viaAlias.body));
+  assert.equal(viaAlias.body.agent.name, renamed.name);
+  assert.equal((await f.call('POST', '/api/agent/join', { role: 'brain', project: f.project.slug, resume: renamed.name })).status, 200);
+  assert.equal((await f.join(ticket, { resume: renamed.name })).status, 409, 'an untracked replacement invalidates old launch reconnects');
+});
+
+test('launch reconnects cannot revive removed employees', async t => {
+  const f = fixture(t), { ticket } = await f.prepare('claude-work');
+  const joined = await f.join(ticket), agent = joined.body.agent;
+  assert.equal((await f.call('DELETE', `/api/ui/agents/${agent.name}`)).status, 200);
+  const result = await f.join(ticket, { resume: agent.name });
+  assert.equal(result.status, 410);
+  assert.equal(f.hive.identity.getAgent(agent.id).online, false);
+});
+
 test('resume is bound to the immutable employee/project; wrong IDs, reuse and foreign callbacks fail closed', async t => {
   const f = fixture(t), first = await f.prepare();
   await f.capture(first.ticket);
@@ -104,6 +138,7 @@ test('resume is bound to the immutable employee/project; wrong IDs, reuse and fo
   await f.capture(stale.ticket);
   assert.equal((await f.join(stale.ticket, { resume: agent.name })).status, 409, 'an older prepared command cannot supersede a newer join');
   assert.equal((await f.join(first.ticket, { resume: agent.name }, resumed.body.token)).status, 409);
+  assert.equal((await f.join(first.ticket, { resume: agent.name })).status, 409, 'reconnect cannot reclaim a superseded launch');
   assert.equal((await f.call('POST', '/api/launch-session/capture', { sessionId: uuid }, next.ticket,
     { origin: 'http://localhost' })).status, 403);
   assert.equal((await f.capture(`hml_${'f'.repeat(64)}`)).status, 409);
@@ -124,6 +159,69 @@ test('new launches do not overwrite saved settings until join; metadata never cr
   assert.equal((await f.call('POST', '/api/ui/launch-prepare', { project: side.slug, agentId: agent.id, settings })).status, 409);
   const pending = await f.prepare('claude-work');
   assert.equal((await f.join(pending.ticket, { project: side.slug })).status, 409);
+});
+
+for (const role of ['brain', 'worker'] as const) test(`an untracked ${role} reconnect invalidates a pending legacy resume without saved settings`, async t => {
+  const f = fixture(t);
+  const input = { role, seniority: role === 'worker' ? 'senior' : null, project: f.project.slug };
+  const first = await f.call('POST', '/api/agent/join', input), agent = first.body.agent;
+  assert.equal(first.status, 200);
+  assert.equal(f.hive.launchSessions.saved(agent.id), null);
+  setAgentPresence(f.hive, agent.id, { online: false, lastSeenAt: Date.now() - 300_000 });
+  const older = await f.prepare('claude-work', { agentId: agent.id,
+    settings: { ...settings, software: 'claude-work', role, seniority: input.seniority } });
+  const nativeSession = { software: 'claude', sessionId: uuid, model: 'newer-model', effort: 'low' };
+  const newer = await f.call('POST', '/api/agent/join', { ...input, resume: agent.name, nativeSession });
+  assert.equal(newer.status, 200);
+  assert.equal(f.hive.launchSessions.saved(agent.id), null, 'the optional launch pointer never changed');
+  const fingerprint = f.hive.identity.sessionFingerprint(agent.id);
+  assert.equal((await f.join(older.ticket, { role, resume: agent.name })).status, 409);
+  assert.equal(f.hive.identity.sessionFingerprint(agent.id), fingerprint, 'a stale command cannot fence the newer client');
+  assert.equal(f.hive.identity.agentByToken(newer.body.token).id, agent.id);
+  assert.deepEqual(f.hive.identity.nativeSession(agent.id), nativeSession);
+  assert.equal(f.hive.launchSessions.saved(agent.id), null);
+});
+
+test('a bound MCP reconnect invalidates older prepared resumes even while the saved launch pointer stays unchanged', async t => {
+  const f = fixture(t), initial = await f.prepare('claude-work'), first = await f.join(initial.ticket);
+  const agent = first.body.agent, saved = f.hive.launchSessions.saved(agent.id);
+  setAgentPresence(f.hive, agent.id, { online: false, lastSeenAt: Date.now() - 300_000 });
+  const older = await f.prepare('claude-work', { agentId: agent.id });
+  const newer = await f.join(initial.ticket, { resume: agent.name });
+  assert.equal(newer.status, 200);
+  assert.deepEqual(f.hive.launchSessions.saved(agent.id), saved);
+  assert.equal((await f.join(older.ticket, { resume: agent.name })).status, 409);
+  assert.equal(f.hive.identity.agentByToken(newer.body.token).id, agent.id);
+  assert.deepEqual(f.hive.launchSessions.saved(agent.id), saved);
+});
+
+test('same-session activity and a server restart do not invalidate a prepared resume', async t => {
+  const f = fixture(t), first = await f.call('POST', '/api/agent/join', { role: 'brain', project: f.project.slug });
+  const agent = first.body.agent;
+  setAgentPresence(f.hive, agent.id, { online: false, lastSeenAt: Date.now() - 300_000 });
+  const prepared = await f.prepare('claude-work', { agentId: agent.id });
+  assert.equal((await f.call('POST', '/api/agent/join', { role: 'brain', project: f.project.slug }, first.body.token)).status, 200);
+  const reopened = new Hive(f.file);
+  try {
+    const response = await createApp(reopened).request('/api/agent/join', { method: 'POST',
+      headers: { 'content-type': 'application/json' }, body: JSON.stringify({ role: 'brain', project: f.project.slug,
+        resume: agent.name, launchTicket: prepared.ticket }) });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json() as { agent: { id: string } }).agent.id, agent.id);
+  } finally { await reopened.adaptiveTopology.stop(); reopened.db.close(); }
+});
+
+test('pre-migration pending resumes fail closed but bound launches can still reconnect', async t => {
+  const f = fixture(t), initial = await f.prepare('claude-work'), first = await f.join(initial.ticket);
+  const agent = first.body.agent, saved = f.hive.launchSessions.saved(agent.id);
+  setAgentPresence(f.hive, agent.id, { online: false, lastSeenAt: Date.now() - 300_000 });
+  const prepared = await f.prepare('claude-work', { agentId: agent.id });
+  // Migration 43 leaves this field null rather than trusting today's key for an old command.
+  updateRows(f.hive, 'launch_sessions', { previous_session_fingerprint: null });
+  assert.equal((await f.join(prepared.ticket, { resume: agent.name })).status, 409);
+  assert.equal(f.hive.identity.agentByToken(first.body.token).id, agent.id);
+  assert.equal((await f.join(initial.ticket, { resume: agent.name })).status, 200);
+  assert.deepEqual(f.hive.launchSessions.saved(agent.id), saved);
 });
 
 test('tracked joins keep the selected project even when the prompt omits it, and normalize launch choices', async t => {

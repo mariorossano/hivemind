@@ -6,9 +6,10 @@ import { nativeSessionId, type NativeSession } from '../shared/native-session.ts
 import { softwareFamily } from '../shared/launch-prompt.ts';
 import { LauncherQueueCipher } from './launcher-queue-crypto.ts';
 import type { Core } from './services/ports.ts';
+import type { IdentityService } from './services/identity.ts';
 
 type Row = { id: string; ticket_hash: string; project_id: string; expected_agent_id: string | null;
-  previous_launch_id: string | null;
+  previous_launch_id: string | null; previous_session_fingerprint: string | null;
   agent_id: string | null; settings: string; provider: string; session_id: string | null; captured: number;
   created_at: number; bound_at: number | null };
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -19,7 +20,7 @@ const MAX_AGE = 24 * 60 * 60 * 1000;
  */
 export class LaunchSessions {
   private readonly cipher: LauncherQueueCipher;
-  constructor(private readonly deps: Core & { home: string }) {
+  constructor(private readonly deps: Core & { home: string; identity: Pick<IdentityService, 'sessionFingerprint'> }) {
     this.cipher = new LauncherQueueCipher(deps.home,
       Boolean(deps.storage.db.prepare('SELECT 1 FROM launch_sessions LIMIT 1').get() ||
         deps.storage.db.prepare("SELECT 1 FROM launcher_commands WHERE state IN ('queued','dispatched') LIMIT 1").get()));
@@ -38,8 +39,9 @@ export class LaunchSessions {
     // Unexecuted previews/copies are disposable; never prune a bound employee's current settings.
     this.db.prepare('DELETE FROM launch_sessions WHERE agent_id IS NULL AND created_at < ?').run(Date.now() - MAX_AGE);
     const previous = expectedAgentId ? this.db.prepare('SELECT launch_id FROM agent_launch_settings WHERE agent_id=?').get(expectedAgentId)?.launch_id ?? null : null;
-    this.db.prepare(`INSERT INTO launch_sessions(id,ticket_hash,project_id,expected_agent_id,previous_launch_id,settings,provider,session_id,captured,created_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?)`).run(id, hash(ticket), projectId, expectedAgentId, previous, this.cipher.seal(settings), provider,
+    const fingerprint = expectedAgentId ? this.deps.identity.sessionFingerprint(expectedAgentId) ?? null : null;
+    this.db.prepare(`INSERT INTO launch_sessions(id,ticket_hash,project_id,expected_agent_id,previous_launch_id,previous_session_fingerprint,settings,provider,session_id,captured,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(id, hash(ticket), projectId, expectedAgentId, previous, fingerprint, this.cipher.seal(settings), provider,
       sessionId, provider === 'claude' || !['codex', 'cursor'].includes(provider) ? 1 : 0, Date.now());
     return { ticket, sessionId };
   }
@@ -75,11 +77,20 @@ export class LaunchSessions {
       row.expected_agent_id && candidate && row.expected_agent_id !== candidate.id ||
       !row.expected_agent_id && candidate && row.agent_id !== candidate.id)
       throw new HiveError(409, 'Launch does not match the joining identity/project');
-    if (row.agent_id && (row.agent_id !== authenticatedId ||
+    // A restarted MCP process no longer holds its in-memory bearer key. Allow an
+    // explicit name-based reconnect to this launch's ONE identity, using the same
+    // session fencing and lifecycle checks as ordinary resume. A fresh join (no
+    // candidate), another identity or a superseded launch still fails closed.
+    if (row.agent_id && (row.agent_id !== (authenticatedId ?? candidate?.id) ||
       this.db.prepare('SELECT launch_id FROM agent_launch_settings WHERE agent_id=?').get(row.agent_id)?.launch_id !== row.id))
       throw new HiveError(409, 'Launch already used or superseded; prepare a new Resume');
-    if (!row.agent_id && row.expected_agent_id &&
-      (this.db.prepare('SELECT launch_id FROM agent_launch_settings WHERE agent_id=?').get(row.expected_agent_id)?.launch_id ?? null) !== row.previous_launch_id)
+    // The optional saved-launch pointer is not a session generation: it stays
+    // null for legacy/manual joins and stays unchanged during MCP reconnects.
+    // Check the session too, before identity.join can rotate its key. Pending
+    // pre-migration commands have no fingerprint and must be prepared again.
+    if (!row.agent_id && row.expected_agent_id && (!row.previous_session_fingerprint ||
+      this.deps.identity.sessionFingerprint(row.expected_agent_id) !== row.previous_session_fingerprint ||
+      (this.db.prepare('SELECT launch_id FROM agent_launch_settings WHERE agent_id=?').get(row.expected_agent_id)?.launch_id ?? null) !== row.previous_launch_id))
       throw new HiveError(409, 'Employee resumed since this command was prepared; prepare a new Resume');
     if (!row.captured) throw new HiveError(409, 'Conversation ID not captured. Review the native session hook/CLI configuration, then retry join; do not guess an ID.');
     const nativeSession = ['codex', 'claude', 'cursor'].includes(row.provider)

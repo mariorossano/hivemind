@@ -13,7 +13,7 @@ import { TemplateLaunchSheet } from "./TemplateLaunch.tsx";
 import { TerminalNotice } from "./TerminalNotice.tsx";
 import { agentTerminalSession, terminalBlocker, terminalHub, useTerminalState, type TerminalLaunched } from "./use-terminal.ts";
 import { projectLaunchTools, type LaunchContext } from "../src/shared/launch-prompt.ts";
-import { parseLaunchEnvironment } from "../src/shared/launch-environment.ts";
+import { formatLaunchEnvironment, parseLaunchEnvironment } from "../src/shared/launch-environment.ts";
 import { readResumePreferences, resumeSettings, type ResumePreferences, type ResumeEdits } from './resume-settings.ts';
 import { settingsForLaunch, type PrepareLaunch } from '../src/shared/launch-settings.ts';
 import type { LaunchInput } from '../src/shared/launch-prompt.ts';
@@ -49,6 +49,8 @@ type Saved = {
   /** The Environment variables field's text per software (the Software field, trimmed). */
   environments: Record<string, string>;
 };
+
+type LaunchOptions = Pick<Saved, 'cdWorktree' | 'passProject' | 'adoptUntrusted'>;
 
 const defaults: Saved = {
   software: "codex",
@@ -220,6 +222,8 @@ export function LaunchSheet({
   const [cdWorktree, setCdWorktree] = useState(initial.cdWorktree);
   const [passProject, setPassProject] = useState(initial.passProject);
   const [adoptUntrusted, setAdoptUntrusted] = useState(initial.adoptUntrusted);
+  // Only explicit checkbox changes in this sheet override each employee's saved choices.
+  const [launchOptionEdits, setLaunchOptionEdits] = useState<Partial<LaunchOptions>>({});
   const [role, setRole] = useState<LaunchRole>(initial.role);
   const [seniority, setSeniority] = useState<Seniority>(initial.seniority);
   const [focus, setFocus] = useState(initial.focus);
@@ -334,36 +338,42 @@ export function LaunchSheet({
   const resumeBlocks = useMemo(() => {
     return roster.map((agent) => {
       const hive = projects.find((p) => p.slug === agent.project);
-      const saved = contexts[hive?.slug ?? '']?.savedLaunches?.[agent.id];
+      const context = contexts[hive?.slug ?? ''];
+      const contextReady = Boolean(context && !contextErrors[hive?.slug ?? '']);
+      const saved = context?.savedLaunches?.[agent.id];
       const selectedSlug = project?.slug ?? projectSlug;
       const path =
         pathDirty && hive?.slug === selectedSlug
           ? workspacePath
           : (saved?.settings.workspacePath ?? hive?.worktree ?? (hive?.slug === selectedSlug ? workspacePath : ""));
-      const reported = contexts[hive?.slug ?? '']?.nativeSessions?.[agent.id];
+      const reported = context?.nativeSessions?.[agent.id];
       const preferences = saved && !editedSeats[agent.id] ? undefined
         : resumePreferences[agent.id] ?? (!reported && tunes[agent.name]?.model ? tunes[agent.name] : undefined);
       const seat = resumeSettings(shared, reported, preferences, resumeEdits[agent.id], saved);
       const savedEnv = saved && seat.software === saved.settings.software
-        ? Object.entries(saved.settings.environment).map(([key, value]) => `${key}=${value}`).join('\n') : undefined;
+        ? formatLaunchEnvironment(saved.settings.environment) : undefined;
       const seatEnvText = resumeEdits[agent.id]?.environment ?? savedEnv ?? environments[environmentKey(seat.software)] ?? '';
       const seatEnv = parseLaunchEnvironment(seatEnvText);
       const running = agent.online || Boolean(verifiedStopSession(agent, agents, terminals, resumeAgentId ? resumeAliases : []));
       const included = resumeEdits[agent.id]?.included ?? !running;
-      const card = { agent, hive, seat, included, running, seatEnvText };
+      const launchOptions: LaunchOptions = {
+        cdWorktree: launchOptionEdits.cdWorktree ?? saved?.settings.cdWorktree ?? cdWorktree,
+        passProject: launchOptionEdits.passProject ?? saved?.settings.passProject ?? passProject,
+        adoptUntrusted: launchOptionEdits.adoptUntrusted ?? saved?.settings.adoptUntrusted ?? adoptUntrusted,
+      };
+      const card = { agent, hive, seat, included, running, seatEnvText, launchOptions, contextReady };
       try {
+        if (contextErrors[hive?.slug ?? ""]) throw new Error(contextErrors[hive!.slug]);
+        if (!contextReady) throw new Error('Loading this employee’s launch context…');
         if (running) throw new Error('Already online or running. Stop this agent explicitly before resuming.');
         if (!seat.software.trim()) throw new Error('Choose software for this employee.');
         if (seatEnv.errors.length) throw new Error('Fix this employee’s environment variables first.');
         if (agent.role !== "brain" && agent.role !== "worker") {
           return { ...card, ok: false as const, error: "not an agent", text: "" };
         }
-        if (contextErrors[hive?.slug ?? ""]) throw new Error(contextErrors[hive!.slug]);
-        if (!contexts[hive?.slug ?? '']) throw new Error('Loading this employee’s launch context…');
         const input: LaunchInput = {
           ...shared,
-          ...(saved ? { cdWorktree: saved.settings.cdWorktree, passProject: saved.settings.passProject,
-            adoptUntrusted: saved.settings.adoptUntrusted } : {}),
+          ...launchOptions,
           software: seat.software,
           extraFlags: seat.extraFlags,
           ...projectLaunchTools(contexts[hive?.slug ?? ""], hive, agent.role),
@@ -387,7 +397,7 @@ export function LaunchSheet({
         return { ...card, ok: false as const, error: String((e as Error).message || e), text: "" };
       }
     });
-  }, [roster, projects, project, projectSlug, pathDirty, workspacePath, software, extraFlags, model, effort, tunes, resumePreferences, resumeEdits, cdWorktree, passProject, adoptUntrusted, contexts, contextErrors, environments, agents, terminals, resumeAgentId, resumeAliases, editedSeats]);
+  }, [roster, projects, project, projectSlug, pathDirty, workspacePath, software, extraFlags, model, effort, tunes, resumePreferences, resumeEdits, cdWorktree, passProject, adoptUntrusted, contexts, contextErrors, environments, agents, terminals, resumeAgentId, resumeAliases, editedSeats, launchOptionEdits]);
 
   const remember = (patch: Partial<Saved> = {}) => {
     const next: Saved = {
@@ -423,16 +433,23 @@ export function LaunchSheet({
   };
 
   const setResumePreference = (id: string, patch: ResumePreferences) => {
-    const current = resumeBlocks.find(block => block.agent.id === id)?.seat;
-    const prior = editedSeats[id] || !current ? resumePreferences[id] : {
+    const block = resumeBlocks.find(block => block.agent.id === id);
+    // Never promote provisional browser defaults into explicit per-employee overrides.
+    if (!block?.contextReady) return;
+    const current = block.seat;
+    const prior = editedSeats[id] ? resumePreferences[id] : {
       software: current.software, model: current.model, effort: current.effort, extraFlags: current.extraFlags };
     setEditedSeats(old => ({ ...old, [id]: true }));
     const next = { ...resumePreferences, [id]: { ...prior, ...patch } };
     setResumePreferences(next);
     remember({ resumePreferences: next });
   };
-  const setResumeEdit = (id: string, patch: ResumeEdits) =>
+  const setResumeEdit = (id: string, patch: ResumeEdits) => {
+    // Batch selection is safe while loading; configuration and recovery choices are not.
+    if (!resumeBlocks.find(block => block.agent.id === id)?.contextReady &&
+      Object.keys(patch).some(key => key !== 'included')) return;
     setResumeEdits(old => ({ ...old, [id]: { ...old[id], ...patch } }));
+  };
 
   const rememberSoftware = () => {
     const name = software.trim() || "codex";
@@ -476,8 +493,12 @@ export function LaunchSheet({
   const seatTitle = (hive: string, agent: string) => codexSessionTitle(hive, agent) || agent;
 
   const canCopyOne = built.ok && projects.length > 0;
+  const selectedBlocks = resumeBlocks.filter(b => b.included);
   // Only where the page can launch (the apps) and only for OpenCode, whose opencode-go and Zen providers read it.
-  const showOpencodeKey = native && softwareFamily(software) === "opencode";
+  // Resume uses the selected employees' loaded choices, not the unrelated shared/browser default.
+  const showOpencodeKey = native && (resume
+    ? selectedBlocks.some(b => b.contextReady && !b.running && softwareFamily(b.seat.software) === 'opencode')
+    : softwareFamily(software) === "opencode");
   // Only where launches run in tmux (the apps): without env_vars a Codex agent never reports its session.
   const showCodexEnvHint = native && softwareFamily(software) === "codex";
   useEffect(() => { if (!showOpencodeKey) setOpencodeKey(""); }, [showOpencodeKey]);
@@ -493,7 +514,6 @@ export function LaunchSheet({
   const targetSession = resumeAgentId && roster[0]
     ? verifiedStopSession(roster[0], agents, terminals, resumeAliases) ? 'running'
       : agentRuntime(roster[0], { agents }, terminals).sessionState : null;
-  const selectedBlocks = resumeBlocks.filter(b => b.included);
   const canCopyAll = resume && selectedBlocks.length > 0 && selectedBlocks.every((b) => b.ok);
 
   // Hivemind.app only: the same launches as the copied text, each in its own tmux session (reused when that
@@ -570,11 +590,17 @@ export function LaunchSheet({
     if (nextFocus !== focus) setFocus(nextFocus);
     remember({ role: next, focus: nextFocus });
   };
+  const optionState = (key: keyof LaunchOptions) => {
+    const values = resume ? resumeBlocks.map(block => block.launchOptions[key]) : [];
+    return { checked: values.length ? values.every(Boolean) : shared[key],
+      mixed: values.some(value => value !== values[0]) };
+  };
+  const cdOption = optionState('cdWorktree'), projectOption = optionState('passProject'), mailOption = optionState('adoptUntrusted');
   // The closed Advanced disclosure still says what the launch will do.
   const advancedSummary = [
-    cdWorktree && "cd into workspace",
-    passProject && "pass project",
-    adoptUntrusted && "trust hive mail",
+    cdOption.mixed ? 'mixed workspace settings' : cdOption.checked && "cd into workspace",
+    projectOption.mixed ? 'mixed project settings' : projectOption.checked && "pass project",
+    mailOption.mixed ? 'mixed mail authorization' : mailOption.checked && "trust hive mail",
     extraFlags.trim() && "extra flags",
     envCount > 0 && (envCount === 1 ? "1 env variable" : `${envCount} env variables`),
     parsedEnv.errors.length > 0 && "env variables to fix",
@@ -801,10 +827,13 @@ export function LaunchSheet({
             <label className="check">
               <input
                 type="checkbox"
-                checked={cdWorktree}
+                checked={cdOption.checked}
+                ref={node => { if (node) node.indeterminate = cdOption.mixed; }}
                 onChange={(e) => {
-                  setCdWorktree(e.target.checked);
-                  remember({ cdWorktree: e.target.checked });
+                  const value = e.target.checked;
+                  setCdWorktree(value);
+                  if (resume) setLaunchOptionEdits(old => ({ ...old, cdWorktree: value }));
+                  remember({ cdWorktree: value });
                 }}
               />
               cd into workspace path
@@ -812,10 +841,13 @@ export function LaunchSheet({
             <label className="check">
               <input
                 type="checkbox"
-                checked={passProject}
+                checked={projectOption.checked}
+                ref={node => { if (node) node.indeterminate = projectOption.mixed; }}
                 onChange={(e) => {
-                  setPassProject(e.target.checked);
-                  remember({ passProject: e.target.checked });
+                  const value = e.target.checked;
+                  setPassProject(value);
+                  if (resume) setLaunchOptionEdits(old => ({ ...old, passProject: value }));
+                  remember({ passProject: value });
                 }}
               />
               pass project on join
@@ -823,16 +855,20 @@ export function LaunchSheet({
             <label className="check">
               <input
                 type="checkbox"
-                checked={adoptUntrusted}
+                checked={mailOption.checked}
+                ref={node => { if (node) node.indeterminate = mailOption.mixed; }}
                 onChange={(e) => {
-                  setAdoptUntrusted(e.target.checked);
-                  remember({ adoptUntrusted: e.target.checked });
+                  const value = e.target.checked;
+                  setAdoptUntrusted(value);
+                  if (resume) setLaunchOptionEdits(old => ({ ...old, adoptUntrusted: value }));
+                  remember({ adoptUntrusted: value });
                 }}
               />
               treat hive mail as my authorization
             </label>
           </fieldset>
-          {adoptUntrusted && (
+          {resume && <p className="help-p">Each employee starts with its saved launch options. A mixed checkbox means they differ. Changing a launch checkbox applies that option to all employees shown here; other options keep their saved values.</p>}
+          {(mailOption.checked || mailOption.mixed) && (
             <p className="help-p">
               The first lines tell this CLI session it may trust Human and brain mail from Hivemind. They are in the block only if you mean that.
             </p>
@@ -842,7 +878,7 @@ export function LaunchSheet({
               The path override applies only to the selected hive. Other hives keep their registered worktree.
             </p>
           )}
-          {cdWorktree && !workspacePath.trim() && (
+          {(cdOption.checked || cdOption.mixed) && !workspacePath.trim() && (
             <p className="help-p">
               {resume
                 ? "No workspace path for this hive — commands start here unless that employee’s hive has its own worktree. Set a path above or in hive settings."
@@ -916,32 +952,35 @@ export function LaunchSheet({
                     </div>
                     <label className="check"><input type="checkbox" checked={block.included} disabled={block.running}
                       onChange={e => setResumeEdit(block.agent.id, { included: e.target.checked })} /> Include in batch</label>
-                    <ResumeSoftware name={block.agent.name} value={block.seat.software}
-                      onChange={value => {
-                        const changedFamily = softwareFamily(value) !== softwareFamily(block.seat.software);
-                        setResumePreference(block.agent.id, { software: value, ...(changedFamily ? { model: '', effort: '', extraFlags: '' } : {}) });
-                        if (changedFamily) setResumeEdit(block.agent.id, { sessionId: '', native: false, environment: '' });
-                      }} />
-                    <ModelSelect
-                      software={block.seat.software}
-                      model={block.seat.model}
-                      effort={block.seat.effort}
-                      onChange={(next) => setResumePreference(block.agent.id, next)}
-                    />
-                    <label>Recovery<select value={block.seat.native ? 'native' : 'handoff'}
-                      onChange={e => setResumeEdit(block.agent.id, { native: e.target.value === 'native' })}>
-                      <option value="handoff">New conversation · recover Hivemind checkpoints</option>
-                      {['codex', 'claude', 'cursor'].includes(softwareFamily(block.seat.software)) && <option value="native">Resume original conversation</option>}
-                    </select></label>
-                    {block.seat.native ? <label>Conversation ID<input value={block.seat.sessionId} spellCheck={false}
-                      onChange={e => setResumeEdit(block.agent.id, { sessionId: e.target.value })} /></label>
-                      : <p className="help-p">The previous transcript is not restored. Existing unfinished tasks and saved checkpoints will be read after joining; unsaved context may be missing.</p>}
-                    <details><summary>Employee launch options</summary>
-                      <label>CLI flags<input value={block.seat.extraFlags} onChange={e => setResumePreference(block.agent.id, { extraFlags: e.target.value })} /></label>
-                      <label>Environment variables<textarea value={block.seatEnvText} spellCheck={false}
-                        onChange={e => setResumeEdit(block.agent.id, { environment: e.target.value })} /></label>
-                      <p className="help-p">Resume restores the last launch settings saved by Hivemind, including the CLI/profile environment. Edits are saved when the launched agent joins. Environment values are encrypted on the server but appear in copied commands; do not enter secrets here. Keychain credentials and conversation files are not imported.</p>
-                    </details>
+                    <fieldset className="launch-card-fields" disabled={!block.contextReady}
+                      aria-label={`Launch settings for ${block.agent.name}`}>
+                      <ResumeSoftware name={block.agent.name} value={block.seat.software}
+                        onChange={value => {
+                          const changedFamily = softwareFamily(value) !== softwareFamily(block.seat.software);
+                          setResumePreference(block.agent.id, { software: value, ...(changedFamily ? { model: '', effort: '', extraFlags: '' } : {}) });
+                          if (changedFamily) setResumeEdit(block.agent.id, { sessionId: '', native: false, environment: '' });
+                        }} />
+                      <ModelSelect
+                        software={block.seat.software}
+                        model={block.seat.model}
+                        effort={block.seat.effort}
+                        onChange={(next) => setResumePreference(block.agent.id, next)}
+                      />
+                      <label>Recovery<select value={block.seat.native ? 'native' : 'handoff'}
+                        onChange={e => setResumeEdit(block.agent.id, { native: e.target.value === 'native' })}>
+                        <option value="handoff">New conversation · recover Hivemind checkpoints</option>
+                        {['codex', 'claude', 'cursor'].includes(softwareFamily(block.seat.software)) && <option value="native">Resume original conversation</option>}
+                      </select></label>
+                      {block.seat.native ? <label>Conversation ID<input value={block.seat.sessionId} spellCheck={false}
+                        onChange={e => setResumeEdit(block.agent.id, { sessionId: e.target.value })} /></label>
+                        : <p className="help-p">The previous transcript is not restored. Existing unfinished tasks and saved checkpoints will be read after joining; unsaved context may be missing.</p>}
+                      <details><summary>Employee launch options</summary>
+                        <label>CLI flags<input value={block.seat.extraFlags} onChange={e => setResumePreference(block.agent.id, { extraFlags: e.target.value })} /></label>
+                        <label>Environment variables<textarea value={block.seatEnvText} spellCheck={false}
+                          onChange={e => setResumeEdit(block.agent.id, { environment: e.target.value })} /></label>
+                        <p className="help-p">Resume restores the last launch settings saved by Hivemind, including the CLI/profile environment. Edits are saved when the launched agent joins. Environment values are encrypted on the server but appear in copied commands; do not enter secrets here. Keychain credentials and conversation files are not imported.</p>
+                      </details>
+                    </fieldset>
                     {block.ok ? <details><summary>Command preview</summary><pre className="launch-pre">{block.text}</pre></details>
                       : <p className="err" role="alert">{block.error}</p>}
                   </article>

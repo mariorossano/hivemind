@@ -403,7 +403,7 @@ export class LauncherQueue {
           : previous?.sessionId && previous.software === softwareFamily(settings.software)
           ? { software: previous.software, sessionId: previous.sessionId } : undefined;
         const built = trackedLaunch(this.deps, serverUrl, project, settings, agent,
-          { claim: ticket, claimName: agent.name, nativeResume });
+          { claim: ticket, claimName: agent.name, nativeResume, requireBotContext: true });
         if (!built.cwd) throw new HiveError(409, "Project needs a worktree before a worker can launch");
         const session = workerSession(project.slug, agent.name);
         payload = { id: command.id, kind: "launch", requestId: row.id, templateId: template.id,

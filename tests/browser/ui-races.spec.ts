@@ -3,6 +3,7 @@ import { expect, test, type Page, type Route, type WebSocketRoute } from "./fixt
 import type { Agent, Channel, Message, Project, Thread } from "../../src/shared/types.ts";
 import type { ChannelPayload, Snapshot } from "../../web/api.ts";
 import type { RoomView } from "../../src/shared/rooms.ts";
+import type { PrepareLaunch } from '../../src/shared/launch-settings.ts';
 
 for (const deferredReply of [false, true]) {
   test(`long threads resume live updates when returning to the bottom (deferred=${deferredReply})`, async ({ page }) => {
@@ -423,6 +424,117 @@ async function installMessages(
 }
 
 type FixtureSocket = Pick<WebSocketRoute, "close"> & { send: (data: string) => void };
+
+for (const outcome of ['saved', 'legacy', 'error'] as const) test(`resume editors wait for launch context (${outcome})`, async ({ page }) => {
+  const p = project('alpha', 'Example Hive'), ch = channel('a', 'general', p), snap = snapshot([p], [ch]);
+  snap.agents.push({ ...human, id: 'employee-0', name: 'Atlas', role: 'brain', seniority: null,
+    focus: 'coord', online: false, projectId: p.id, project: p.slug });
+  await installSnapshot(page, () => snap); await installSocketHarness(page);
+  await installMessages(page, route => fulfillJson(route, payload(ch, [])));
+  await page.addInitScript(() => {
+    localStorage.setItem('hivemind-launch', JSON.stringify({ resume: true, software: 'codex',
+      model: 'stale-model', effort: 'high', extraFlags: '--search' }));
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async () => {} } });
+  });
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const settings = { software: 'claude-work', model: 'saved-model', effort: 'xhigh', extraFlags: '--verbose',
+    environment: { CLAUDE_CONFIG_DIR: '/fixture/original-profile' }, workspacePath: '/fixture/original-worktree',
+    cdWorktree: true, passProject: true, adoptUntrusted: true, role: 'brain' as const, seniority: null, focus: 'coord' };
+  const id = '67d735d1-9e33-4a61-9645-a931afc97f2b';
+  await page.route('**/api/ui/launch-context?*', async route => {
+    await gate;
+    if (outcome === 'error') return route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'Fixture context unavailable' }) });
+    return fulfillJson(route, { project: { id: p.id, slug: p.slug }, botDefinitions: [], botInstructions: '',
+      hivemindMcp: { command: 'hivemind', args: ['mcp'], env: {} },
+      savedLaunches: outcome === 'saved' ? { 'employee-0': { settings, sessionId: id, captured: true } } : {} });
+  });
+  const requests: PrepareLaunch[] = [];
+  await page.route('**/api/ui/launch-prepare', route => {
+    requests.push(route.request().postDataJSON() as PrepareLaunch);
+    return fulfillJson(route, { command: 'fixture-command', cwd: null, environment: {} });
+  });
+  await page.goto('/#/c/a');
+  await page.getByRole('button', { name: 'Launch agent', exact: true }).click();
+  const sheet = page.getByRole('dialog', { name: 'Launch agent' }), card = sheet.locator('.launch-card');
+  await expect(card).toContainText('Loading this employee');
+  await card.getByText('Employee launch options', { exact: true }).click();
+  const editors = [card.getByLabel('Software for Atlas'), card.getByRole('combobox', { name: 'Model', exact: true }),
+    card.getByRole('combobox', { name: 'Recovery', exact: true }), card.getByRole('textbox', { name: 'CLI flags', exact: true }),
+    card.getByRole('textbox', { name: 'Environment variables', exact: true })];
+  for (const editor of editors) await expect(editor).toBeDisabled();
+  await expect(card.getByRole('button', { name: 'Copy', exact: true })).toBeDisabled();
+  release();
+  if (outcome === 'error') {
+    await expect(card).toContainText('Fixture context unavailable');
+    for (const editor of editors) await expect(editor).toBeDisabled();
+    await expect(card.getByRole('button', { name: 'Copy', exact: true })).toBeDisabled();
+    expect(requests).toEqual([]);
+    return;
+  }
+  for (const editor of editors) await expect(editor).toBeEnabled();
+  if (outcome === 'saved') {
+    await expect(editors[0]).toHaveValue('claude-work');
+    await expect(card.getByLabel('Conversation ID')).toHaveValue(id);
+  }
+  await editors[1].selectOption('');
+  await card.getByRole('button', { name: 'Copy', exact: true }).click();
+  await expect.poll(() => requests.length).toBe(1);
+  if (outcome === 'saved') {
+    expect(requests[0]).toMatchObject({ native: true, sessionId: id, settings: { ...settings, model: '', effort: '' } });
+  } else {
+    expect(requests[0]).toMatchObject({ native: false, settings: { software: 'codex', model: '', effort: '', extraFlags: '--search' } });
+  }
+});
+
+test('resume launch options show mixed saved values and explicit authorization edits reach individual Copy', async ({ page }) => {
+  const p = project('alpha', 'Example Hive'), ch = channel('a', 'general', p), snap = snapshot([p], [ch]);
+  snap.agents.push(...['Atlas', 'Birch'].map((name, i): Agent => ({ ...human, id: `employee-${i}`, name,
+    role: 'brain', seniority: null, focus: 'coord', online: false, projectId: p.id, project: p.slug })));
+  await installSnapshot(page, () => snap); await installSocketHarness(page);
+  await installMessages(page, route => fulfillJson(route, payload(ch, [])));
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async () => {} } });
+  });
+  await page.route('**/api/ui/launch-context?*', route => fulfillJson(route, {
+    project: { id: p.id, slug: p.slug }, botDefinitions: [], botInstructions: '',
+    hivemindMcp: { command: 'hivemind', args: ['mcp'], env: {} },
+    savedLaunches: Object.fromEntries([true, false].map((value, i) => [`employee-${i}`, {
+      settings: { software: 'claude', model: '', effort: '', extraFlags: '', environment: {},
+        workspacePath: '/fixture/work', cdWorktree: value, passProject: value, adoptUntrusted: value,
+        role: 'brain', seniority: null, focus: 'coord' }, sessionId: null, captured: true,
+    }])),
+  }));
+  const requests: PrepareLaunch[] = [];
+  await page.route('**/api/ui/launch-prepare', route => {
+    requests.push(route.request().postDataJSON() as PrepareLaunch);
+    return fulfillJson(route, { command: 'fixture-command', cwd: null, environment: {} });
+  });
+  await page.goto('/#/c/a');
+  await page.getByRole('button', { name: 'Launch agent', exact: true }).click();
+  const sheet = page.getByRole('dialog', { name: 'Launch agent' });
+  await sheet.getByLabel('Resume same employees').check();
+  await sheet.locator('summary').filter({ hasText: 'Advanced launch options' }).click();
+  const mail = sheet.getByLabel('treat hive mail as my authorization'), cd = sheet.getByLabel('cd into workspace path');
+  const projectCheck = sheet.getByLabel('pass project on join');
+  for (const check of [mail, cd, projectCheck]) await expect(check).toHaveJSProperty('indeterminate', true);
+  await mail.focus();
+  await mail.press('Space');
+  await expect(mail).toBeChecked();
+  await mail.press('Space');
+  await expect(mail).not.toBeChecked();
+  await expect(mail).toHaveJSProperty('indeterminate', false);
+  for (const check of [cd, projectCheck]) await expect(check).toHaveJSProperty('indeterminate', true);
+  const cards = sheet.locator('.launch-card');
+  for (const name of ['Atlas', 'Birch']) {
+    const card = cards.filter({ has: page.getByText(name, { exact: true }) });
+    await expect(card.locator('.launch-pre')).not.toContainText('authorizes the assigned work');
+    await card.getByRole('button', { name: 'Copy', exact: true }).click();
+  }
+  await expect.poll(() => requests.length).toBe(2);
+  expect(requests.map(r => [r.settings.cdWorktree, r.settings.passProject, r.settings.adoptUntrusted]))
+    .toEqual([[true, true, false], [false, false, false]]);
+});
 
 test('mixed native resume preserves each employee’s CLI and UUID, validates selection and fits the viewport', async ({ page }, testInfo) => {
   const p = project('alpha', 'Example Hive'), ch = channel('a', 'general', p);

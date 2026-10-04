@@ -252,6 +252,10 @@ test('task resume restores its original launch choices after its template change
   f.hive.tasks.sweepHardPauses(pause.task.pause!.graceUntil!);
   const kill = (await (await f.signed('GET', target)).json() as { command: Record<string, any> }).command;
   await f.signed('POST', `/api/launcher/${kill.id}/result`, { status: 'killed' });
+  const reconnect = await f.app.request('/api/agent/join', { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ role: 'worker', project: f.project.slug, resume: first.agent, launchTicket }) });
+  assert.equal(reconnect.status, 409);
+  assert.match(await reconnect.text(), /hard-paused/, 'launch reconnect must retain Human task-pause gates');
   f.hive.tasks.control(f.human, request.task.id,
     { requestId: randomUUID(), expectedRevision: task().revision, action: { type: 'resume' } });
   const resumed = (await (await f.signed('GET', target)).json() as { command: Record<string, any> }).command;

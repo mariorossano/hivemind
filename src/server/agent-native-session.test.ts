@@ -99,7 +99,7 @@ test('migration preserves an existing database and does not invent provider sess
   t.after(() => db.close());
   applyMigrations(db, { target: 40 });
   const agents = db.prepare('SELECT * FROM agents').all();
-  assert.deepEqual(applyMigrations(db).map(m => m.name), ['agent_native_sessions', 'launch_sessions']);
+  assert.deepEqual(applyMigrations(db).map(m => m.name), ['agent_native_sessions', 'launch_sessions', 'launch_session_fencing']);
   assert.deepEqual(db.prepare('SELECT * FROM agents').all(), agents);
   assert.equal((db.prepare('SELECT COUNT(*) AS n FROM agent_native_sessions').get() as { n: number }).n, 0);
   agentNativeSessions(db);

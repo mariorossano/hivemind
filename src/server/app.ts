@@ -541,7 +541,7 @@ export function createApp(hive: Hive, hooks: AppHooks = {}) {
     const result = hive.storage.transaction(() => {
       const project = body.launchTicket ? hive.projects.getProject(hive.launchSessions.projectId(body.launchTicket)) : null;
       const candidate = !body.launchTicket ? null : bearer ? hive.identity.agentByToken(bearer) : body.resume || body.resumeName
-        ? hive.identity.getAgentByName(body.resume || body.resumeName) ?? null : null;
+        ? hive.identity.getAgentByResumeName(body.resume || body.resumeName) : null;
       const launch = body.launchTicket ? hive.launchSessions.forJoin(body.launchTicket, { role: body.role },
         body.project ? hive.projects.getProjectBySlug(body.project).id : project!.id, candidate, candidate && bearer ? candidate.id : null) : null;
       const joined = hive.identity.join({ role: body.role, seniority: body.seniority ?? null, focus: body.focus ?? null,

@@ -19,10 +19,26 @@ the defaults. Stale browser preferences and later template changes do not replac
 restores that choice, not a snapshot of the provider's changing default model. Model changes made inside a CLI are not
 tracked: Resume restores what was selected in Hivemind.
 
+Each employee's launch editors stay disabled until its project's saved launch context loads. A loading failure keeps them
+disabled and shows the error, so provisional browser defaults cannot replace that employee's configuration.
+
+The advanced launch checkboxes reflect the employees' effective saved choices (a mixed state means they differ).
+Changing a checkbox overrides that option for every employee shown in the sheet, including individual Copy actions;
+untouched options keep each employee's saved value. These overrides last only for the open sheet and are saved for an
+employee only after its next successful join, just like the other launch edits.
+
+In the apps, selecting an OpenCode employee shows the optional OpenCode Go API key field even when the shared software
+default is another client. The key goes only to selected OpenCode launches, never to copied commands or saved settings.
+Removing the last eligible OpenCode employee from the selection (or changing its client) clears the field and its value.
+
 Online/verified-running employees cannot be restarted here. Pending reservations, archived/removed identities and
 task-bound workers keep their existing lifecycle controls. A browser cannot prove an offline employee's old process has
 exited; check before launching. The native broker still checks terminal reuse. A terminal-start acknowledgement does not
 prove successful transcript recovery or join.
+
+Manual workers (including Human launches from templates) need only the Hivemind MCP binding and can launch when a bot
+package, profile or registry is unavailable. Brains still require their bot instructions; the task queue retains its
+stricter project-readiness check.
 
 ## Native conversations
 
@@ -71,9 +87,11 @@ launch retain the old template-based checkpoint-recovery behavior; matching lega
 ## Storage and safety
 
 Migration 41 stores legacy provider metadata. Migration 42 adds encrypted launch settings and single-launch capabilities.
+Migration 43 fences prepared resumes against the employee's current session, even when no launch settings were saved.
+Previously prepared, unbound resume commands must be prepared again after that upgrade; bound launches remain usable.
 Only Human's project-scoped launcher API and the approved task queue prepare executable configuration. The MCP process
 passes the capability automatically; a model's `nativeSession` cannot overwrite tracked launch choices. Binding settings
-and joining happen atomically. Expired commands, mismatched identities/projects, replayed launches and prepared resumes
+and joining happen atomically. Expired commands, mismatched identities/projects, duplicate fresh joins and prepared resumes
 superseded by a newer join are rejected. Preparing/copying a command is not permission to perform its assigned work.
 
 The Human launch context exposes only that project's settings. Agent rosters and ordinary UI snapshots omit them.
@@ -82,6 +100,12 @@ it during upgrades. Callback capabilities are stored as hashes. No transcripts, 
 are imported. Arbitrary environment values can nevertheless contain secrets: they are encrypted on the server but appear
 in copied shell commands. Use the native secret fields instead. Unused prepared commands expire after 24 hours; copy again
 if necessary. Untracked replacement joins clear the tracked association to avoid restoring a stale conversation.
+
+Restarting only the MCP connection keeps the launch configuration and conversation association: explicitly join with
+`resume=NAME` (the current or a former name). Only the identity already bound to the **current** launch can reconnect;
+an initial join without a name cannot allocate a duplicate employee. A reconnect rotates the in-memory session key,
+fences the previous MCP session and redelivers unacknowledged mail. No bearer credential is saved to disk. Superseded
+launches and removed/archived identities remain blocked, and a hard-paused task still requires Human's task Resume.
 
 Provider references: [Codex hooks](https://learn.chatgpt.com/docs/hooks),
 [Codex resume](https://developers.openai.com/codex/cli/reference/#codex-resume),

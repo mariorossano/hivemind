@@ -147,6 +147,12 @@ export class IdentityService implements AgentDirectory {
       WHERE aliases.name=? LIMIT 1`).get(name, name) as AgentRow | undefined;
   }
 
+  /** Resolve resume aliases for launch validation; join still enforces all lifecycle checks. */
+  getAgentByResumeName(name: string): Agent | null {
+    const row = this.resumeRow(name);
+    return row ? this.mapAgent(row) : null;
+  }
+
   private nameTaken(name: string, exceptAgentId?: string): boolean {
     return Boolean(this.db.prepare(`SELECT 1 FROM agents WHERE lower(name)=lower(?) AND id!=?
       UNION ALL SELECT 1 FROM agent_name_aliases WHERE name=? AND agent_id!=? LIMIT 1`)

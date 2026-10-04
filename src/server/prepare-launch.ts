@@ -7,9 +7,13 @@ import { launchContext } from './bot-definitions.ts';
 import type { LaunchSessions } from './launch-sessions.ts';
 
 export function trackedLaunch(deps: { home: string; launchSessions: LaunchSessions }, url: string, project: Project,
-  settings: LaunchSettings, agent: Agent | null, options: Pick<LaunchInput, 'claim' | 'claimName' | 'nativeResume'> = {}) {
+  settings: LaunchSettings, agent: Agent | null,
+  { requireBotContext = false, ...options }: Pick<LaunchInput, 'claim' | 'claimName' | 'nativeResume'> & { requireBotContext?: boolean } = {}) {
   const context = launchContext(deps.home, url, project);
-  if (context.botError) throw new HiveError(503, 'Project launch context is unavailable');
+  // Manual workers need only the MCP binding, not bot instructions. The task
+  // queue retains its stricter project-readiness gate as an explicit policy.
+  if (context.botError && (settings.role === 'brain' || requireBotContext))
+    throw new HiveError(503, 'Project launch context is unavailable');
   const input: LaunchInput = { ...settings, ...projectLaunchTools(context, project, settings.role),
     projectSlug: project.slug, hiveName: project.name, resume: Boolean(agent && !options.claim),
     resumeName: agent?.name, ...options };
