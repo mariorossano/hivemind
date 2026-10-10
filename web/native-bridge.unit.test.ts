@@ -830,26 +830,41 @@ test("the OpenCode Go API key field shows only for OpenCode, and only where the 
   assert.ok(keyInput(ios.view.host));
 });
 
-test("the Codex env_vars hint shows under Software for Codex, and only where the page can launch", async () => {
+test("the Codex setup hint appears for both copied and native launches", async () => {
   const hint = (host: ParentNode) => host.querySelector(".launch-codex-env")?.textContent ?? null;
   localStorage.setItem("hivemind-launch", JSON.stringify({ software: "codex" }));
   const browser = await mountLaunchSheet();
-  assert.equal(hint(browser.view.host), null, "not in a browser, which launches nothing in tmux");
+  assert.match(hint(browser.view.host)!, /Review and trust that hook in \/hooks/, 'copied commands also need hook trust');
   for (const unmount of unmounts.splice(0).reverse()) unmount();
 
   installBridge();
   for (const software of ["codex", "", "/opt/homebrew/bin/codex"]) {
     localStorage.setItem("hivemind-launch", JSON.stringify({ software }));
     const sheet = await mountLaunchSheet();
-    assert.equal(hint(sheet.view.host), "Codex passes the session label and generated role to MCP servers only if its config lists them. Add "
-      + 'env_vars = ["HIVEMIND_TMUX_SESSION", "HIVEMIND_ROLE"] under [mcp_servers.hivemind] in each CODEX_HOME’s config.toml — '
-      + "hivemind mcp-config --codex prints the block.", JSON.stringify(software));
+    assert.match(hint(sheet.view.host)!, /Prepared Codex launches include the Hivemind MCP binding/);
+    assert.match(hint(sheet.view.host)!, /Review and trust that hook in \/hooks/);
+    assert.match(hint(sheet.view.host)!, /hivemind mcp-config --codex/);
     const field = sheet.view.host.querySelector("input[list='launch-software']")!.closest("label")!;
     assert.equal(field.nextElementSibling?.nextElementSibling?.className, "help-p launch-codex-env", "right under the Software field");
     for (const other of ["claude", "opencode", "agent"]) {
       await typeInto(sheet.view.host.querySelector("input[list='launch-software']") as unknown as HTMLInputElement, other);
       assert.equal(hint(sheet.view.host), null, other);
     }
+    for (const unmount of unmounts.splice(0).reverse()) unmount();
+  }
+});
+
+test('Cursor CLI setup and native approval guidance appears for copied and native launches', async () => {
+  for (const native of [false, true]) {
+    if (native) installBridge();
+    localStorage.setItem('hivemind-launch', JSON.stringify({ software: 'cursor-agent' }));
+    const sheet = await mountLaunchSheet();
+    const hint = () => sheet.view.host.querySelector('.launch-cursor-env')?.textContent ?? '';
+    assert.match(hint(), /hivemind mcp-config --cursor/);
+    assert.match(hint(), /a new launch can require approval again/);
+    assert.match(hint(), /does not approve servers automatically/);
+    await typeInto(sheet.view.host.querySelector("input[list='launch-software']") as unknown as HTMLInputElement, 'claude');
+    assert.equal(hint(), '');
     for (const unmount of unmounts.splice(0).reverse()) unmount();
   }
 });

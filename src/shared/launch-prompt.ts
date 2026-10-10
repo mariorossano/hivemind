@@ -293,7 +293,7 @@ export function buildLaunchPrompt(input: LaunchInput): string {
       (!input.botProject || !input.passProject || input.projectSlug !== input.botProject)) {
     throw new Error("Bot instructions require an explicit matching launch project");
   }
-  const call = `Call the hivemind MCP tool join with ${joinArgs(input)}. ` +
+  const call = `Call the hivemind MCP tool join with ${joinArgs(input)}${input.tracking ? ', requireLaunchTracking=true' : ''}. ` +
     "Use a real tool call; never simulate a tool result or invent an agent name. " +
     "If join is not visible yet, use the host's available tool discovery to load Hivemind's tools first. " +
     "If join is unavailable or fails, report the startup failure and stop.";

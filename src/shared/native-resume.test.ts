@@ -70,6 +70,7 @@ test('tracked Codex uses a SessionStart callback and per-process MCP ticket, wit
   assert.match(hook, /_capture-session/);
   assert.doesNotMatch(built.command, /dangerously-bypass|skip.*trust|Include nativeSession=/);
   assert.match(args.at(-1)!, /records this launch configuration and native conversation automatically/);
+  assert.match(args.at(-1)!, /requireLaunchTracking=true/);
 });
 
 for (const shell of ['bash', 'zsh']) test(`Cursor captures one exact chat and keeps the profile for creation and resume (${shell})`, () => {
@@ -88,10 +89,14 @@ for (const shell of ['bash', 'zsh']) test(`Cursor captures one exact chat and ke
   node() { IFS= read -r chat || true; [ "$chat" = 'chat_fixture-42' ]; }
   `;
   const result = spawnSync(shell, ['-c', stub + command], { env: childEnv(), encoding: 'utf8' });
+  assert.ifError(result.error);
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(result.stderr.trim().split('\n'), ['/fixture/profile with space', '/fixture/profile with space']);
   assert.deepEqual(result.stdout.split('\0').slice(0, 2), ['--resume', 'chat_fixture-42']);
+  assert.match(result.stdout, /requireLaunchTracking=true/);
+  assert.doesNotMatch(command, /--approve-mcps|mcp enable|--force|--yolo/);
   const failed = spawnSync(shell, ['-c', stub + '\nnode() { return 1; }\n' + command], { env: childEnv(), encoding: 'utf8' });
+  assert.ifError(failed.error);
   assert.notEqual(failed.status, 0);
   assert.equal(failed.stdout, '', 'capture failure must never start an untracked conversation');
   const resume = buildLaunchCommand({ ...input, resume: true, nativeResume: { software: 'cursor', sessionId: 'chat_fixture-42' } });

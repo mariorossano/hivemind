@@ -56,8 +56,20 @@ guessed. After trusting a previously skipped startup hook, restart/resume the CL
 The hook definition is stable across launches; a Hivemind executable/path change may require review again.
 
 Claude receives the per-launch Hivemind MCP binding. Codex receives that binding plus the hook through CLI configuration,
-without editing the user's config files. Cursor uses its normally configured Hivemind stdio MCP server and inherits the
-launch environment; it must point to the same Hivemind instance. Cursor support concerns **CLI chats**, not IDE chat tabs.
+without editing the user's config files. Cursor uses its normally configured Hivemind stdio MCP server, but **does not
+automatically forward the launch environment**. Run `hivemind mcp-config --cursor` against the same Hivemind instance and
+merge its `hivemind` entry into the selected workspace's `.cursor/mcp.json` (or the selected profile's global config),
+preserving other servers. It explicitly forwards `HIVEMIND_LAUNCH_TICKET`, `HIVEMIND_ROLE` and `HIVEMIND_TMUX_SESSION`
+using Cursor's `${env:NAME}` interpolation. A workspace entry can shadow the global one, so check the effective binding.
+Use the upgraded Hivemind MCP executable and restart the client; an older MCP process cannot enforce the new join check.
+The generated tracked prompt requires `requireLaunchTracking=true` on join: a missing binding fails before creating an
+employee or clearing an existing employee's saved settings. Do not remove that check to get past a setup failure.
+
+Review Cursor's native MCP approval when prompted, using the same CLI/profile and launch environment. Cursor CLI
+2026.10.01 includes the resolved environment in that approval: a new launch ticket can require approval again even if
+the server path has not changed. An unattended launch can therefore stop awaiting native approval. Hivemind never calls
+`mcp enable` automatically or enables blanket MCP approval. Do not persist a ticket in `mcp.json` or reuse an old ticket.
+Cursor support concerns **CLI chats**, not IDE chat tabs.
 Cursor's chat-creation and resume commands use the same alias, flags, working directory and profile environment.
 
 Use the original installed CLI/alias and profile/home. Hivemind does not copy transcripts, credentials or accounts.
@@ -110,4 +122,5 @@ launches and removed/archived identities remain blocked, and a hard-paused task 
 Provider references: [Codex hooks](https://learn.chatgpt.com/docs/hooks),
 [Codex resume](https://developers.openai.com/codex/cli/reference/#codex-resume),
 [Claude Code CLI](https://code.claude.com/docs/en/cli-reference),
+[Cursor MCP configuration](https://cursor.com/docs/mcp),
 [Cursor CLI parameters](https://cursor.com/docs/cli/reference/parameters).

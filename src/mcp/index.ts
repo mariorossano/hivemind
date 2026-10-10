@@ -107,9 +107,12 @@ export async function startMcp(launchTicket = process.env.HIVEMIND_LAUNCH_TICKET
       resume: z.string().optional(),
       project: z.string().optional(),
       claim: z.string().optional().describe(PARAM_DESCRIPTIONS.claim),
+      requireLaunchTracking: z.boolean().optional().describe('Set true when the integrated launch prompt requests it. Rejects a missing launch binding instead of silently joining without saved resume settings. Never retry with false to bypass a failed launch.'),
       nativeSession: nativeSessionSchema.optional().describe('Legacy optional CLI/model and exact conversation ID. Integrated launches record these automatically. Not the Hivemind identity or tmux name. Never guess an ID; use null when unavailable.'),
     },
-    async ({ role, seniority, focus, resume, project, claim, nativeSession }) => joinSerial(async () => {
+    async ({ role, seniority, focus, resume, project, claim, nativeSession, requireLaunchTracking }) => joinSerial(async () => {
+      if (requireLaunchTracking && !launchTicket)
+        throw new Error('The MCP process did not receive this launch binding. Stop and fix the MCP configuration, then relaunch. For Cursor CLI, use hivemind mcp-config --cursor and review its native MCP approval. Do not retry without requireLaunchTracking.');
       if (toolRole && role !== toolRole)
         throw new Error(`This MCP process is configured for ${toolRole}; join with role=${toolRole} or start another MCP process`);
       if (joinedName && claim)

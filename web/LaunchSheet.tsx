@@ -499,8 +499,13 @@ export function LaunchSheet({
   const showOpencodeKey = native && (resume
     ? selectedBlocks.some(b => b.contextReady && !b.running && softwareFamily(b.seat.software) === 'opencode')
     : softwareFamily(software) === "opencode");
-  // Only where launches run in tmux (the apps): without env_vars a Codex agent never reports its session.
-  const showCodexEnvHint = native && softwareFamily(software) === "codex";
+  // Setup also applies to copied commands and each selected client in a mixed roster.
+  const showCodexEnvHint = resume
+    ? selectedBlocks.some(b => softwareFamily(b.seat.software) === 'codex')
+    : softwareFamily(software) === 'codex';
+  const showCursorEnvHint = resume
+    ? selectedBlocks.some(b => softwareFamily(b.seat.software) === 'cursor')
+    : softwareFamily(software) === 'cursor';
   useEffect(() => { if (!showOpencodeKey) setOpencodeKey(""); }, [showOpencodeKey]);
   const opencodeKeyValue = showOpencodeKey ? opencodeKey.trim() : "";
   const opencodeKeyProblem = opencodeKeyValue ? terminalSecretProblem(opencodeKeyValue) : null;
@@ -688,11 +693,18 @@ export function LaunchSheet({
           </datalist>
           {showCodexEnvHint && (
             <p className="help-p launch-codex-env">
-              Codex passes the session label and generated role to MCP servers only if its config lists them. Add{" "}
-              <code>env_vars = ["HIVEMIND_TMUX_SESSION", "HIVEMIND_ROLE"]</code> under <code>[mcp_servers.hivemind]</code> in each{" "}
-              <code>CODEX_HOME</code>’s <code>config.toml</code> — <code>hivemind mcp-config --codex</code> prints the block.
+              Prepared Codex launches include the Hivemind MCP binding and session-capture hook.
+              Review and trust that hook in <code>/hooks</code>, then restart/resume if its startup event was skipped.
+              For manual MCP setup, <code>hivemind mcp-config --codex</code> prints the block with{' '}
+              <code>env_vars = ["HIVEMIND_TMUX_SESSION", "HIVEMIND_ROLE"]</code> for each <code>CODEX_HOME</code>.
             </p>
           )}
+          {showCursorEnvHint && <p className="help-p launch-cursor-env">
+            Cursor CLI needs explicit launch environment forwarding. Merge the entry printed by{' '}
+            <code>hivemind mcp-config --cursor</code> into the selected workspace/profile’s MCP configuration.
+            Review Cursor’s native MCP approval when prompted; a new launch can require approval again.
+            Hivemind does not approve servers automatically.
+          </p>}
           <ModelSelect
             software={software}
             model={model}
@@ -897,8 +909,8 @@ export function LaunchSheet({
               launchContext.botError ? "Cannot load project tools: " + launchContext.botError :
               "Project bots: " + (launchContext.botDefinitions.map((p) => p.name).join(", ") || "none enabled") + ". Instructions are included; no tool is started here."}
           </p>
-          {launchContext && softwareFamily(software) !== "claude" && <p className="help-p">
-            Use this CLI’s normal Hivemind MCP configuration. Automatic server binding is available for Claude launchers.
+          {launchContext && !['claude', 'codex'].includes(softwareFamily(software)) && <p className="help-p">
+            Use this CLI’s normal Hivemind MCP configuration. Prepared Codex and Claude launches include their server binding.
           </p>}
           <p className="help-p">
             One block: command plus prompt. Paste it in a terminal. One chat is one employee. Hive is the Hivemind project name.

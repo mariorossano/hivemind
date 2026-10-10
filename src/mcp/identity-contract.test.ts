@@ -28,6 +28,12 @@ test("real concurrent/repeated MCP joins reuse the active identity without expos
     assert.doesNotMatch(text, /hm_[a-f0-9]{48}/, "model result leaked a token");
     return JSON.parse(text) as T;
   };
+  const prior = hive.identity.listAgents().length;
+  const unbound = await client.callTool({ name: 'join', arguments: { role: 'brain', requireLaunchTracking: true } });
+  assert.equal(unbound.isError, true);
+  assert.match(JSON.stringify(unbound.content), /did not receive this launch binding/);
+  assert.match(JSON.stringify(unbound.content), /mcp-config --cursor/);
+  assert.equal(hive.identity.listAgents().length, prior, 'a missing launch binding must not allocate an employee');
   const [a,b] = await Promise.all([call<{ name:string;created:boolean }>("join",{ role:"brain" }), call<{ name:string;created:boolean }>("join",{ role:"brain" })]);
   assert.equal(a.name,b.name); assert.equal([a,b].filter(x=>x.created).length,1);
   assert.equal(hive.identity.listAgents().filter(a=>a.role==="brain").length,1);
@@ -86,13 +92,13 @@ for (const software of ['codex', 'claude', 'cursor'] as const)
       role: 'brain' as const, seniority: null, focus: 'coord' };
     const launch = hive.launchSessions.prepare(project.id, settings, null);
     const clients: Client[] = [], transports: StdioClientTransport[] = [];
-    const connect = async () => {
+    const connect = async (omitBinding = false) => {
       const client = new Client({ name: 'tracked-fixture', version: '0' });
       const transport = new StdioClientTransport({ command: process.execPath,
         args: ['--import', path.join(root, 'node_modules/tsx/dist/loader.mjs'), path.join(root, 'src/cli.ts'), 'mcp',
-          ...(software === 'cursor' ? [] : ['--launch-ticket', launch.ticket])], cwd: dir,
+          ...(software === 'cursor' || omitBinding ? [] : ['--launch-ticket', launch.ticket])], cwd: dir,
         env: childEnv({ PATH: process.env.PATH ?? '', HIVEMIND_HOME: path.join(dir, 'client'), HIVEMIND_URL: url,
-          HIVEMIND_TOKEN: '', ...(software === 'cursor' ? { HIVEMIND_LAUNCH_TICKET: launch.ticket } : {}) }), stderr: 'pipe' });
+          HIVEMIND_TOKEN: '', ...(software === 'cursor' && !omitBinding ? { HIVEMIND_LAUNCH_TICKET: launch.ticket } : {}) }), stderr: 'pipe' });
       clients.push(client); transports.push(transport);
       await client.connect(transport);
       return client;
@@ -108,7 +114,7 @@ for (const software of ['codex', 'claude', 'cursor'] as const)
       await captureSession(['--url', url, '--ticket', launch.ticket, ...(software === 'codex' ? ['--hook'] : [])], input());
     }
     const client = await connect();
-    const result = await client.callTool({ name: 'join', arguments: { role: 'brain', project: project.slug } });
+    const result = await client.callTool({ name: 'join', arguments: { role: 'brain', project: project.slug, requireLaunchTracking: true } });
     assert.notEqual(result.isError, true, JSON.stringify(result));
     const text = (result.content as Array<{ type: string; text: string }>)[0]!.text;
     assert.ok(!text.includes(launch.ticket), 'private launch capability never reaches model output');
@@ -123,6 +129,14 @@ for (const software of ['codex', 'claude', 'cursor'] as const)
     assert.ok(mail.delivery);
     assert.ok(mail.mail?.length);
     const fingerprint = hive.identity.sessionFingerprint(agent.id);
+    const unbound = await connect(true);
+    const denied = await unbound.callTool({ name: 'join', arguments: { role: 'brain', project: project.slug,
+      resume: agent.name, requireLaunchTracking: true } });
+    assert.equal(denied.isError, true);
+    assert.match(JSON.stringify(denied.content), /did not receive this launch binding/);
+    assert.equal(hive.identity.sessionFingerprint(agent.id), fingerprint, 'a failed setup cannot supersede the employee');
+    assert.deepEqual(hive.launchSessions.saved(agent.id), { settings, sessionId: id, captured: true }, 'the prior saved launch is preserved');
+    await unbound.close();
     await client.close();
     const restarted = await connect();
     const rejoined = await restarted.callTool({ name: 'join', arguments: { role: 'brain', project: project.slug, resume: agent.name } });
